@@ -182,61 +182,169 @@ class CliTests(unittest.TestCase):
             token_cli.automatic_token(text)
 
 
-class RegistryTests(unittest.TestCase):
-    def test_install_and_remove_per_user_extensions(self):
-        class Registry:
-            HKEY_CURRENT_USER = 1234
-            KEY_WRITE = 1
-            REG_SZ = 1
-            def __init__(self):
-                self.created = {}
-                self.live = set()
-                self.deleted = []
-            def CreateKeyEx(self, hive, path, reserved, flags):
-                assert hive == self.HKEY_CURRENT_USER
-                self.created.setdefault(path, {})
-                self.live.add(path)
-                class Context:
-                    def __enter__(inner): return path
-                    def __exit__(inner, *args): return False
-                return Context()
-            def SetValueEx(self, key, name, reserved, kind, value):
-                self.created[key][name] = value
-            def DeleteKey(self, hive, path):
-                assert hive == self.HKEY_CURRENT_USER
-                if path not in self.live:
-                    raise FileNotFoundError(path)
-                if any(k.startswith(path + '\\') for k in self.live):
-                    raise OSError('Key still has children')
-                self.live.remove(path)
-                self.deleted.append(path)
+class FakeRegistry:
+    HKEY_CURRENT_USER = 1234
+    HKEY_CLASSES_ROOT = 5678
+    KEY_WRITE = 1
+    KEY_READ = 2
+    REG_SZ = 1
 
-        with tempfile.TemporaryDirectory() as temp:
-            base = Path(temp)
-            exe = base / '.venv' / 'Scripts' / 'pythonw.exe'
-            exe.parent.mkdir(parents=True)
-            exe.touch()
-            (base / 'tokenforge.py').touch()
-            reg = Registry()
-            with patch.object(context_menu, '_registry', return_value=reg):
-                context_menu.install(base)
-                context_menu.remove()
-            self.assertEqual(len(reg.created), len(context_menu.EXTENSIONS) * len(context_menu.ACTION_NAMES) * 2)
-            self.assertEqual(len(reg.deleted), len(reg.created))
-            self.assertFalse(reg.live)
-            allkeys = list(reg.created.keys())
-            self.assertTrue(all(k.startswith(context_menu.ROOT) for k in allkeys))
-            for ext in context_menu.EXTENSIONS:
-                self.assertTrue(any(k.startswith(context_menu.ROOT + '\\' + ext + '\\shell\\') for k in allkeys))
-            cmd = [v.get('') for k, v in reg.created.items() if k.endswith('\\command')]
-            self.assertEqual(len(cmd), 28)
-            self.assertTrue(all('"%1"' in s for s in cmd))
+    class Handle:
+        def __init__(self, hive, path):
+            self.hive, self.path = hive, path
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def __init__(self, shadow=False):
+        self.keys = {}
+        self.shadow = shadow
+        self.machine = {
+            '*': {},
+            r'*\shell': {},
+            r'*\shell\Foreign': {'': ('Other command', self.REG_SZ)},
+            r'*\shell\Foreign\command': {'': ('other.exe "%1"', self.REG_SZ)},
+        }
+
+    def _view(self, hive):
+        if hive == self.HKEY_CURRENT_USER:
+            return self.keys
+        assert hive == self.HKEY_CLASSES_ROOT
+        prefix = 'Software\\Classes\\'
+        user = {p[len(prefix):]: values for p, values in self.keys.items()
+                if p.startswith(prefix)}
+        result = dict(self.machine)
+        if self.shadow and r'*\shell' in user:
+            result = {p: v for p, v in result.items()
+                      if p != r'*\shell' and not p.startswith('*\\shell\\')}
+        result.update(user)
+        return result
+
+    def CreateKeyEx(self, hive, path, reserved, flags):
+        assert hive == self.HKEY_CURRENT_USER
+        parts = path.split('\\')
+        for length in range(1, len(parts) + 1):
+            self.keys.setdefault('\\'.join(parts[:length]), {})
+        return self.Handle(hive, path)
+
+    def OpenKey(self, hive, path, reserved=0, flags=2):
+        if path not in self._view(hive):
+            raise FileNotFoundError(path)
+        return self.Handle(hive, path)
+
+    def _children(self, key):
+        prefix = key.path + '\\'
+        return sorted(p[len(prefix):] for p in self._view(key.hive)
+                      if p.startswith(prefix) and '\\' not in p[len(prefix):])
+
+    def QueryInfoKey(self, key):
+        return len(self._children(key)), len(self._view(key.hive)[key.path]), 0
+
+    def EnumKey(self, key, index):
+        return self._children(key)[index]
+
+    def EnumValue(self, key, index):
+        name, (value, kind) = list(self._view(key.hive)[key.path].items())[index]
+        return name, value, kind
+
+    def SetValueEx(self, key, name, reserved, kind, value):
+        assert key.hive == self.HKEY_CURRENT_USER
+        self.keys[key.path][name] = (value, kind)
+
+    def DeleteKey(self, hive, path):
+        assert hive == self.HKEY_CURRENT_USER
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        if self._children(self.Handle(hive, path)):
+            raise OSError('Key still has children')
+        del self.keys[path]
+
+
+class RegistryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.exe = self.base / '.venv' / 'Scripts' / 'pythonw.exe'
+        self.exe.parent.mkdir(parents=True)
+        self.exe.touch()
+        (self.base / 'tokenforge.py').touch()
+
+    def _legacy(self, reg, name='TokenForge.Create', ext='.png'):
+        path = context_menu.LEGACY_ROOT + '\\' + ext + '\\shell\\' + name
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path + r'\command', 0, reg.KEY_WRITE) as key:
+            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'legacy.exe "%1"')
+        return path
+
+    def test_install_and_remove_scoped_verbs(self):
+        reg = FakeRegistry()
+        old = self._legacy(reg)
+        foreign = self._legacy(reg, name='ThirdParty', ext='.jpg')
+        baseline = context_menu._foreign_shell(reg)
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell') as notify:
+            context_menu.install(self.base)
             expected = {'TokenForge.Create': '--auto', 'TokenForge.Open': '--open',
                         'TokenForge.CreateItem': '--auto-item', 'TokenForge.OpenItem': '--open-item'}
-            for ext in context_menu.EXTENSIONS:
-                for verb, flag in expected.items():
-                    key = context_menu.ROOT + '\\' + ext + '\\shell\\' + verb + '\\command'
-                    self.assertEqual(reg.created[key][''], f'"{exe}" "{base / "tokenforge.py"}" {flag} "%1"')
+            for verb, flag in expected.items():
+                key = context_menu.ROOT + '\\' + verb
+                expected_cmd = f'"{self.exe}" "{self.base / "tokenforge.py"}" {flag} "%1"'
+                self.assertEqual(reg.keys[key + r'\command'][''][0], expected_cmd)
+                self.assertEqual(reg.keys[key]['AppliesTo'][0],
+                                 'System.FileExtension:=.png OR System.FileExtension:=.jpg OR '
+                                 'System.FileExtension:=.jpeg OR System.FileExtension:=.webp OR '
+                                 'System.FileExtension:=.bmp OR System.FileExtension:=.tif OR '
+                                 'System.FileExtension:=.tiff')
+            self.assertNotIn(old, reg.keys)
+            self.assertIn(foreign, reg.keys)
+            self.assertEqual(context_menu._foreign_shell(reg), baseline)
+            context_menu.remove()
+            context_menu.remove()  # uninstall is idempotent
+            self.assertFalse(any(p.startswith(context_menu.ROOT + '\\') for p in reg.keys))
+            self.assertIn(foreign, reg.keys)
+            self.assertEqual(context_menu._foreign_shell(reg), baseline)
+            self.assertEqual(notify.call_count, 3)
+
+    def test_registry_conflict_rolls_back_without_losing_old_verbs(self):
+        reg = FakeRegistry(shadow=True)
+        old = self._legacy(reg)
+        before = {key: dict(values) for key, values in reg.keys.items()}
+        baseline = context_menu._foreign_shell(reg)
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell'):
+            with self.assertRaises(context_menu.RegistryConflictError):
+                context_menu.install(self.base)
+            self.assertIn(old, reg.keys)
+            self.assertEqual(reg.keys, before)
+            self.assertEqual(context_menu._foreign_shell(reg), baseline)
+            context_menu.remove()
+            self.assertNotIn(context_menu.LEGACY_ROOT, reg.keys)
+
+    @unittest.skipUnless(
+        __import__('os').name == 'nt'
+        and __import__('os').environ.get('GITHUB_ACTIONS') == 'true'
+        and __import__('os').environ.get('TOKENFORGE_TEST_REAL_REGISTRY') == '1',
+        'Real registry smoke test is opt-in on the disposable Windows CI runner')
+    def test_real_windows_registry_preserves_foreign_verbs(self):
+        reg = context_menu._registry()
+        baseline = context_menu._foreign_shell(reg)
+        try:
+            try:
+                context_menu.install(self.base)
+            except context_menu.RegistryConflictError:
+                self.assertEqual(context_menu._foreign_shell(reg), baseline)
+                self.skipTest('This Windows configuration cannot safely register per-user static verbs')
+            for name in context_menu.ACTION_NAMES:
+                with reg.OpenKey(reg.HKEY_CURRENT_USER,
+                                 context_menu.ROOT + '\\' + name) as key:
+                    self.assertEqual(reg.QueryValueEx(key, 'AppliesTo')[0], context_menu.APPLIES_TO)
+        finally:
+            context_menu.remove()
+        after = context_menu._foreign_shell(reg)
+        self.assertTrue(all(after.get(path) == values for path, values in baseline.items()))
 
 
 if __name__ == '__main__':
