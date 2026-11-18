@@ -354,7 +354,12 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
         (out_size, out_size), Image.Resampling.NEAREST)
     inner = ImageChops.multiply(inner, support)
     image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), inner))
-    token = Image.alpha_composite(image_layer, frame.resize((out_size, out_size), Image.Resampling.LANCZOS))
+    resized_frame = frame.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    visible = ImageChops.multiply(image_layer.getchannel('A'),
+                                  ImageChops.invert(resized_frame.getchannel('A')))
+    if visible.getbbox() is None:
+        raise ValueError('Персонаж полностью вне видимой области рамки. Измени положение или масштаб.')
+    token = Image.alpha_composite(image_layer, resized_frame)
     return token
 
 

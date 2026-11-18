@@ -22,6 +22,33 @@ def check_lock(path, results):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_global_schema_uses_same_boolean_semantics(self):
+        from settings_store import decode_settings
+        for value in (False, 'false', '0', 0, 'off'):
+            for strict in (False, True):
+                decoded = decode_settings({'keep_alpha': value, 'skip_exists': value,
+                                           'convert_original': value},
+                                          default_frame='RingT.png', strict=strict)
+                self.assertEqual([decoded[name] for name in
+                                  ('keep_alpha', 'skip_exists', 'convert_original')], [False]*3)
+        for value in ('bad', [], 2, None):
+            with self.assertRaises(ValueError):
+                decode_settings({'skip_exists': value}, default_frame='RingT.png', strict=True)
+        self.assertEqual(decode_settings({'ring': []}, default_frame='RingT.png')['ring'], 'RingT.png')
+
+    def test_recovery_preserves_corrupt_bytes_and_concurrent_repair(self):
+        from settings_store import recover_settings_file
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            malformed = b'{broken \xff'
+            path.write_bytes(malformed)
+            decoded, backup = recover_settings_file(path)
+            self.assertEqual(decoded, {})
+            self.assertEqual(backup.read_bytes(), malformed)
+            self.assertEqual(read_settings_file(path, strict=True), {})
+            path.write_text('{"size": 512}', encoding='utf-8')
+            self.assertEqual(recover_settings_file(path), ({'size': 512}, None))
+
     def test_repair_malformed_override_preserves_concurrent_fields(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'settings.json'

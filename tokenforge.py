@@ -27,7 +27,8 @@ from token_engine import (
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
-                            override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES)
+                            override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES,
+                            EDGE_MODES, decode_settings, recover_settings_file)
 from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session
 from cutout_service import load_cutout
 
@@ -49,11 +50,25 @@ FG = '#e9ecf1'
 MUTED = '#a0a6b1'
 BLUE = '#789fff'
 MODELS = LOCAL_MODELS
-EDGE_MODES = ['Очистка краёв', 'Обычный', 'Alpha matting (медленно)']
 
 
 def settings_read():
-    return read_settings_file(PREFS_FILE)
+    try:
+        raw = read_settings_file(PREFS_FILE, strict=True)
+    except (ValueError, RecursionError):
+        raw = {}
+        if messagebox.askyesno('Повреждены настройки',
+                               'Создать резервную копию повреждённого файла и восстановить настройки по умолчанию?'):
+            try:
+                raw, backup = recover_settings_file(PREFS_FILE)
+                if backup is not None:
+                    messagebox.showinfo('Настройки восстановлены', f'Резервная копия: {backup}')
+            except (OSError, ValueError, RecursionError) as exc:
+                messagebox.showerror('Не удалось восстановить настройки', str(exc))
+    except OSError as exc:
+        raw = {}
+        messagebox.showerror('Не удалось прочитать настройки', str(exc))
+    return decode_settings(raw, default_frame=BASE / 'RingT.png')
 
 
 def checkerboard(size: int) -> Image.Image:
@@ -166,6 +181,14 @@ class TokenForge:
         except Exception as exc:
             self.status.set(f'Не удалось открыть рамку: {exc}')
         self._settings_baseline = self._settings_snapshot()
+        # Preserve the actual persisted baseline for fields that were repaired
+        # by the decoder, so the normal delta save writes these repairs.
+        persisted = read_settings_file(PREFS_FILE)
+        for name in ('ring', 'model', 'edge_mode', 'size', 'ext', 'keep_alpha',
+                     'skip_exists', 'convert_original', 'item_layout', 'folder',
+                     'overrides', 'item_overrides'):
+            if name in persisted:
+                self._settings_baseline[name] = deepcopy(persisted[name])
         if startup_file is not None:
             self._set_folder(startup_file.parent, select_path=startup_file)
         else:
@@ -1204,7 +1227,8 @@ class TokenForge:
         current = self._settings_snapshot()
         self.save_retryable = False
         try:
-            save_settings_delta(PREFS_FILE, self._settings_baseline, current, resets=self.pending_resets)
+            save_settings_delta(PREFS_FILE, self._settings_baseline, current,
+                                resets=self.pending_resets, lock_timeout=0)
             self.pending_resets.clear()
             self.save_retries = 0
             # Keep the baseline local: remote edits have not changed our controls.
@@ -1213,7 +1237,8 @@ class TokenForge:
         except (OSError, ValueError) as exc:
             # A reader holding settings.json can briefly deny replacement
             # on Windows. Retry the whole locked merge, not a stale write.
-            self.save_retryable = isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (5, 32, 33)
+            self.save_retryable = isinstance(exc, TimeoutError) or (
+                isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (5, 32, 33))
             if allow_retry:
                 self._resume_save_retry()
             self.status.set(f'Не удалось сохранить настройки: {exc}')

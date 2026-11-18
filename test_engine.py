@@ -577,6 +577,18 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(token.getpixel((0, 0))[3], 0)
         self.assertGreater(token.getpixel((128, 128))[3], 0)
 
+    def test_token_without_visible_subject_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, 'вне видимой области'):
+            compose(self.figure, self.frame, self.mask, 256, Adjust(x=120))
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            result = export_batch([source], read_image, self.frame, self.mask,
+                                  {source: Adjust(x=120)}, convert_original=False)
+            self.assertEqual(result.created, 0)
+            self.assertTrue(result.errors)
+            self.assertFalse(token_output_path(source).exists())
+
     def test_manual_position_changes_pixels(self):
         a = compose(self.figure, self.frame, self.mask, 256, Adjust())
         b = compose(self.figure, self.frame, self.mask, 256, Adjust(zoom=140))

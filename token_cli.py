@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from cutout_service import load_cutout
-from settings_store import read_settings_file, adjustment_for, output_format
+from settings_store import read_settings_file, adjustment_for, decode_settings
 from local_models import DEFAULT_MODEL, require_local_model, new_local_session
 import os
 import traceback
@@ -45,7 +45,8 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     if frame_path is None:
         # GUI open must remain usable for recovery from an invalid settings
         # file. Automatic commands pass their strictly read frame explicitly.
-        frame_path = Path(read_settings_file(PREFS_FILE).get('ring') or BASE / 'RingT.png')
+        frame_path = Path(decode_settings(read_settings_file(PREFS_FILE),
+                                         default_frame=BASE / 'RingT.png')['ring'])
     if excluded_file(path, frame_path):
         raise ValueError('Выбранный файл используется как рамка, а не исходный арт.')
     owner = read_export_owner(path)
@@ -91,8 +92,8 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
     loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
     """
-    settings = read_settings()
-    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='token')
+    frame_path = Path(settings['ring'])
     source = resolve_context_source(filename, frame_path=frame_path)
     def load_frame():
         frame = read_image(frame_path)
@@ -102,19 +103,17 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
-    keep_alpha = bool(settings.get('keep_alpha', True))
-    ext = output_format(settings.get('ext', 'webp'), strict=True)
-    size = int(settings.get('size', 256))
-    if size not in (256, 512, 1024):
-        raise ValueError('Неподдерживаемый размер токена в настройках.')
+    keep_alpha = settings['keep_alpha']
+    ext = settings['ext']
+    size = settings['size']
 
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_batch(
         [source], get_cutout, None, None, {source: _adjust_for(settings, source)},
         frame_loader=load_frame,
         out_size=size, format_name=ext,
-        skip_exists=bool(settings.get('skip_exists', True)),
-        convert_original=bool(settings.get('convert_original', True)),
+        skip_exists=settings['skip_exists'],
+        convert_original=settings['convert_original'],
     )
     for warning in result.warnings:
         write_log(warning)
@@ -133,16 +132,16 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
 def automatic_item(filename: str | Path) -> tuple[str, Path]:
     """Create 500x500 equipment art using the same reusable cutout cache."""
-    settings = read_settings()
-    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
+    settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='item')
+    source = resolve_context_source(filename, frame_path=Path(settings['ring']))
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
-    keep_alpha = bool(settings.get('keep_alpha', True))
+    keep_alpha = settings['keep_alpha']
     adj = adjustment_for(settings, source, 'item')
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_items([source], get_cutout, {source: adj},
-                          skip_exists=bool(settings.get('skip_exists', True)),
-                          convert_original=bool(settings.get('convert_original', True)))
+                          skip_exists=settings['skip_exists'],
+                          convert_original=settings['convert_original'])
     for warning in result.warnings:
         write_log(warning)
     if result.errors:
