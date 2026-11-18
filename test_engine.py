@@ -175,10 +175,24 @@ class EngineTests(unittest.TestCase):
         import io
         with tempfile.TemporaryDirectory() as d:
             source = Path(d) / 'Tagged.png'
-            profile = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
-            self.figure.save(source, icc_profile=profile)
+            # Keep the sRGB primaries and white point, but use a linear
+            # transfer curve. The transformed middle gray is not the input.
+            import struct
+            profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes())
+            count = struct.unpack_from('>I', profile, 128)[0]
+            for i in range(count):
+                pos = 132 + 12 * i
+                tag, offset, length = struct.unpack_from('>4sII', profile, pos)
+                if tag in (b'rTRC', b'gTRC', b'bTRC'):
+                    self.assertGreaterEqual(length, 16)
+                    profile[offset:offset+16] = struct.pack('>4s4xIH2x', b'curv', 1, 256)
+                    struct.pack_into('>I', profile, pos+8, 14)
+            figure = self.figure.copy()
+            figure.putpixel((0, 0), (64, 64, 64, 123))
+            figure.save(source, icc_profile=bytes(profile))
             decoded = read_image(source)
-            self.assertEqual(decoded.getchannel('A').tobytes(), self.figure.getchannel('A').tobytes())
+            self.assertEqual(decoded.getpixel((0, 0)), (137, 137, 137, 123))
+            self.assertEqual(decoded.getchannel('A').tobytes(), figure.getchannel('A').tobytes())
             self.assertTrue(decoded.info.get('icc_profile'))
             self.assertTrue(save_original_webp(source))
             with Image.open(source.with_suffix('.webp')) as converted:
@@ -254,6 +268,54 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(pixels[0] < pixels[1] < pixels[2] < pixels[3])
         profile = ImageCms.ImageCmsProfile(io.BytesIO(decoded.info['icc_profile']))
         self.assertIn('sRGB', ImageCms.getProfileDescription(profile))
+
+        # A real grayscale+alpha 16-bit PNG uses the RGBA decoder path.
+        import zlib
+        def chunk(kind, payload):
+            return (struct.pack('>I', len(payload)) + kind + payload
+                    + struct.pack('>I', zlib.crc32(kind + payload) & 0xffffffff))
+        png = (b'\x89PNG\r\n\x1a\n'
+               + chunk(b'IHDR', struct.pack('>IIBBBBB', 2, 1, 16, 4, 0, 0, 0))
+               + chunk(b'iCCP', b'Gray\0\0' + zlib.compress(bytes(data)))
+               + chunk(b'IDAT', zlib.compress(b'\0' + struct.pack('>HHHH', 16384, 32768, 65535, 16384)))
+               + chunk(b'IEND', b''))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'GrayAlpha.png'
+            path.write_bytes(png)
+            decoded = read_image(path)
+            self.assertEqual(list(decoded.getchannel('A').getdata()), [128, 64])
+            self.assertLess(decoded.getpixel((0, 0))[0], decoded.getpixel((1, 0))[0])
+            # A truecolor PNG carrying the same incompatible profile should
+            # still be rejected, not silently reduced to grayscale.
+            Image.new('RGBA', (2, 1), 'red').save(path, icc_profile=bytes(data))
+            with self.assertRaisesRegex(ValueError, 'ICC'):
+                read_image(path)
+
+    def test_legacy_webp_discovery_does_not_open_decoder_or_allow_oversized_skip(self):
+        from token_engine import read_export_owner, validate_skip, read_owned_export_image
+        from token_cli import resolve_context_source
+        from PIL import WebPImagePlugin
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            source, copy = folder / 'Hero.png', folder / 'Hero.webp'
+            self.figure.save(source)
+            exif = Image.Exif()
+            exif[270] = 'TokenForge/2:["copy","Hero.png"]'
+            self.figure.save(copy, 'WEBP', exif=exif)
+            with patch('token_engine.MAX_IMAGE_PIXELS', 100), \
+                 patch.object(WebPImagePlugin.WebPImageFile, '_open',
+                              side_effect=AssertionError('unexpected decoder allocation')):
+                self.assertEqual(read_export_owner(copy), (2, 'copy', 'Hero.png'))
+                self.assertEqual(list_source_images(folder), [source])
+                self.assertEqual(resolve_context_source(copy, frame_path=folder / 'Ring.png'), source)
+            with patch('token_engine.MAX_IMAGE_PIXELS', 100):
+                with self.assertRaises(OSError):
+                    validate_skip(copy, source, 'copy')
+                with self.assertRaises(ValueError):
+                    read_owned_export_image(copy, source, 'copy')
+            # Truncated RIFF must not be accepted as ownership evidence.
+            copy.write_bytes(copy.read_bytes()[:-1])
+            self.assertIsNone(read_export_owner(copy))
 
     def test_oversized_ring_and_discovery_reject_before_pixel_decode(self):
         from token_engine import load_frame, read_export_owner
@@ -787,6 +849,36 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(report.skipped, 1)
                     self.assertTrue(any('Параметры генерации' in w for w in report.warnings))
                     loader.assert_not_called()
+
+    def test_late_skip_compares_winner_against_current_extraction_recipe(self):
+        from token_engine import LoadedCutout, source_identity, save_generated, token_recipe, extraction_provenance
+        from item_engine import export_items, item_output_path, ItemAdjust, item_recipe
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            identity = source_identity(source)
+            old = extraction_provenance('birefnet-general', True, 'e', revision=('old',))
+            current = extraction_provenance('birefnet-general', True, 'e', revision=('current',))
+            revision = Mock(return_value=old)
+            for kind, destination, winner_recipe, run in (
+                ('token', token_output_path(source), token_recipe(self.frame, Adjust(), 256, 'webp', current),
+                 lambda loader: export_batch([source], loader, self.frame, self.mask, {source: Adjust()},
+                                             convert_original=False, extraction_recipe=revision)),
+                ('item', item_output_path(source), item_recipe(ItemAdjust(), current),
+                 lambda loader: export_items([source], loader, {source: ItemAdjust()},
+                                              convert_original=False, extraction_recipe=revision)),
+            ):
+                with self.subTest(kind=kind):
+                    revision.return_value = old
+                    def loader(path):
+                        revision.return_value = current
+                        save_generated(self.figure, destination, source, kind, skip_exists=False,
+                                       input_identity=identity, recipe=winner_recipe)
+                        return LoadedCutout(self.figure, identity, old)
+                    report = run(loader)
+                    self.assertEqual(report.skipped, 1, report.errors)
+                    self.assertFalse(report.warnings)
 
     def test_token_without_visible_subject_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'вне видимой области'):

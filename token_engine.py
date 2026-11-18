@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+import struct
 import traceback
 from pathlib import Path
 from statistics import median
@@ -241,6 +242,10 @@ def decode_artwork(raw, *, force_alpha=False):
     """
     import io
     from PIL import ImageCms
+    # Pillow exposes a 16-bit grayscale+alpha PNG as RGBA. Capture the
+    # decoder's original sample layout before exif_transpose loads it.
+    gray_alpha16_png = (raw.format == 'PNG' and raw.mode == 'RGBA'
+                        and any(tile[3] == 'LA;16B' for tile in getattr(raw, 'tile', ())))
     artwork = ImageOps.exif_transpose(raw)
     has_alpha = 'A' in artwork.getbands() or 'transparency' in artwork.info
     grayscale16 = artwork.mode in ('I;16', 'I;16L', 'I;16B')
@@ -263,6 +268,10 @@ def decode_artwork(raw, *, force_alpha=False):
                 color = artwork
             elif artwork.mode == 'LA':
                 color = artwork.getchannel('L')
+            elif gray_alpha16_png:
+                # The decoder already expanded gray into three equal 8-bit
+                # channels. CMS needs one gray channel; alpha is independent.
+                color = artwork.getchannel('R')
             else:
                 color = artwork.convert('RGB')
             result = ImageCms.profileToProfile(color, source, target, outputMode='RGB')
@@ -855,6 +864,58 @@ def _probe_owner(stream, *, require_pixels=False):
         return None
 
 
+def _probe_webp_owner(stream, size):
+    """Read only bounded RIFF headers and EXIF, never create a WebP decoder.
+
+    Discovery can recognize old exports even if current pixel limits would
+    reject them. This is not pixel validation or authorization to replace.
+    """
+    header = stream.read(12)
+    if len(header) != 12 or header[:4] != b'RIFF' or header[8:] != b'WEBP':
+        return None
+    end = 8 + struct.unpack_from('<I', header, 4)[0]
+    if not 12 <= end <= size:
+        return None
+    owner = None
+    image_chunk = False
+    for index in range(4096):
+        if stream.tell() == end:
+            return owner if image_chunk else None
+        if end - stream.tell() < 8:
+            return None
+        chunk = stream.read(8)
+        if len(chunk) != 8:
+            return None
+        kind, length = struct.unpack('<4sI', chunk)
+        next_chunk = stream.tell() + length + (length & 1)
+        if next_chunk > end:
+            return None
+        if index == 0:
+            # EXIF is only supported by extended WebP containers.
+            if kind != b'VP8X' or length != 10:
+                return None
+            flags = stream.read(10)
+            if len(flags) != 10 or not flags[0] & 0x08:
+                return None
+        elif kind == b'EXIF':
+            # TokenForge ownership strings are <= 4096 characters. Allow
+            # ample space for legacy EXIF, but never read an arbitrary chunk.
+            if not 0 < length <= 1024 * 1024 or owner is not None:
+                return None
+            data = stream.read(length)
+            if len(data) != length:
+                return None
+            exif = Image.Exif()
+            exif.load(data)
+            owner = _parse_owner(exif.get(270))
+            if owner is None:
+                return None
+        elif kind in (b'VP8 ', b'VP8L', b'ANMF') and length:
+            image_chunk = True
+        stream.seek(next_chunk)
+    return None
+
+
 def read_export_owner(destination: Path, *, identity=None, require_pixels=False) -> tuple | None:
     """For mutations, inspect the exact bytes that were fingerprinted."""
     if destination.suffix.lower() not in ('.png', '.webp'):
@@ -863,11 +924,20 @@ def read_export_owner(destination: Path, *, identity=None, require_pixels=False)
         with source_snapshot(destination, identity) as snapshot:
             return _probe_owner(snapshot, require_pixels=require_pixels)
     try:
-        if destination.stat().st_size > MAX_ENCODED_BYTES:
-            return None
-    except OSError:
+        with destination.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size > MAX_ENCODED_BYTES:
+                return None
+            header = stream.read(12)
+            stream.seek(0)
+            if not require_pixels and header[:4] == b'RIFF' and header[8:] == b'WEBP':
+                return _probe_webp_owner(stream, size)
+            return _probe_owner(stream, require_pixels=require_pixels)
+    except InvalidExportError:
+        raise
+    except (OSError, ValueError, SyntaxError, TypeError, RecursionError, struct.error,
+            IndexError, OverflowError, Image.DecompressionBombError):
         return None
-    return _probe_owner(destination, require_pixels=require_pixels)
 
 
 def recorded_source_matches(source: Path, filename: str) -> bool:
@@ -1046,7 +1116,14 @@ def validate_skip(destination, source, kind, *, identity=None):
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
-                   input_identity: tuple | None = None, collision_index=None, recipe=None) -> Publication:
+                   input_identity: tuple | None = None, collision_index=None, recipe=None,
+                   skip_recipe=None) -> Publication:
+    # A late competing publication must be compared with the current settings,
+    # not the actual extraction recipe of pixels that we did not publish.
+    def skipped(owner):
+        current = skip_recipe() if skip_recipe is not None else recipe
+        return Publication(False, freshness_warnings(owner, input_identity, current))
+
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
@@ -1062,7 +1139,7 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
             owner = validate_skip(destination, source, kind, identity=prior)
             if input_identity is not None:
                 assert_source_identity(source, input_identity)
-            return Publication(False, freshness_warnings(owner, input_identity, recipe))
+            return skipped(owner)
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
@@ -1095,7 +1172,7 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
             ensure_no_source_collision(destination, source, kind, collision_index, live=True)
         owner = validate_skip(destination, source, kind)
         check_input()
-        return Publication(False, freshness_warnings(owner, input_identity, recipe))
+        return skipped(owner)
     return published
 
 
@@ -1319,7 +1396,8 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                         recipe = recipe_for(source, actual)
                     publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
                                                  approved_identity=approved,
-                                                 input_identity=identity, collision_index=folders, recipe=recipe)
+                                                 input_identity=identity, collision_index=folders, recipe=recipe,
+                                                 skip_recipe=(lambda: recipe_for(source)) if recipe_for is not None else None)
                     result.warnings.extend(f'{source.name}: {destination.name}: {warning}' for warning in publication.warnings)
                     if publication:
                         result.created += 1
