@@ -90,6 +90,19 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(recovered), 1)
             self.assertEqual(recovered[0].read_bytes(), b'external editor')
 
+    def test_batch_prepares_frame_once(self):
+        from token_engine import prepare_token_frame
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            sources = [Path(directory) / name for name in ('One.png', 'Two.png')]
+            for source in sources:
+                self.figure.save(source)
+            with patch('token_engine.prepare_token_frame', wraps=prepare_token_frame) as prepare:
+                result = export_batch(sources, read_image, self.frame, self.mask,
+                                      {source: Adjust() for source in sources}, convert_original=False)
+            self.assertEqual(result.created, 2, result.errors)
+            prepare.assert_called_once()
+
     def test_both_exporters_reject_changed_input_during_composition(self):
         from item_engine import export_items, ItemAdjust, item_output_path
         import tempfile
@@ -97,7 +110,7 @@ class EngineTests(unittest.TestCase):
             source = Path(directory) / 'Hero.png'
             for mode in ('token', 'item'):
                 self.figure.save(source)
-                def race(*args):
+                def race(*args, **kwargs):
                     Image.new('RGBA', (32, 32), 'red').save(source)
                     return Image.new('RGBA', (256, 256), 'blue')
                 if mode == 'token':

@@ -170,12 +170,13 @@ class CacheTests(unittest.TestCase):
         disk = Mock()
         disk.directory = self.cache.directory
         disk.load.side_effect = [None, image]
-        extract, factory = Mock(), Mock()
+        extract, factory, decode = Mock(), Mock(), Mock()
         result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
-                             disk_cache=disk, memory={}, sessions={}, decode=read_image,
+                             disk_cache=disk, memory={}, sessions={}, decode=decode,
                              extract=extract, session_factory=factory)
         self.assertIs(result.image, image)
         disk.save.assert_not_called()
+        decode.assert_not_called()
         extract.assert_not_called()
         factory.assert_not_called()
 
@@ -554,18 +555,26 @@ class CacheTests(unittest.TestCase):
 
     def test_preview_geometry_reused_for_placement_only(self):
         from preview_renderer import PreviewJob, PreviewRenderer
-        from token_engine import Adjust, silhouette_geometry
+        from token_engine import Adjust, silhouette_geometry, prepare_token_frame, compose
         image = Image.new('RGBA', (100, 120), 'red')
         frame = read_image(Path(__file__).parent / 'RingT.png')
         mask = frame_interior(frame)
         renderer = PreviewRenderer()
-        with patch('preview_renderer.silhouette_geometry', wraps=silhouette_geometry) as geometry:
+        with patch('preview_renderer.silhouette_geometry', wraps=silhouette_geometry) as geometry, \
+             patch('preview_renderer.prepare_token_frame', wraps=prepare_token_frame) as prepare:
             for serial, zoom in enumerate((80, 100, 130)):
-                renderer.render(PreviewJob(1, serial, image, 'token', False,
-                                           frame, mask, Adjust(zoom=zoom)), None)
+                adjust = Adjust(zoom=zoom)
+                result = renderer.render(PreviewJob(1, serial, image, 'token', False,
+                                                    frame, mask, adjust), None)
+                self.assertEqual(result.tobytes(), compose(image, frame, mask, 512, adjust).tobytes())
             self.assertEqual(geometry.call_count, 1)
+            self.assertEqual(prepare.call_count, 1)
             renderer.render(PreviewJob(2, 5, image.copy(), 'token', False, frame, mask, Adjust()), None)
             self.assertEqual(geometry.call_count, 2)
+            self.assertEqual(prepare.call_count, 1)
+            renderer.render(PreviewJob(2, 6, image, 'token', False, frame, mask, Adjust(), 256), None)
+            renderer.render(PreviewJob(2, 7, image, 'token', False, frame.copy(), mask, Adjust(), 256), None)
+            self.assertEqual(prepare.call_count, 3)
 
     def test_close_decline_rearms_only_transient_save_failure(self):
         from unittest.mock import Mock

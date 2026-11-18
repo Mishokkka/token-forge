@@ -61,18 +61,17 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
             check()
             verify_revision()
             return CutoutResult(None, revision)
-        original = decode(path, identity=identity)
-        if keep_alpha and already_transparent(original):
-            cutout = original
-            publish(cutout)
-        else:
-            # Hold the shared inference reservation until publication. A waiting
-            # process can then reuse the completed result instead of rerunning AI.
-            with process_lock(disk_cache.directory.parent / 'inference', timeout=120):
-                revision = model_revision(model)
-                memory_key = (*key, revision)
-                cutout = cached()
-                if cutout is None:
+        # Recheck under the reservation before allocating decoded pixels.
+        # Transparent bypass and AI extraction share the same publication policy.
+        with process_lock(disk_cache.directory.parent / 'inference', timeout=120):
+            revision = model_revision(model)
+            memory_key = (*key, revision)
+            cutout = cached()
+            if cutout is None:
+                original = decode(path, identity=identity)
+                if keep_alpha and already_transparent(original):
+                    cutout = original
+                else:
                     existing = sessions.get(model)
                     if existing is not None and existing[0] == revision:
                         session = existing[1]
@@ -94,7 +93,7 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
                         memory_key = (*key, revision)
                         sessions[model] = (revision, session)
                     cutout = extract(original, session, edge_mode)
-                    publish(cutout)
+                publish(cutout)
 
     # Also verify hits (including the second lookup under the inference lock).
     check()

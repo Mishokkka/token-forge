@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from weakref import ref
 from PIL import Image
-from token_engine import compose, silhouette_geometry
+from token_engine import compose, silhouette_geometry, prepare_token_frame
 from item_engine import compose_item, _orient
 
 
@@ -26,6 +26,9 @@ class PreviewRenderer:
         self._oriented = None
         self._orientation_key = None
         self._raw = None
+        self._frame = None
+        self._interior = None
+        self._prepared_frame = None
 
     def render(self, job, raw_renderer):
         # A weak reference plus object identity avoids id reuse and does not
@@ -50,5 +53,11 @@ class PreviewRenderer:
             return compose_item(job.cutout, adjust, prepared=self._oriented)
         if self._geometry is None:
             self._geometry = silhouette_geometry(job.cutout)
+        if (self._frame is None or self._frame() is not job.frame
+                or self._interior() is not job.interior
+                or self._prepared_frame.size != job.size):
+            prepared = prepare_token_frame(job.frame, job.interior, job.size)
+            self._frame, self._interior = ref(job.frame), ref(job.interior)
+            self._prepared_frame = prepared
         return compose(job.cutout, job.frame, job.interior, job.size,
-                       job.adjustment, geometry=self._geometry)
+                       job.adjustment, geometry=self._geometry, prepared_frame=self._prepared_frame)

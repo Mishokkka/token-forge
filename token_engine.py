@@ -501,8 +501,28 @@ def silhouette_geometry(cutout: Image.Image):
     return float(median(centers)), head_width, float(y0)
 
 
+@dataclass(frozen=True)
+class PreparedTokenFrame:
+    size: int
+    interior: Image.Image
+    frame: Image.Image
+    visible: Image.Image
+
+
+def prepare_token_frame(frame, interior, out_size):
+    """Prepare the invariant ring layers once per frame and output size."""
+    inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    support = interior.point(lambda a: 255 if a else 0).resize(
+        (out_size, out_size), Image.Resampling.NEAREST)
+    inner = ImageChops.multiply(inner, support)
+    resized_frame = frame.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    visible = ImageChops.invert(resized_frame.getchannel('A'))
+    return PreparedTokenFrame(out_size, inner, resized_frame, visible)
+
+
 def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
-            out_size: int = 256, adjust: Adjust | None = None, *, geometry=None) -> Image.Image:
+            out_size: int = 256, adjust: Adjust | None = None, *, geometry=None,
+            prepared_frame=None) -> Image.Image:
     """Place cutout against a ring, clipping everything outside its interior."""
     if adjust is None:
         adjust = Adjust()
@@ -541,17 +561,14 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
             raise ValueError('Масштаб токена слишком велик для безопасной компоновки.')
         scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
         image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
-    inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
-    support = interior.point(lambda a: 255 if a else 0).resize(
-        (out_size, out_size), Image.Resampling.NEAREST)
-    inner = ImageChops.multiply(inner, support)
-    image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), inner))
-    resized_frame = frame.resize((out_size, out_size), Image.Resampling.LANCZOS)
-    visible = ImageChops.multiply(image_layer.getchannel('A'),
-                                  ImageChops.invert(resized_frame.getchannel('A')))
+    prepared = prepare_token_frame(frame, interior, out_size) if prepared_frame is None else prepared_frame
+    if prepared.size != out_size:
+        raise ValueError('Размер подготовленной рамки не соответствует размеру токена.')
+    image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), prepared.interior))
+    visible = ImageChops.multiply(image_layer.getchannel('A'), prepared.visible)
     if visible.getbbox() is None:
         raise ValueError('Персонаж полностью вне видимой области рамки. Измени положение или масштаб.')
-    token = Image.alpha_composite(image_layer, resized_frame)
+    token = Image.alpha_composite(image_layer, prepared.frame)
     return token
 
 
@@ -1324,6 +1341,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  frame_loader=None, expected_inputs=None, extraction_recipe=None,
                  captured_loader=None) -> BatchResult:
     frame_digest = None
+    prepared_frame = None
     def ensure_frame():
         nonlocal frame, interior
         if frame is None and frame_loader is not None:
@@ -1345,8 +1363,13 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
         return token_recipe(frame, adjustments[source], out_size, format_name, extraction,
                             frame_digest=frame_digest)
     def render(cutout, source):
-        ensure_frame()
-        return compose(cutout, frame, interior, out_size, adjustments[source])
+        nonlocal prepared_frame
+        if ensure_frame() is None or interior is None:
+            raise ValueError('Выбери корректное PNG-кольцо.')
+        if prepared_frame is None:
+            prepared_frame = prepare_token_frame(frame, interior, out_size)
+        return compose(cutout, frame, interior, out_size, adjustments[source],
+                       prepared_frame=prepared_frame)
     return export_images(files, get_cutout, lambda p: token_output_path(p, format_name),
                          render, kind='token', skip_exists=skip_exists,
                          convert_original=convert_original, cancel_event=cancel_event,
