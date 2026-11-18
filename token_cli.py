@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from settings_store import read_settings_file
+from local_models import DEFAULT_MODEL, require_local_model, new_local_session
 import os
 import traceback
 from datetime import datetime
@@ -11,7 +12,7 @@ from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
     export_batch, frame_interior, list_source_images, read_image,
     remove_background, token_output_path, source_identity, assert_source_identity, read_export_owner,
-    LoadedCutout,
+    LoadedCutout, recorded_source_matches,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -40,8 +41,10 @@ def resolve_context_source(filename: str | Path) -> Path:
     if owner is None:
         return path
     candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
-    matches = [p for p in candidates
-               if (p.name if owner[0] == 2 else p.stem).casefold() == owner[2].casefold()]
+    if owner[0] == 2:
+        matches = [p for p in candidates if recorded_source_matches(p, owner[2])]
+    else:
+        matches = [p for p in candidates if p.stem.casefold() == owner[2].casefold()]
     if len(matches) != 1:
         raise ValueError(f'Не удалось однозначно найти исходный арт для {path.name}.')
     return matches[0]
@@ -59,6 +62,7 @@ def _adjust_for(settings: dict, source: Path) -> Adjust:
 
 
 def make_cutout_loader(model, keep_alpha, edge_mode):
+    require_local_model(model)
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     def get_cutout(path: Path):
         identity = source_identity(path)
@@ -71,8 +75,7 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
         if keep_alpha and already_transparent(original):
             cutout = original
         else:
-            from rembg import new_session
-            cutout = remove_background(original, new_session(model), edge_mode)
+            cutout = remove_background(original, new_local_session(model), edge_mode)
         try:
             cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
         except OSError:
@@ -98,7 +101,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
             raise ValueError('PNG-кольцо должно быть квадратным.')
         return frame, frame_interior(frame)
 
-    model = settings.get('model', 'birefnet-general')
+    model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
     ext = str(settings.get('ext', 'webp')).lower()
@@ -135,7 +138,7 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     """Create 500x500 equipment art using the same reusable cutout cache."""
     source = resolve_context_source(filename)
     settings = read_settings()
-    model = settings.get('model', 'birefnet-general')
+    model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
     stored = override_for(settings, 'item_overrides', source)

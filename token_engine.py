@@ -73,11 +73,9 @@ class DiskCutoutCache:
                 return stored.convert('RGBA')
         except FileNotFoundError:
             return None
-        except (OSError, ValueError):
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass  # A read-only cache must not block fresh extraction.
+        except (OSError, ValueError, Image.DecompressionBombError):
+            # Never unlink a name after a failed read: another process may
+            # already have replaced it with a valid entry.
             return None
 
     def save(self, source: Path, model: str, keep_alpha: bool,
@@ -310,6 +308,15 @@ class Publication:
         return self.created
 
 
+def windows_extended_path(path):
+    value = str(path.absolute())
+    if value.startswith('\\\\?\\'):
+        return value
+    if value.startswith('\\\\'):
+        return '\\\\?\\UNC\\' + value[2:]
+    return '\\\\?\\' + value
+
+
 def _windows_replace(temporary, destination, backup):
     import ctypes
     from ctypes import wintypes
@@ -317,7 +324,7 @@ def _windows_replace(temporary, destination, backup):
     replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
                         wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
     replace.restype = wintypes.BOOL
-    if not replace(str(destination), str(temporary), str(backup), 0, None, None):
+    if not replace(windows_extended_path(destination), windows_extended_path(temporary), windows_extended_path(backup), 0, None, None):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
@@ -337,6 +344,8 @@ def _replace_preserving_displaced(temporary: Path, destination: Path, expected: 
     """Publish without silently discarding an unexpected displaced file."""
     import uuid
     recovery = destination.parent / '.tokenforge-recovery'
+    if os.name == 'nt':
+        recovery = Path(windows_extended_path(recovery))
     recovery.mkdir(exist_ok=True)
     backup = recovery / (uuid.uuid4().hex + destination.suffix)
     if os.name == 'nt':
@@ -366,12 +375,14 @@ def _replace_preserving_displaced(temporary: Path, destination: Path, expected: 
 
 
 def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=None,
-                 expected_destination=None, after_publish=None) -> Publication:
+                 expected_destination=None, after_publish=None,
+                 late_conflict_hint='Повтори обработку с отключённым пропуском готовых изображений.') -> Publication:
     """Publish only a complete, closed file and distinguish success with warnings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
     warnings = []
     created = False
+    failure = None
     try:
         with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent,
                                          prefix='.tokenforge-', suffix='.tmp', delete=False) as fp:
@@ -392,15 +403,21 @@ def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=Non
                 after_publish()
             except OSError as exc:
                 warnings.append(f'Результат записан, но исходник изменился или недоступен: {exc}. '
-                                'Повтори обработку с отключённым пропуском готовых изображений.')
+                                + late_conflict_hint)
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
         if temporary is not None:
             try:
                 temporary.unlink(missing_ok=True)
             except OSError as exc:
-                if not created:
+                if failure is not None:
+                    failure.add_note(f'Не удалось очистить временный файл {temporary}: {exc}')
+                elif not created:
                     raise
-                warnings.append(f'Не удалось очистить временный файл {temporary}: {exc}')
+                else:
+                    warnings.append(f'Не удалось очистить временный файл {temporary}: {exc}')
     return Publication(created, tuple(warnings))
 
 
@@ -437,12 +454,25 @@ def read_export_owner(destination: Path) -> tuple | None:
     return None
 
 
+def recorded_source_matches(source: Path, filename: str) -> bool:
+    # Exact spelling is always valid; a case variant only if the filesystem
+    # confirms that both names refer to the same existing file.
+    if source.name == filename:
+        return True
+    if source.name.casefold() != filename.casefold():
+        return False
+    try:
+        return source.samefile(source.with_name(filename))
+    except OSError:
+        return False
+
+
 def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
     owner = read_export_owner(destination)
     if not owner or owner[1] != kind:
         return False
     if owner[0] == 2:
-        return owner[2].casefold() == source.name.casefold()
+        return recorded_source_matches(source, owner[2])
     if owner[2].casefold() != source.stem.casefold():
         return False
     # Old v1 markers lack an extension; resolve only when unambiguous.
@@ -451,19 +481,50 @@ def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
                    and read_export_owner(p) is None for p in list_images(source.parent))
 
 
-def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> None:
-    # Two independent originals with the same stem have identical output names.
-    # A different original may also need destination as its own WebP copy.
-    for candidate in list_images(source.parent):
-        if candidate.resolve() == source.resolve():
+class FolderIndex:
+    """Name index refreshed on directory changes; inspect only colliding stems.
+
+    No per-entry resolve/stat or image decode for unrelated files. The final
+    destination guard remains independent of this index.
+    """
+    def __init__(self):
+        self.folders = {}
+
+    def candidates(self, folder, stems):
+        info = folder.stat()
+        stamp = (info.st_mtime_ns, info.st_ctime_ns)
+        previous = self.folders.get(folder)
+        if previous is None or previous[0] != stamp:
+            indexed = {}
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    path = Path(entry.name)
+                    if path.suffix.lower() in IMAGE_EXTS:
+                        indexed.setdefault(path.stem.casefold(), []).append(folder / entry.name)
+            self.folders[folder] = stamp, indexed
+        else:
+            indexed = previous[1]
+        return (p for stem in stems for p in indexed.get(stem, ()) if p.is_file())
+
+
+def ensure_no_source_collision(destination: Path, source: Path, kind: str, index=None) -> None:
+    index = index if index is not None else FolderIndex()
+    stems = {source.stem.casefold()}
+    if destination.suffix.lower() == '.webp':
+        stems.add(destination.stem.casefold())
+    for candidate in index.candidates(source.parent, stems):
+        if candidate == source and candidate.name == source.name:
             continue
-        if candidate.resolve() == destination.resolve():
-            # An unmarked exact-path conflict is handled by save_generated,
-            # including the user's explicit approval of a legacy export.
+        if candidate == destination and candidate.name == destination.name:
             continue
-        if (candidate.stem.casefold() == source.stem.casefold()
-                or (destination.suffix.lower() == '.webp'
-                    and candidate.stem.casefold() == destination.stem.casefold())) and read_export_owner(candidate) is None:
+        # Path equality alone is case-insensitive under Windows. Do not
+        # collapse separate names in a case-sensitive Windows directory.
+        try:
+            if candidate.samefile(source) or (destination.exists() and candidate.samefile(destination)):
+                continue
+        except OSError:
+            pass
+        if read_export_owner(candidate) is None:
             raise FileExistsError(f'Имя {destination.name} конфликтует с исходником {candidate.name}. '
                                   'Переименуй один из исходников.')
 
@@ -545,7 +606,8 @@ def save_original_webp(source: Path) -> Publication:
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
                                                        method=6, alpha_quality=100, exif=exif),
                                replace=False, before_publish=lambda: assert_source_identity(source, identity),
-                               after_publish=lambda: assert_source_identity(source, identity))
+                               after_publish=lambda: assert_source_identity(source, identity),
+                               late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
         if not created and not is_owned_export(destination, source, 'copy'):
             raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
         return created
@@ -579,6 +641,8 @@ class BatchResult:
 
     def record_error(self, source: Path, stage: str, exc: Exception) -> None:
         message = f'{source.name}: {stage}: {exc}'
+        if getattr(exc, '__notes__', None):
+            message += '\n' + '\n'.join(exc.__notes__)
         self.errors.append(message)
         self.error_details.append(message + '\n' + traceback.format_exc())
 
@@ -593,6 +657,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
     """
     result = BatchResult(errors=[], total=len(files))
     stage = 'генерация токена' if kind == 'token' else 'генерация предмета'
+    folders = FolderIndex()
     for index, source in enumerate(files):
         if cancel_event is not None and cancel_event.is_set():
             result.cancelled = True
@@ -608,7 +673,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 result.record_error(source, 'преобразование оригинала', exc)
         destination = output_path(source)
         try:
-            ensure_no_source_collision(destination, source, kind)
+            ensure_no_source_collision(destination, source, kind, folders)
             if skip_exists and destination.exists():
                 if not is_owned_export(destination, source, kind):
                     raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')

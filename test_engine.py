@@ -210,6 +210,41 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), b'old')
             self.assertFalse(list(dest.parent.glob('.tokenforge-*.tmp')))
 
+    def test_folder_index_reuses_scan_and_detects_new_conflict(self):
+        from token_engine import FolderIndex, ensure_no_source_collision
+        import tempfile
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            source = folder / 'Ca.png'
+            self.figure.save(source)
+            index = FolderIndex()
+            with patch('token_engine.os.scandir', wraps=os.scandir) as scan:
+                for _ in range(10):
+                    ensure_no_source_collision(token_output_path(source), source, 'token', index)
+                self.assertEqual(scan.call_count, 1)
+                conflict = folder / 'Cat.jpg'
+                self.figure.convert('RGB').save(conflict)
+                # Force a distinct observable directory timestamp on filesystems
+                # with low timestamp resolution.
+                stat = folder.stat()
+                os.utime(folder, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2000000000))
+                with self.assertRaises(FileExistsError):
+                    ensure_no_source_collision(token_output_path(source), source, 'token', index)
+                self.assertEqual(scan.call_count, 2)
+
+    def test_cleanup_failure_keeps_publication_error(self):
+        from token_engine import atomic_write
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / 'output.webp'
+            def fail():
+                raise OSError('recovery at important path')
+            with patch.object(Path, 'unlink', side_effect=PermissionError('cleanup denied')):
+                with self.assertRaisesRegex(OSError, 'important path') as caught:
+                    atomic_write(dest, lambda fp: fp.write(b'x'), before_publish=fail)
+            self.assertIn('cleanup denied', caught.exception.__notes__[0])
+
     def test_render_shape_and_alpha(self):
         token = compose(self.figure, self.frame, self.mask, 256)
         self.assertEqual(token.size, (256, 256))

@@ -198,6 +198,14 @@ class CliTests(unittest.TestCase):
             auto.assert_called_once_with(str(self.photo), item=False)
             gui.assert_not_called()
 
+    def test_remote_or_unknown_model_is_rejected_before_io(self):
+        self.settings['model'] = 'remote'
+        self.save_settings()
+        for action in (token_cli.automatic_token, token_cli.automatic_item):
+            with self.assertRaisesRegex(ValueError, 'локальная модель'):
+                action(self.photo)
+        self.assertEqual(list(self.art_folder.iterdir()), [self.photo])
+
     def test_invalid_settings_prevent_automatic_publication(self):
         settings = self.pref / 'settings.json'
         for value in ('null', '[]', '{invalid'):

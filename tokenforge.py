@@ -25,6 +25,7 @@ from token_engine import (
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import read_settings_file, save_settings_delta
+from local_models import LOCAL_MODELS, DEFAULT_MODEL, require_local_model, new_local_session
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -43,7 +44,7 @@ INPUT = '#2a2e35'
 FG = '#e9ecf1'
 MUTED = '#a0a6b1'
 BLUE = '#789fff'
-MODELS = ['birefnet-general', 'birefnet-portrait', 'bria-rmbg', 'birefnet-general-lite', 'isnet-general-use', 'isnet-anime', 'u2net']
+MODELS = LOCAL_MODELS
 EDGE_MODES = ['Очистка краёв', 'Обычный', 'Alpha matting (медленно)']
 
 
@@ -110,7 +111,8 @@ class TokenForge:
         self.sliders_updating = False
         self.save_timer = None
 
-        self.model = tk.StringVar(value=self.settings.get('model', MODELS[0]))
+        saved_model = self.settings.get('model', DEFAULT_MODEL)
+        self.model = tk.StringVar(value=saved_model if saved_model in MODELS else DEFAULT_MODEL)
         self.edge_mode = tk.StringVar(value=self.settings.get('edge_mode', EDGE_MODES[0]))
         self.show_cutout = tk.BooleanVar(value=False)
         saved_size = str(self.settings.get('size', 256))
@@ -614,6 +616,7 @@ class TokenForge:
         return (*source_identity(path), model, keep_alpha, edge_mode)
 
     def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False):
+        require_local_model(model)
         key = key if key is not None else self._cache_key(path, model, keep_alpha, edge_mode)
         identity = key[:4]
         if key in self.cache:
@@ -631,8 +634,7 @@ class TokenForge:
                 cutout = original
             else:
                 if model not in self.sessions:
-                    from rembg import new_session
-                    self.sessions[model] = new_session(model)
+                    self.sessions[model] = new_local_session(model)
                 cutout = remove_background(original, self.sessions[model], edge_mode)
             try:
                 self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)

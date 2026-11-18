@@ -22,19 +22,19 @@ class CacheTests(unittest.TestCase):
     def test_disk_cache_persists_full_rgba_unchanged(self):
         image = Image.new('RGBA', (170, 220), (11, 22, 33, 0))
         image.putpixel((20, 30), (71, 92, 154, 157))
-        self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
-        self.cache.save(self.source, 'm', False, 'e', image)
-        stored = DiskCutoutCache(self.directory / 'cache').load(self.source, 'm', False, 'e')
+        self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
+        self.cache.save(self.source, 'birefnet-general', False, 'e', image)
+        stored = DiskCutoutCache(self.directory / 'cache').load(self.source, 'birefnet-general', False, 'e')
         self.assertIsNotNone(stored)
         self.assertEqual(stored.tobytes(), image.tobytes())
 
     def test_cache_key_invalidation(self):
-        baseline = self.cache.path_for(self.source, 'm', False, 'e')
-        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'm2', False, 'e'))
-        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'm', False, 'different'))
-        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'm', True, 'e'))
+        baseline = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
+        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'birefnet-portrait', False, 'e'))
+        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'birefnet-general', False, 'different'))
+        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'birefnet-general', True, 'e'))
         Image.new('RGB', (171, 220), (60, 50, 40)).save(self.source)
-        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'm', False, 'e'))
+        self.assertNotEqual(baseline, self.cache.path_for(self.source, 'birefnet-general', False, 'e'))
 
     def test_same_size_same_mtime_replacement_invalidates_content_cache(self):
         import os
@@ -43,26 +43,26 @@ class CacheTests(unittest.TestCase):
         Image.new('RGB', (40, 20), 'red').save(bmp)
         info = bmp.stat()
         identity = source_identity(bmp)
-        self.cache.save(bmp, 'm', False, 'e', Image.new('RGBA', (40, 20), 'red'))
+        self.cache.save(bmp, 'birefnet-general', False, 'e', Image.new('RGBA', (40, 20), 'red'))
         Image.new('RGB', (40, 20), 'blue').save(bmp)
         os.utime(bmp, ns=(info.st_atime_ns, info.st_mtime_ns))
         self.assertEqual(bmp.stat().st_size, info.st_size)
         self.assertNotEqual(source_identity(bmp), identity)
-        self.assertIsNone(self.cache.load(bmp, 'm', False, 'e'))
+        self.assertIsNone(self.cache.load(bmp, 'birefnet-general', False, 'e'))
 
     def test_corrupt_cache_is_discarded(self):
-        path = self.cache.path_for(self.source, 'm', False, 'e')
+        path = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'not an image')
-        self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
-        self.assertFalse(path.exists())
+        self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
+        self.assertTrue(path.exists())  # do not delete a potentially refreshed entry
 
     def test_unreadable_cache_cleanup_is_best_effort(self):
-        path = self.cache.path_for(self.source, 'm', False, 'e')
+        path = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b'corrupt')
         with patch.object(Path, 'unlink', side_effect=PermissionError('read-only')):
-            self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
+            self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
 
     def test_source_replaced_during_inference_does_not_poison_cache(self):
         app = self.make_mock_app()
@@ -72,8 +72,8 @@ class CacheTests(unittest.TestCase):
         with patch('tokenforge.remove_background', side_effect=replace_source), \
              patch.dict('sys.modules', {'rembg': SimpleNamespace(new_session=lambda name: object())}):
             with self.assertRaises(OSError):
-                app._get_cutout(self.source, 'm', False, 'e')
-        self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
+                app._get_cutout(self.source, 'birefnet-general', False, 'e')
+        self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
 
     def make_mock_app(self):
         app = TokenForge.__new__(TokenForge)
@@ -98,13 +98,13 @@ class CacheTests(unittest.TestCase):
         with patch('tokenforge.remove_background', side_effect=fake_cut), \
              patch.dict('sys.modules', {'rembg': SimpleNamespace(new_session=lambda name: object())}):
             first = self.make_mock_app()
-            a, _ = first._get_cutout(self.source, 'm', False, 'e')
+            a, _ = first._get_cutout(self.source, 'birefnet-general', False, 'e')
             self.assertEqual(a.tobytes(), cutout.tobytes())
             second = self.make_mock_app()
-            b, _ = second._get_cutout(self.source, 'm', False, 'e')
+            b, _ = second._get_cutout(self.source, 'birefnet-general', False, 'e')
             self.assertEqual(b.tobytes(), cutout.tobytes())
             self.assertEqual(len(count), 1)
-            second._get_cutout(self.source, 'm', False, 'different')
+            second._get_cutout(self.source, 'birefnet-general', False, 'different')
             self.assertEqual(len(count), 2)
 
     def test_single_export_overwrites_even_when_skip_enabled(self):
@@ -118,7 +118,7 @@ class CacheTests(unittest.TestCase):
         app.pending_export = None
         app.frame = frame
         app.interior = interior
-        app.model = SimpleNamespace(get=lambda: 'm')
+        app.model = SimpleNamespace(get=lambda: 'birefnet-general')
         app.keep_alpha = SimpleNamespace(get=lambda: True)
         app.edge_mode = SimpleNamespace(get=lambda: 'Очистка краёв')
         app.ext = SimpleNamespace(get=lambda: 'webp')
@@ -151,7 +151,7 @@ class CacheTests(unittest.TestCase):
         app.cancel_event = threading.Event()
         def control(value):
             return SimpleNamespace(get=lambda: value)
-        for name, value in {'work_mode': 'token', 'model': 'm', 'keep_alpha': True,
+        for name, value in {'work_mode': 'token', 'model': 'birefnet-general', 'keep_alpha': True,
                             'edge_mode': 'Обычный', 'ext': 'webp', 'size': '512',
                             'skip_exists': True, 'convert_original': False}.items():
             setattr(app, name, control(value))
@@ -230,10 +230,10 @@ class CacheTests(unittest.TestCase):
         app.pending_export = None
         app.preview_pending = False
         app.busy = True
-        app.model = SimpleNamespace(get=lambda: 'm')
+        app.model = SimpleNamespace(get=lambda: 'birefnet-general')
         app.keep_alpha = SimpleNamespace(get=lambda: False)
         app.edge_mode = SimpleNamespace(get=lambda: 'e')
-        key = app._cache_key(self.source, 'm', False, 'e')
+        key = app._cache_key(self.source, 'birefnet-general', False, 'e')
         self.source.unlink()
         request = app._preview_request()
         app.preview_generation += 1
@@ -272,11 +272,11 @@ class CacheTests(unittest.TestCase):
         app.pending_export = None
         app.preview_pending = True
         app.busy = True
-        app.model = SimpleNamespace(get=lambda: 'm')
+        app.model = SimpleNamespace(get=lambda: 'birefnet-general')
         app.keep_alpha = SimpleNamespace(get=lambda: False)
         app.edge_mode = SimpleNamespace(get=lambda: 'e')
         app._request_preview = Mock()
-        app.events.put(('error', ((0, self.source, 'm', False, 'e'), 'old failure')))
+        app.events.put(('error', ((0, self.source, 'birefnet-general', False, 'e'), 'old failure')))
         with patch('tokenforge.messagebox.showerror') as error:
             app._poll()
             error.assert_not_called()
@@ -305,11 +305,11 @@ class CacheTests(unittest.TestCase):
         app.frame = object()
         app.busy = False
         app.preview_pending = False
-        for name, value in {'work_mode': 'token', 'show_cutout': False, 'model': 'm',
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'model': 'birefnet-general',
                             'keep_alpha': True, 'edge_mode': 'e'}.items():
             setattr(app, name, SimpleNamespace(get=lambda v=value: v))
         app.current_cutout = read_image(self.source)
-        app.current_key = app._cache_key(self.source, 'm', True, 'e')
+        app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
         Image.new('RGBA', (171, 220), (255, 0, 0, 200)).save(self.source)
         worker = Mock()
         with patch('tokenforge.threading.Thread', return_value=worker) as launch, \

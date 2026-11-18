@@ -105,6 +105,15 @@ class ItemTests(unittest.TestCase):
             result = export_items(*args, skip_exists=False, convert_original=False)
             self.assertEqual(result.created, 1)
 
+    def test_outline_covers_mixed_opacity_regions(self):
+        item = Image.new('RGBA', (100, 50), (200, 50, 30, 100))
+        ImageDraw.Draw(item).rectangle((0, 0, 49, 49), fill=(200, 50, 30, 255))
+        rendered = compose_item(item, ItemAdjust())
+        box = rendered.getchannel('A').getbbox()
+        y = 250
+        self.assertEqual(rendered.getpixel((box[2]-1, y)), (0, 0, 0, 255))
+        self.assertEqual(rendered.getpixel((350, y)), (200, 50, 30, 100))
+
     def test_translucent_item_diagonal_and_outline(self):
         item = Image.new('RGBA', (60, 300))
         ImageDraw.Draw(item).rectangle((25, 10, 34, 289), fill=(220, 50, 20, 50))

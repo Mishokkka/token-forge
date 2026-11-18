@@ -172,9 +172,8 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     canvas.alpha_composite(placed, dest=(px, py))
     if stroke_px:
         alpha = canvas.getchannel('A')
-        peak = alpha.getextrema()[1]
-        cutoff = 128 if peak >= 128 else max(1, (peak + 1) // 2)
-        contour = alpha.point(lambda a: 255 if a >= cutoff else 0)
+        # All retained nonzero-alpha regions belong to the silhouette.
+        contour = alpha.point(lambda a: 255 if a else 0)
         dilated = contour.filter(ImageFilter.MaxFilter(2 * stroke_px + 1))
         # An outline must not contribute opacity or black to any visible
         # subject pixel, including translucent interiors and feathered edges.
