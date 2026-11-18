@@ -51,7 +51,7 @@ def _prepare_subject(image: Image.Image, clean_noise: bool = True) -> Image.Imag
 
 
 def _subject_bbox(image: Image.Image, clean_noise: bool = True):
-    subject = _prepare_subject(image, clean_noise)
+    subject = image if image.mode == 'RGBA' and not clean_noise else _prepare_subject(image, clean_noise)
     box = subject.getchannel('A').getbbox()
     if box is None:
         raise ValueError('Предмет не найден: прозрачная маска пуста.')
@@ -186,9 +186,9 @@ def outline_subject(canvas, stroke_px):
 
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
-                 on_progress=None, approved_outputs=None) -> BatchResult:
+                 on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
     return export_images(files, get_cutout, item_output_path,
                          lambda image, source: compose_item(image, adjustments[source]),
                          kind='item', skip_exists=skip_exists, convert_original=convert_original,
                          cancel_event=cancel_event, on_progress=on_progress,
-                         approved_outputs=approved_outputs)
+                         approved_outputs=approved_outputs, expected_inputs=expected_inputs)

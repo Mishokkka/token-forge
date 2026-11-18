@@ -870,13 +870,15 @@ class TokenForge:
                     result = export_items(selected_files, get_cutout, captured,
                                           skip_exists=skip, convert_original=convert,
                                           cancel_event=self.cancel_event, on_progress=progress,
-                                          approved_outputs=approved_outputs)
+                                          approved_outputs=approved_outputs,
+                                          expected_inputs={str(files[0]): expected_input} if expected_input is not None else None)
                 else:
                     result = export_batch(selected_files, get_cutout, frame, interior,
                                           captured, out_size=size, format_name=ext,
                                           skip_exists=skip, convert_original=convert,
                                           cancel_event=self.cancel_event, on_progress=progress,
-                                          approved_outputs=approved_outputs)
+                                          approved_outputs=approved_outputs,
+                                          expected_inputs={str(files[0]): expected_input} if expected_input is not None else None)
                 self.events.put(('done', result))
             except Exception as exc:
                 self.events.put(('batch_failure', traceback.format_exc()))

@@ -1,5 +1,6 @@
 """Run with python -m unittest test_engine.py (requires Pillow only)."""
 import unittest
+import tempfile
 from unittest.mock import patch
 from types import SimpleNamespace
 import sys
@@ -230,8 +231,94 @@ class EngineTests(unittest.TestCase):
                 stat = folder.stat()
                 os.utime(folder, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2000000000))
                 with self.assertRaises(FileExistsError):
-                    ensure_no_source_collision(token_output_path(source), source, 'token', index)
-                self.assertEqual(scan.call_count, 2)
+                    ensure_no_source_collision(token_output_path(source), source, 'token', index, live=True)
+                self.assertEqual(scan.call_count, 1 if os.name == 'nt' else 2)
+
+    def test_invalid_metadata_is_not_a_discovery_failure(self):
+        from token_engine import _parse_owner
+        self.assertIsNone(_parse_owner('other:' + '[' * 2000))
+        self.assertIsNone(_parse_owner('TokenForge/2:' + '[' * 1500 + ']' * 1500))
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'A.png'
+            exif = Image.Exif()
+            exif[270] = 'TokenForge/2:' + '[' * 1500 + ']' * 1500
+            self.figure.save(source, exif=exif)
+            self.assertEqual(list_source_images(source.parent), [source])
+
+    def test_copy_and_token_share_one_identity(self):
+        import token_engine
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            old = token_engine.save_original_webp
+            def change(*args, **kwargs):
+                result = old(*args, **kwargs)
+                Image.new('RGBA', (32, 32), 'red').save(source)
+                return result
+            with patch('token_engine.save_original_webp', side_effect=change):
+                result = export_batch([source], read_image, self.frame, self.mask, {source: Adjust()})
+            self.assertEqual((result.converted, result.created), (1, 0))
+            self.assertTrue(result.errors)
+            self.assertFalse(token_output_path(source).exists())
+
+    def test_preview_identity_checked_before_copy(self):
+        from token_engine import source_identity
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            identity = source_identity(source)
+            Image.new('RGBA', (32, 32), 'red').save(source)
+            result = export_batch([source], read_image, self.frame, self.mask, {source: Adjust()},
+                                  expected_inputs={str(source): identity})
+            self.assertEqual((result.converted, result.created), (0, 0))
+            self.assertTrue(result.errors)
+            self.assertFalse(source.with_suffix('.webp').exists())
+
+    def test_ownership_is_bound_to_fingerprint(self):
+        from token_engine import save_generated
+        import token_engine
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source)
+            self.figure.save(dest)
+            before = dest.read_bytes()
+            original = token_engine.source_identity
+            def race(path):
+                identity = original(path)
+                if path == dest:
+                    exif = Image.Exif()
+                    exif[270] = token_engine.export_owner(source, 'token')
+                    self.figure.save(dest, exif=exif)
+                return identity
+            with patch('token_engine.source_identity', side_effect=race):
+                with self.assertRaises(OSError):
+                    save_generated(self.figure, dest, source, 'token', skip_exists=False)
+            # The externally supplied file remains intact, not our export.
+            self.assertNotEqual(dest.read_bytes(), before)
+            self.assertEqual(token_engine.read_export_owner(dest), (2, 'token', 'Hero.png'))
+
+    def test_corrupt_owned_png_is_not_counted_as_skip(self):
+        from token_engine import save_generated, read_export_owner
+        import struct
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source, 'png')
+            save_generated(self.figure, dest, source, 'token', skip_exists=False)
+            contents = dest.read_bytes()
+            pos = 8
+            while contents[pos+4:pos+8] != b'IDAT':
+                pos += 12 + struct.unpack('>I', contents[pos:pos+4])[0]
+            dest.write_bytes(contents[:pos+9])
+            self.assertIsNotNone(read_export_owner(dest))
+            result = export_batch([source], read_image, self.frame, self.mask, {source: Adjust()},
+                                  format_name='png', convert_original=False)
+            self.assertEqual((result.created, result.skipped), (0, 0))
+            self.assertTrue(result.errors)
+            result = export_batch([source], read_image, self.frame, self.mask, {source: Adjust()},
+                                  format_name='png', convert_original=False, skip_exists=False)
+            self.assertEqual(result.created, 1)
 
     def test_cleanup_failure_keeps_publication_error(self):
         from token_engine import atomic_write

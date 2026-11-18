@@ -457,27 +457,55 @@ def export_owner(source: Path, kind: str) -> str:
     return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
 
 
-def read_export_owner(destination: Path) -> tuple | None:
-    """Read a validated marker; arbitrary filename suffixes are never proof."""
-    if destination.suffix.lower() not in ('.png', '.webp'):
-        return None  # these are the only formats TokenForge has ever marked
+class InvalidExportError(OSError):
+    pass
+
+
+def _parse_owner(owner):
+    if not isinstance(owner, str) or len(owner) > 4096:
+        return None
+    prefix, separator, payload = owner.partition(':')
+    version = {'TokenForge/1': 1, 'TokenForge/2': 2}.get(prefix)
+    if not separator or version is None:
+        return None
     try:
-        with Image.open(destination) as stored:
-            owner = stored.getexif().get(270)
-        if not isinstance(owner, str):
-            return None
-        prefix, payload = owner.split(':', 1)
-        version = {'TokenForge/1': 1, 'TokenForge/2': 2}.get(prefix)
         values = json.loads(payload)
-        if (version and isinstance(values, list) and len(values) == 2
-                and values[0] in ('token', 'item', 'copy')
-                and isinstance(values[1], str) and values[1]
-                and '/' not in values[1] and '\\' not in values[1]
-                and ':' not in values[1] and values[1] not in ('.', '..')):
-            return version, values[0], values[1]
-    except (OSError, ValueError, SyntaxError, TypeError, Image.DecompressionBombError):
-        pass
+    except (ValueError, RecursionError):
+        return None
+    if (isinstance(values, list) and len(values) == 2
+            and values[0] in ('token', 'item', 'copy')
+            and isinstance(values[1], str) and values[1]
+            and not any(c in values[1] for c in ('/', '\\', ':', '\0'))
+            and values[1] not in ('.', '..')):
+        return version, values[0], values[1]
     return None
+
+
+def _probe_owner(stream, *, require_pixels=False):
+    """Discovery is not evidence that the pixels are decodable."""
+    try:
+        with Image.open(stream) as stored:
+            owner = _parse_owner(stored.getexif().get(270))
+            if owner and require_pixels:
+                try:
+                    stored.load()
+                except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+                    raise InvalidExportError('Готовое изображение повреждено. Отключи пропуск и создай его заново.') from exc
+            return owner
+    except InvalidExportError:
+        raise
+    except (OSError, ValueError, SyntaxError, TypeError, RecursionError, Image.DecompressionBombError):
+        return None
+
+
+def read_export_owner(destination: Path, *, identity=None, require_pixels=False) -> tuple | None:
+    """For mutations, inspect the exact bytes that were fingerprinted."""
+    if destination.suffix.lower() not in ('.png', '.webp'):
+        return None
+    if identity is not None:
+        with source_snapshot(destination, identity) as snapshot:
+            return _probe_owner(snapshot, require_pixels=require_pixels)
+    return _probe_owner(destination, require_pixels=require_pixels)
 
 
 def recorded_source_matches(source: Path, filename: str) -> bool:
@@ -493,8 +521,9 @@ def recorded_source_matches(source: Path, filename: str) -> bool:
         return False
 
 
-def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
-    owner = read_export_owner(destination)
+def is_owned_export(destination: Path, source: Path, kind: str, *, identity=None,
+                    require_pixels=False) -> bool:
+    owner = read_export_owner(destination, identity=identity, require_pixels=require_pixels)
     if not owner or owner[1] != kind:
         return False
     if owner[0] == 2:
@@ -502,49 +531,107 @@ def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
     if owner[2].casefold() != source.stem.casefold():
         return False
     # Old v1 markers lack an extension; resolve only when unambiguous.
-    return not any(p.resolve() != source.resolve()
-                   and p.stem.casefold() == source.stem.casefold()
-                   and read_export_owner(p) is None for p in list_images(source.parent))
+    return not any(p.name != source.name and not recorded_source_matches(source, p.name)
+                   and read_export_owner(p) is None
+                   for p in live_stem_candidates(source.parent, {source.stem}))
+
+
+def _windows_stem_names(folder, stem):
+    """Ask Windows for matching names rather than enumerating the directory."""
+    import ctypes
+    from ctypes import wintypes
+
+    class FindData(ctypes.Structure):
+        _fields_ = [('attributes', wintypes.DWORD), ('created', wintypes.FILETIME),
+                    ('accessed', wintypes.FILETIME), ('written', wintypes.FILETIME),
+                    ('size_high', wintypes.DWORD), ('size_low', wintypes.DWORD),
+                    ('reserved0', wintypes.DWORD), ('reserved1', wintypes.DWORD),
+                    ('name', wintypes.WCHAR * 260), ('alternate', wintypes.WCHAR * 14)]
+
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    first, next_file, close = api.FindFirstFileW, api.FindNextFileW, api.FindClose
+    first.argtypes, first.restype = [wintypes.LPCWSTR, ctypes.POINTER(FindData)], wintypes.HANDLE
+    next_file.argtypes, next_file.restype = [wintypes.HANDLE, ctypes.POINTER(FindData)], wintypes.BOOL
+    close.argtypes, close.restype = [wintypes.HANDLE], wintypes.BOOL
+    data = FindData()
+    handle = first(windows_extended_path(folder / (stem + '.*')), ctypes.byref(data))
+    if handle == ctypes.c_void_p(-1).value:
+        code = ctypes.get_last_error()
+        if code in (2, 18):
+            return
+        raise ctypes.WinError(code)
+    try:
+        while True:
+            if not data.attributes & 0x10:
+                yield folder / data.name
+            if not next_file(handle, ctypes.byref(data)):
+                code = ctypes.get_last_error()
+                if code != 18:
+                    raise ctypes.WinError(code)
+                break
+    finally:
+        close(handle)
+
+
+def live_stem_candidates(folder, stems):
+    folded = {stem.casefold() for stem in stems}
+    if os.name == 'nt':
+        # Native lookup follows Windows filesystem name matching, including Cyrillic.
+        # Filter out DOS 8.3 aliases and unrelated wildcard matches.
+        upper = {stem.upper() for stem in stems}
+        candidates = (p for stem in stems for p in _windows_stem_names(folder, stem))
+    else:
+        # POSIX supplies no portable case-insensitive targeted directory search.
+        upper = set()
+        candidates = iter(list_images(folder))
+    seen = set()
+    for path in candidates:
+        if (path.name not in seen and path.suffix.lower() in IMAGE_EXTS
+                and (path.stem.casefold() in folded or path.stem.upper() in upper)
+                and path.is_file()):
+            seen.add(path.name)
+            yield path
 
 
 class FolderIndex:
-    """Name index refreshed on directory changes; inspect only colliding stems.
-
-    No per-entry resolve/stat or image decode for unrelated files. The final
-    destination guard remains independent of this index.
-    """
+    """One initial name index per batch; live publication guards are separate."""
     def __init__(self):
         self.folders = {}
 
-    def candidates(self, folder, stems):
-        info = folder.stat()
-        stamp = (info.st_mtime_ns, info.st_ctime_ns)
-        previous = self.folders.get(folder)
-        if previous is None or previous[0] != stamp:
+    def candidates(self, folder, stems, *, live=False):
+        if folder not in self.folders:
             indexed = {}
             with os.scandir(folder) as entries:
                 for entry in entries:
                     path = Path(entry.name)
                     if path.suffix.lower() in IMAGE_EXTS:
                         indexed.setdefault(path.stem.casefold(), []).append(folder / entry.name)
-            self.folders[folder] = stamp, indexed
-        else:
-            indexed = previous[1]
-        return (p for stem in stems for p in indexed.get(stem, ()) if p.is_file())
+            self.folders[folder] = indexed
+        indexed = self.folders[folder]
+        known = (p for stem in {s.casefold() for s in stems}
+                 for p in indexed.get(stem, ()) if p.is_file())
+        if not live:
+            return known
+        # Include known Unicode casefold variants even where native collation
+        # has different rules; newly introduced names use native matching.
+        from itertools import chain
+        def unique():
+            seen = set()
+            for p in chain(known, live_stem_candidates(folder, stems)):
+                if p.name not in seen:
+                    seen.add(p.name)
+                    yield p
+        return unique()
 
 
-def ensure_no_source_collision(destination: Path, source: Path, kind: str, index=None) -> None:
+def ensure_no_source_collision(destination: Path, source: Path, kind: str, index=None, *, live=False) -> None:
     index = index if index is not None else FolderIndex()
-    stems = {source.stem.casefold()}
+    stems = {source.stem}
     if destination.suffix.lower() == '.webp':
-        stems.add(destination.stem.casefold())
-    for candidate in index.candidates(source.parent, stems):
-        if candidate == source and candidate.name == source.name:
+        stems.add(destination.stem)
+    for candidate in index.candidates(source.parent, stems, live=live):
+        if candidate.name in (source.name, destination.name):
             continue
-        if candidate == destination and candidate.name == destination.name:
-            continue
-        # Path equality alone is case-insensitive under Windows. Do not
-        # collapse separate names in a case-sensitive Windows directory.
         try:
             if candidate.samefile(source) or (destination.exists() and candidate.samefile(destination)):
                 continue
@@ -555,6 +642,13 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
                                   'Переименуй один из исходников.')
 
 
+def validate_skip(destination, source, kind, *, identity=None):
+    identity = identity if identity is not None else source_identity(destination)
+    if not is_owned_export(destination, source, kind, identity=identity, require_pixels=True):
+        raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')
+    assert_source_identity(destination, identity)
+
+
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
                    input_identity: tuple | None = None, collision_index=None) -> Publication:
@@ -562,8 +656,11 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
     if prior is not None:
-        owned = is_owned_export(destination, source, kind)
+        owned = is_owned_export(destination, source, kind, identity=prior)
         if skip_exists and owned:
+            validate_skip(destination, source, kind, identity=prior)
+            if input_identity is not None:
+                assert_source_identity(source, input_identity)
             return Publication(False)
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
@@ -579,15 +676,18 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
             assert_source_identity(source, input_identity)
     def guard():
         if collision_index is not None:
-            ensure_no_source_collision(destination, source, kind, collision_index)
+            ensure_no_source_collision(destination, source, kind, collision_index, live=True)
         if prior is not None:
             assert_source_identity(destination, prior)
         check_input()
     published = atomic_write(destination, encode, replace=False,
                              before_publish=guard, expected_destination=prior,
                              after_publish=check_input)
-    if not published and (not skip_exists or not is_owned_export(destination, source, kind)):
-        raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
+    if not published:
+        if not skip_exists:
+            raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
+        validate_skip(destination, source, kind)
+        check_input()
     return published
 
 
@@ -607,25 +707,25 @@ def token_output_path(source: Path, format_name: str = 'webp') -> Path:
     return source.with_name(f'{source.stem}t.{format_name.lower()}')
 
 
-def save_original_webp(source: Path, *, collision_index=None) -> Publication:
+def save_original_webp(source: Path, *, collision_index=None, input_identity=None) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
     WebP (which might be a hand-edited asset).
     """
+    identity = input_identity if input_identity is not None else source_identity(source)
+    assert_source_identity(source, identity)
     if source.suffix.lower() == '.webp':
         return Publication(False)
     destination = original_webp_path(source)
     if destination.exists():
-        if not is_owned_export(destination, source, 'copy'):
-            raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
+        validate_skip(destination, source, 'copy')
         return Publication(False)
     if collision_index is not None:
         ensure_no_source_collision(destination, source, 'copy', collision_index)
-    identity = source_identity(source)
     def guard():
         if collision_index is not None:
-            ensure_no_source_collision(destination, source, 'copy', collision_index)
+            ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
         assert_source_identity(source, identity)
     with source_snapshot(source, identity) as snapshot, Image.open(snapshot) as raw:
         artwork = ImageOps.exif_transpose(raw)
@@ -642,8 +742,9 @@ def save_original_webp(source: Path, *, collision_index=None) -> Publication:
                                replace=False, before_publish=guard,
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
-        if not created and not is_owned_export(destination, source, 'copy'):
-            raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
+        if not created:
+            validate_skip(destination, source, 'copy')
+            assert_source_identity(source, identity)
         return created
 
 
@@ -693,7 +794,7 @@ class BatchResult:
 
 def export_images(files, get_cutout, output_path, renderer, *, kind,
                   skip_exists=True, convert_original=True, cancel_event=None,
-                  on_progress=None, approved_outputs=None) -> BatchResult:
+                  on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
     """One export pipeline for both composition modes.
 
     Capture the source version before invoking the loader and carry it
@@ -708,22 +809,34 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             break
         if on_progress:
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
+        try:
+            identity = (expected_inputs or {}).get(str(source))
+            if identity is None:
+                identity = source_identity(source)
+            else:
+                assert_source_identity(source, identity)
+        except Exception as exc:
+            result.record_error(source, stage, exc)
+            if on_progress:
+                on_progress(index+1, len(files), f'Выполнено: {index + 1}/{len(files)}')
+            continue
         if convert_original:
             try:
-                publication = save_original_webp(source, collision_index=folders)
+                publication = save_original_webp(source, collision_index=folders, input_identity=identity)
                 result.converted += int(bool(publication))
                 result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
             except Exception as exc:
                 result.record_error(source, 'преобразование оригинала', exc)
         destination = output_path(source)
         try:
+            assert_source_identity(source, identity)
             ensure_no_source_collision(destination, source, kind, folders)
             if skip_exists and destination.exists():
-                if not is_owned_export(destination, source, kind):
-                    raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')
+                ensure_no_source_collision(destination, source, kind, folders, live=True)
+                validate_skip(destination, source, kind)
+                assert_source_identity(source, identity)
                 result.skipped += 1
             else:
-                identity = source_identity(source)
                 loaded = get_cutout(source)
                 if isinstance(loaded, LoadedCutout):
                     if loaded.identity != identity:
@@ -755,7 +868,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  out_size: int = 256, format_name: str = 'webp',
                  skip_exists: bool = True, convert_original: bool = True,
                  cancel_event=None, on_progress=None, approved_outputs=None,
-                 frame_loader=None) -> BatchResult:
+                 frame_loader=None, expected_inputs=None) -> BatchResult:
     def render(cutout, source):
         nonlocal frame, interior
         if frame is None and frame_loader is not None:
@@ -764,4 +877,4 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
     return export_images(files, get_cutout, lambda p: token_output_path(p, format_name),
                          render, kind='token', skip_exists=skip_exists,
                          convert_original=convert_original, cancel_event=cancel_event,
-                         on_progress=on_progress, approved_outputs=approved_outputs)
+                         on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs)
