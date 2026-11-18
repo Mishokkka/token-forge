@@ -138,11 +138,18 @@ class CacheTests(unittest.TestCase):
         app.busy = False
         app.worker = None
         app.preview_generation = 0
+        app.render_serial = 0
+        app.pending_render = None
+        from preview_renderer import PreviewRenderer
+        app.preview_renderer = PreviewRenderer()
+        app.preview_stamp = None
+        app.last_full_check = 0.0
         app.preview_cached_only = False
         app.preview_retry = False
         app.scan_running = False
         app.scan_generation = 0
         app.pending_scan = None
+        app.pending_export = None
         app.active_scan = None
         app.folder = None
         app.frame_path = Path(__file__).parent / 'RingT.png'
@@ -321,12 +328,12 @@ class CacheTests(unittest.TestCase):
         request = app._preview_request()
         app.preview_generation += 1
         app.selected = None
-        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key)))
+        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key, None, 0.0)))
         with patch.object(app, '_cache_key', side_effect=AssertionError('GUI hashed source')):
             app._poll()
         self.assertFalse(app.busy)
         self.assertFalse(app.preview_pending)
-        app.root.after.assert_called_once_with(120, app._poll)
+        app.root.after.assert_called_once_with(40, app._poll)
 
     def test_unmarked_saved_result_is_not_shown(self):
         existing = token_output_path(self.source)
@@ -390,19 +397,76 @@ class CacheTests(unittest.TestCase):
         app._show_token.assert_not_called()
 
     def test_render_failure_clears_canvas_but_retains_cutout(self):
+        import queue
         from unittest.mock import Mock
         app = self.make_mock_app()
         app.current_cutout = Image.new('RGBA', (50, 50), (255, 0, 0, 7))
         app._show_token, app.status = Mock(), Mock()
+        app.events = queue.Queue()
+        app.pending_export = None
+        app.selected = self.source
         app.show_cutout = SimpleNamespace(get=lambda: False)
         app.work_mode = SimpleNamespace(get=lambda: 'item')
         from item_engine import ItemAdjust
         app._current_item_adjust = lambda: ItemAdjust(clean_noise=True)
-        self.assertFalse(app._render())
-        app._show_token.assert_called_once_with(None)
-        self.assertIsNotNone(app.current_cutout)
-        app._current_item_adjust = lambda: ItemAdjust(clean_noise=False)
-        self.assertTrue(app._render())
+        with patch('tokenforge.threading.Thread') as launch:
+            self.assertTrue(app._render())
+            app._show_token.assert_not_called()
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_called_once_with(None)
+            self.assertIsNotNone(app.current_cutout)
+            app._current_item_adjust = lambda: ItemAdjust(clean_noise=False)
+            self.assertTrue(app._render())
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            self.assertIsInstance(app._show_token.call_args.args[0], Image.Image)
+
+    def test_slider_burst_coalesces_and_rejects_old_render(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust
+        app = self.make_mock_app()
+        app.pending_export = None
+        app.current_cutout = Image.new('RGBA', (100, 100), 'red')
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.events = queue.Queue()
+        app.status, app._show_token = Mock(), Mock()
+        app.show_cutout = SimpleNamespace(get=lambda: False)
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        app._current_adjust = lambda: Adjust()
+        with patch('tokenforge.threading.Thread') as launch:
+            app._render()
+            first = launch.call_args.kwargs['target']
+            for zoom in (110, 120, 130):
+                app._current_adjust = lambda zoom=zoom: Adjust(zoom=zoom)
+                app._render()
+            self.assertEqual(launch.call_count, 1)
+            self.assertEqual(app.pending_render.adjustment.zoom, 130)
+            first()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_not_called()
+            self.assertEqual(launch.call_count, 2)
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_called_once()
+
+    def test_preview_geometry_reused_for_placement_only(self):
+        from preview_renderer import PreviewJob, PreviewRenderer
+        from token_engine import Adjust, silhouette_geometry
+        image = Image.new('RGBA', (100, 120), 'red')
+        frame = read_image(Path(__file__).parent / 'RingT.png')
+        mask = frame_interior(frame)
+        renderer = PreviewRenderer()
+        with patch('preview_renderer.silhouette_geometry', wraps=silhouette_geometry) as geometry:
+            for serial, zoom in enumerate((80, 100, 130)):
+                renderer.render(PreviewJob(1, serial, image, 'token', False,
+                                           frame, mask, Adjust(zoom=zoom)), None)
+            self.assertEqual(geometry.call_count, 1)
+            renderer.render(PreviewJob(2, 5, image.copy(), 'token', False, frame, mask, Adjust()), None)
+            self.assertEqual(geometry.call_count, 2)
 
     def test_close_decline_rearms_only_transient_save_failure(self):
         from unittest.mock import Mock
@@ -655,6 +719,34 @@ class CacheTests(unittest.TestCase):
         event = app.events.get_nowait()
         self.assertEqual(event[0], 'preview')
         self.assertNotEqual(event[1][2], app.current_key)
+
+    def test_unchanged_preview_metadata_defers_full_read_but_not_forever(self):
+        import queue
+        import time
+        from unittest.mock import Mock
+        from token_engine import file_stamp
+        app = self.make_mock_app()
+        app.events, app.status = queue.Queue(), Mock()
+        app.selected = self.source
+        app.frame = object()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'model': 'birefnet-general',
+                            'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+        app.preview_stamp = file_stamp(self.source)
+        app.last_full_check = time.monotonic()
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch.object(app, '_cache_key', wraps=app._cache_key) as hash_source:
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+            hash_source.assert_not_called()
+            self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
+            app.busy = False
+            app.last_full_check -= 31
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+            hash_source.assert_called_once()
+            self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
 
     def test_close_waits_for_export_worker_and_discards_queue(self):
         import queue

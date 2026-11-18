@@ -437,11 +437,11 @@ def silhouette_geometry(cutout: Image.Image):
 
 
 def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
-            out_size: int = 256, adjust: Adjust | None = None) -> Image.Image:
+            out_size: int = 256, adjust: Adjust | None = None, *, geometry=None) -> Image.Image:
     """Place cutout against a ring, clipping everything outside its interior."""
     if adjust is None:
         adjust = Adjust()
-    center_x, head_width, top_y = silhouette_geometry(cutout)
+    center_x, head_width, top_y = silhouette_geometry(cutout) if geometry is None else geometry
     # Typical tabletop portrait has hair/head ~40% of token width.
     base_scale = .40 * out_size / max(head_width, 1)
     zoom, x, y, gap = map(float, (adjust.zoom, adjust.x, adjust.y, adjust.gap))

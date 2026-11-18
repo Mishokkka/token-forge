@@ -121,7 +121,7 @@ def _orient(cutout: Image.Image, adjust: ItemAdjust) -> Image.Image:
 
 
 def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
-                 size: int = ITEM_SIZE, stroke_px: int = ITEM_STROKE) -> Image.Image:
+                 size: int = ITEM_SIZE, stroke_px: int = ITEM_STROKE, *, prepared=None) -> Image.Image:
     """Fit complete item, preserve border, and make all UI sliders meaningful.
 
     Zoom=100 means the maximum size *at the requested center*, so a zoom
@@ -137,7 +137,7 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     if not all(math.isfinite(float(value)) for value in (adjust.x, adjust.y, adjust.rotation)):
         raise ValueError('Некорректные параметры положения или поворота.')
 
-    image = _orient(cutout, adjust)
+    image = _orient(cutout, adjust) if prepared is None else prepared
     # Center: the user requested >=5% whitespace, diagonals use a small
     # visual margin. Three black outline pixels need their own safe space.
     margin = math.ceil(size * .05) if adjust.layout == 'По центру' else round(size * .018)

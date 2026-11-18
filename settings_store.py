@@ -178,6 +178,20 @@ def adjustment_for(settings, source, mode, default_layout=None):
     return decode_adjustment(override_for(settings, group, source), mode, default_layout)
 
 
+class BatchAdjustments:
+    """Lazily resolve placement from the captured settings, once per file."""
+    def __init__(self, settings, mode, default_layout=None):
+        self.settings = settings
+        self.mode = mode
+        self.default_layout = default_layout
+        self._values = {}
+
+    def __getitem__(self, source):
+        if source not in self._values:
+            self._values[source] = adjustment_for(self.settings, source, self.mode, self.default_layout)
+        return self._values[source]
+
+
 _MISSING = object()
 
 
