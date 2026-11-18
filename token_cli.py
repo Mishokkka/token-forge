@@ -10,7 +10,7 @@ from pathlib import Path
 from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
     export_batch, frame_interior, list_source_images, read_image,
-    remove_background, token_output_path,
+    remove_background, token_output_path, source_identity, assert_source_identity,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -44,12 +44,12 @@ def resolve_context_source(filename: str | Path) -> Path:
     if path in candidates:
         return path
     # User clicked a generated token, e.g. "Maget.webp": redirect to "Mage.png".
-    if path.stem.casefold().endswith('t'):
+    if path.suffix.lower() in ('.png', '.webp') and path.stem.casefold().endswith('t'):
         original = by_stem.get(path.stem[:-1].casefold())
         if original is not None:
             return original
     # User clicked 'Sword_item.webp': redirect to 'Sword.png' when available.
-    if path.stem.casefold().endswith('_item'):
+    if path.suffix.lower() == '.webp' and path.stem.casefold().endswith('_item'):
         original = by_stem.get(path.stem[:-5].casefold())
         if original is not None:
             return original
@@ -90,19 +90,23 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     def get_cutout(path: Path):
-        cutout = cache.load(path, model, keep_alpha, edge_mode)
+        identity = source_identity(path)
+        cutout = cache.load(path, model, keep_alpha, edge_mode, identity=identity)
         if cutout is not None:
+            assert_source_identity(path, identity)
             return cutout
         original = read_image(path)
+        assert_source_identity(path, identity)
         if keep_alpha and already_transparent(original):
             cutout = original
         else:
             from rembg import new_session
             cutout = remove_background(original, new_session(model), edge_mode)
         try:
-            cache.save(path, model, keep_alpha, edge_mode, cutout)
+            cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
         except OSError:
             pass
+        assert_source_identity(path, identity)
         return cutout
 
     result = export_batch(
@@ -114,12 +118,13 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     if result.errors:
         for detail in result.error_details:
             write_log(detail)
-        raise RuntimeError('\n'.join(result.errors))
+        if not (result.created or result.skipped):
+            raise RuntimeError('\n'.join(result.errors))
     destination = token_output_path(source, ext)
     if result.created:
-        return 'created', destination
+        return ('created_with_warning' if result.errors else 'created'), destination
     if result.skipped and destination.is_file():
-        return 'skipped', destination
+        return ('skipped_with_warning' if result.errors else 'skipped'), destination
     raise RuntimeError('Токен не был создан: неизвестный результат операции.')
 
 
@@ -141,19 +146,23 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
                         if key in stored})
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     def get_cutout(path: Path):
-        cutout = cache.load(path, model, keep_alpha, edge_mode)
+        identity = source_identity(path)
+        cutout = cache.load(path, model, keep_alpha, edge_mode, identity=identity)
         if cutout is not None:
+            assert_source_identity(path, identity)
             return cutout
         original = read_image(path)
+        assert_source_identity(path, identity)
         if keep_alpha and already_transparent(original):
             cutout = original
         else:
             from rembg import new_session
             cutout = remove_background(original, new_session(model), edge_mode)
         try:
-            cache.save(path, model, keep_alpha, edge_mode, cutout)
+            cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
         except OSError:
             pass
+        assert_source_identity(path, identity)
         return cutout
 
     result = export_items([source], get_cutout, {source: adj},
@@ -162,12 +171,13 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     if result.errors:
         for detail in result.error_details:
             write_log(detail)
-        raise RuntimeError('\n'.join(result.errors))
+        if not (result.created or result.skipped):
+            raise RuntimeError('\n'.join(result.errors))
     destination = item_output_path(source)
     if result.created:
-        return 'created', destination
+        return ('created_with_warning' if result.errors else 'created'), destination
     if result.skipped and destination.is_file():
-        return 'skipped', destination
+        return ('skipped_with_warning' if result.errors else 'skipped'), destination
     raise RuntimeError('Предмет не был создан.')
 
 
@@ -221,7 +231,11 @@ def run_auto(filename: str | Path, *, item: bool = False) -> int:
     initialize_missing_streams()
     try:
         status, destination = (automatic_item(filename) if item else automatic_token(filename))
-        if status == 'created':
+        if status.endswith('_with_warning'):
+            write_log(f'Результат доступен, но преобразование оригинала не удалось: {destination}')
+            notify_user('TokenForge: предупреждение',
+                        f'Результат: {destination.name}. Не удалось преобразовать оригинал. Подробности: {LOG_FILE}')
+        elif status == 'created':
             write_log(f'Создан: {destination}')
             notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')
         else:

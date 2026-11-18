@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, save_original_webp
+from token_engine import BatchResult, save_original_webp, atomic_write
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -115,7 +115,7 @@ def _orient(cutout: Image.Image, adjust: ItemAdjust) -> Image.Image:
         rotation += (target - current + 90.0) % 180.0 - 90.0
     if abs(rotation) > 0.001:
         image = image.rotate(rotation, resample=Image.Resampling.BICUBIC, expand=True)
-        image = image.crop(_subject_bbox(image))
+        image = image.crop(_subject_bbox(image, clean_noise=False))
     return image
 
 
@@ -204,8 +204,11 @@ def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                 cutout = get_cutout(source)
                 image = compose_item(cutout, adjustments[source])
                 # Lossless for crisp 3px outlines and correct alpha.
-                image.save(destination, 'WEBP', lossless=True, method=6)
-                result.created += 1
+                if atomic_write(destination, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
+                                replace=not skip_exists):
+                    result.created += 1
+                else:
+                    result.skipped += 1
         except Exception as exc:
             result.record_error(source, 'генерация предмета', exc)
         if on_progress:

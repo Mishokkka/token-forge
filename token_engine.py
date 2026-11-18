@@ -24,22 +24,33 @@ class Adjust:
     gap: float = 11.0         # head-to-top gap, token-height percent
 
 
+def source_identity(source: Path) -> tuple:
+    resolved = Path(source).resolve()
+    info = resolved.stat()
+    return str(resolved), info.st_size, info.st_mtime_ns
+
+
+def assert_source_identity(source: Path, identity: tuple) -> None:
+    if source_identity(source) != identity:
+        raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+
+
 class DiskCutoutCache:
     """Lossless persistent cache. No image extraction rerun for unchanged inputs."""
 
     def __init__(self, directory: Path):
         self.directory = Path(directory)
 
-    def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str) -> Path:
-        source = Path(source).resolve()
-        info = source.stat()
-        key = [CUTOUT_CACHE_VERSION, str(source), info.st_size, info.st_mtime_ns,
+    def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
+                 *, identity: tuple | None = None) -> Path:
+        key = [CUTOUT_CACHE_VERSION, *(identity or source_identity(source)),
                model, bool(keep_alpha), edge_mode]
         digest = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode('utf-8')).hexdigest()
         return self.directory / f'{digest}.png'
 
-    def load(self, source: Path, model: str, keep_alpha: bool, edge_mode: str) -> Image.Image | None:
-        path = self.path_for(source, model, keep_alpha, edge_mode)
+    def load(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
+             *, identity: tuple | None = None) -> Image.Image | None:
+        path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
         try:
             with Image.open(path) as stored:
                 stored.load()
@@ -49,12 +60,17 @@ class DiskCutoutCache:
         except FileNotFoundError:
             return None
         except (OSError, ValueError):
-            path.unlink(missing_ok=True)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # A read-only cache must not block fresh extraction.
             return None
 
     def save(self, source: Path, model: str, keep_alpha: bool,
-             edge_mode: str, cutout: Image.Image) -> None:
-        destination = self.path_for(source, model, keep_alpha, edge_mode)
+             edge_mode: str, cutout: Image.Image, *, identity: tuple | None = None) -> None:
+        destination = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
+        if identity is not None:
+            assert_source_identity(source, identity)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
@@ -139,12 +155,19 @@ def frame_interior(frame: Image.Image) -> Image.Image:
     bbox = inside.getbbox()
     if not bbox:
         raise ValueError('Не удалось выделить внутреннюю область рамки.')
-    inside_area = inside.histogram()[255]
-    if inside_area > (frame.width * frame.height * .88):
+    if bbox[0] == 0 or bbox[1] == 0 or bbox[2] == frame.width or bbox[3] == frame.height:
         raise ValueError('Рамка разомкнута. Используй PNG с непрерывным кольцом.')
 
     outside = barrier.copy()
-    ImageDraw.floodfill(outside, (0, 0), 255, thresh=0)
+    # Fill every exterior component touching an edge, even when a corner is opaque.
+    for x in range(frame.width):
+        for y in (0, frame.height - 1):
+            if outside.getpixel((x, y)) == 0:
+                ImageDraw.floodfill(outside, (x, y), 255, thresh=0)
+    for y in range(frame.height):
+        for x in (0, frame.width - 1):
+            if outside.getpixel((x, y)) == 0:
+                ImageDraw.floodfill(outside, (x, y), 255, thresh=0)
     outer_shape = outside.point(lambda p: 0 if p == 255 else 255)
 
     thickness = _ring_thickness(alpha)
@@ -205,26 +228,52 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
     upper = math.floor(-oy / scale) - 2
     right = math.ceil((out_size - ox) / scale) + 2
     lower = math.ceil((out_size - oy) / scale) + 2
-    if right <= left or lower <= upper:
-        raise ValueError('Некорректный масштаб/позиция изображения.')
-    cropped = cutout.crop((left, upper, right, lower))
-    target_size = (max(1, int(round((right - left) * scale))),
-                   max(1, int(round((lower - upper) * scale))))
-    scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
+    left, upper = max(0, left), max(0, upper)
+    right, lower = min(cutout.width, right), min(cutout.height, lower)
     image_layer = Image.new('RGBA', (out_size, out_size), (0, 0, 0, 0))
-    image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
+    if right > left and lower > upper:
+        cropped = cutout.crop((left, upper, right, lower))
+        target_size = (max(1, int(round((right - left) * scale))),
+                       max(1, int(round((lower - upper) * scale))))
+        scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
+        image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
     inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
     image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), inner))
     token = Image.alpha_composite(image_layer, frame.resize((out_size, out_size), Image.Resampling.LANCZOS))
     return token
 
 
-def save_token(image: Image.Image, path: Path, format_name: str = 'WebP') -> None:
+def atomic_write(path: Path, writer, *, replace: bool = True) -> bool:
+    """Publish only a complete, closed file, optionally without replacement."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent,
+                                         prefix='.tokenforge-', suffix='.tmp', delete=False) as fp:
+            temporary = Path(fp.name)
+            writer(fp)
+        if replace:
+            os.replace(temporary, path)
+        else:
+            try:
+                if os.name == 'nt':
+                    os.rename(temporary, path)  # Windows rename refuses an existing target.
+                else:
+                    os.link(temporary, path)  # Atomic no-clobber on POSIX.
+            except FileExistsError:
+                return False
+        return True
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
+               *, replace: bool = True) -> bool:
     if format_name.lower() == 'png':
-        image.save(path, 'PNG', optimize=True)
-    else:
-        image.save(path, 'WEBP', lossless=True, method=6)
+        return atomic_write(path, lambda fp: image.save(fp, 'PNG', optimize=True), replace=replace)
+    return atomic_write(path, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
+                        replace=replace)
 
 
 def list_images(folder: Path) -> list[Path]:
@@ -261,17 +310,10 @@ def save_original_webp(source: Path) -> bool:
             artwork = artwork.convert('RGBA')
         else:
             artwork = artwork.convert('RGB')
-        # Use exclusive creation; do not silently replace somebody else's file.
-        with destination.open('xb') as output:
-            try:
-                artwork.save(output, format='WEBP', quality=95, method=6,
-                             alpha_quality=100)
-            except BaseException:
-                # A partial WebP is not a valid result.
-                output.close()
-                destination.unlink(missing_ok=True)
-                raise
-    return True
+        return atomic_write(destination,
+                            lambda fp: artwork.save(fp, format='WEBP', quality=95,
+                                                    method=6, alpha_quality=100),
+                            replace=False)
 
 
 def list_source_images(folder: Path, exclude: Path | None = None) -> list[Path]:
@@ -293,7 +335,8 @@ def list_source_images(folder: Path, exclude: Path | None = None) -> list[Path]:
         paths = [p for p in paths if p.resolve() != excluded]
     stems = {p.stem.casefold() for p in paths}
     inputs = [p for p in paths
-              if not (p.stem.casefold().endswith('t')
+              if not (p.suffix.lower() in ('.png', '.webp')
+                      and p.stem.casefold().endswith('t')
                       and p.stem[:-1].casefold() in stems)]
     # Multiple copies of the same source artwork should not produce identical
     # output paths or be counted as separate batch jobs.
@@ -349,8 +392,10 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image,
                 cutout = get_cutout(source)
                 final_image = compose(cutout, frame, interior, out_size,
                                       adjustments[source])
-                save_token(final_image, destination, format_name)
-                result.created += 1
+                if save_token(final_image, destination, format_name, replace=not skip_exists):
+                    result.created += 1
+                else:
+                    result.skipped += 1
         except Exception as exc:
             result.record_error(source, 'генерация токена', exc)
         if on_progress is not None:

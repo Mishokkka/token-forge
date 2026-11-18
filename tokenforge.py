@@ -21,6 +21,7 @@ from PIL import Image, ImageDraw, ImageTk
 from token_engine import (
     Adjust, DiskCutoutCache, already_transparent, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
+    atomic_write, source_identity, assert_source_identity,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 
@@ -114,9 +115,11 @@ class TokenForge:
         self.work_mode = tk.StringVar(value=startup_mode or self.settings.get('work_mode', 'token'))
         if self.work_mode.get() not in ('token', 'item'):
             self.work_mode.set('token')
-        self.item_layout = tk.StringVar(value=self.settings.get('item_layout', ITEM_MODES[0]))
-        if self.item_layout.get() not in ITEM_MODES:
-            self.item_layout.set(ITEM_MODES[0])
+        default_layout = self.settings.get('item_layout', ITEM_MODES[0])
+        if default_layout not in ITEM_MODES:
+            default_layout = ITEM_MODES[0]
+        self.default_item_layout = tk.StringVar(value=default_layout)
+        self.item_layout = tk.StringVar(value=default_layout)
         self.item_zoom = tk.DoubleVar(value=100)
         self.item_x = tk.DoubleVar(value=0)
         self.item_y = tk.DoubleVar(value=0)
@@ -264,6 +267,13 @@ class TokenForge:
                                   state='readonly', width=18)
         layout_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
         layout_box.bind('<<ComboboxSelected>>', lambda e: self._on_item_adjust())
+        default_row = tk.Frame(self.item_controls, bg=PANEL)
+        default_row.pack(fill='x', pady=(0, 5))
+        self._label(default_row, 'Для новых артов:', font=('Segoe UI', 9)).pack(side='left')
+        default_box = ttk.Combobox(default_row, values=list(ITEM_MODES),
+                                   textvariable=self.default_item_layout, state='readonly', width=16)
+        default_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
+        default_box.bind('<<ComboboxSelected>>', lambda e: self._schedule_save())
         for title, var, low, high in [
             ('Масштаб, %', self.item_zoom, 10, 100),
             ('Горизонталь, %', self.item_x, -100, 100),
@@ -429,7 +439,7 @@ class TokenForge:
         stored = self.settings.get('item_overrides', {}).get(str(path.resolve()), {})
         if not isinstance(stored, dict):
             stored = {}
-        defaults = {'layout': self.item_layout.get()}
+        defaults = {'layout': self.default_item_layout.get()}
         defaults.update({key: stored[key] for key in ('layout', 'zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
                          if key in stored})
         return ItemAdjust(**defaults)
@@ -550,17 +560,19 @@ class TokenForge:
             self._request_preview()
 
     def _cache_key(self, path, model, keep_alpha, edge_mode):
-        stat = path.stat()
-        return (str(path.resolve()), stat.st_size, stat.st_mtime_ns, model, keep_alpha, edge_mode)
+        return (*source_identity(path), model, keep_alpha, edge_mode)
 
     def _get_cutout(self, path, model, keep_alpha, edge_mode):
         key = self._cache_key(path, model, keep_alpha, edge_mode)
+        identity = key[:3]
         if key in self.cache:
+            assert_source_identity(path, identity)
             return self.cache[key], key
         # Disk cache is checked before reading original and loading AI model.
-        cutout = self.disk_cache.load(path, model, keep_alpha, edge_mode)
+        cutout = self.disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity)
         if cutout is None:
             original = read_image(path)
+            assert_source_identity(path, identity)
             if keep_alpha and already_transparent(original):
                 cutout = original
             else:
@@ -569,9 +581,10 @@ class TokenForge:
                     self.sessions[model] = new_session(model)
                 cutout = remove_background(original, self.sessions[model], edge_mode)
                 try:
-                    self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout)
+                    self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
                 except OSError:
                     pass  # Unwritable cache must not prevent creating tokens.
+        assert_source_identity(path, identity)
         self.cache[key] = cutout
         if len(self.cache) > 6:
             oldest = next(iter(self.cache))
@@ -599,7 +612,7 @@ class TokenForge:
 
     def _render(self):
         if self.current_cutout is None:
-            return
+            return False
         try:
             if self.show_cutout.get():
                 image = self._make_cutout_preview(self.current_cutout, 512)
@@ -607,12 +620,14 @@ class TokenForge:
                 image = compose_item(self.current_cutout, self._current_item_adjust())
             else:
                 if self.frame is None:
-                    return
+                    return False
                 image = compose(self.current_cutout, self.frame, self.interior, 512,
                                 self._current_adjust())
             self._show_token(image)
+            return True
         except Exception as exc:
             self.status.set(f'Ошибка компоновки: {exc}')
+            return False
 
     @staticmethod
     def _make_cutout_preview(img: Image.Image, size: int) -> Image.Image:
@@ -655,12 +670,6 @@ class TokenForge:
             self.status.set('Пакетная обработка уже выполняется.')
             return
         files = list(image_files)
-        if self.busy:
-            # An auto-preview may still be extracting the selected file. The
-            # v1.2 version silently rejected the batch in this situation.
-            self.pending_export = (files, force_overwrite, requested_mode or self.work_mode.get())
-            self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
-            return
         mode = requested_mode or self.work_mode.get()
         if mode == 'token' and self.frame is None:
             messagebox.showerror('Нет рамки', 'Выбери корректное PNG-кольцо.')
@@ -672,9 +681,19 @@ class TokenForge:
         interior = self.interior.copy() if self.interior is not None else None
         adjustments = {p: (self._item_adjust_for(p) if mode == 'item'
                             else self._adjust_for(p)) for p in files}
+        request = (files, mode, model, keep, edge_mode, ext, size, skip,
+                   convert, frame, interior, adjustments)
+        if self.busy:
+            self.pending_export = request
+            self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
+            return
+        self._run_export(request)
+
+    def _run_export(self, request):
+        (files, mode, model, keep, edge_mode, ext, size, skip,
+         convert, frame, interior, adjustments) = request
         self.busy = True
         self.running_batch = True
-        self.preview_pending = False
         self.cancel_event.clear()
         self.progress['value'] = 0
         self.status.set(f'Начата пакетная обработка: {len(files)} артов.')
@@ -700,10 +719,9 @@ class TokenForge:
     def _after_preview(self):
         """Prioritize queued exports over another potentially slow preview."""
         if self.pending_export is not None:
-            files, force_overwrite, mode = self.pending_export
+            request = self.pending_export
             self.pending_export = None
-            self.preview_pending = False
-            self._start_export(files, force_overwrite=force_overwrite, requested_mode=mode)
+            self._run_export(request)
         elif self.preview_pending:
             self.preview_pending = False
             self._request_preview()
@@ -723,13 +741,21 @@ class TokenForge:
                 if action == 'preview':
                     path, img, key = data
                     self.busy = False
-                    if path == self.selected and key == self._cache_key(path, self.model.get(), self.keep_alpha.get(), self.edge_mode.get()):
+                    try:
+                        matches = path == self.selected and key == self._cache_key(
+                            path, self.model.get(), self.keep_alpha.get(), self.edge_mode.get())
+                    except OSError:
+                        matches = False
+                    if matches:
                         self.current_cutout = img
                         self.current_key = key
-                        self._render()
-                        self.status.set(f'Готово: {path.name}. Отрегулируй положение или экспортируй.')
+                        self.preview_pending = False
+                        if self._render():
+                            self.status.set(f'Готово: {path.name}. Отрегулируй положение или экспортируй.')
                     else:
-                        self.preview_pending = True
+                        self.preview_pending = bool(self.selected and self.selected.is_file())
+                        if not self.preview_pending:
+                            self.status.set(f'Исходный файл недоступен: {path.name}')
                     self._after_preview()
                 elif action == 'error':
                     self.busy = False
@@ -760,7 +786,8 @@ class TokenForge:
                     self._after_preview()
         except queue.Empty:
             pass
-        self.root.after(120, self._poll)
+        finally:
+            self.root.after(120, self._poll)
 
     def _schedule_save(self):
         if self.save_timer:
@@ -780,11 +807,12 @@ class TokenForge:
             'skip_exists': self.skip_exists.get(),
             'convert_original': self.convert_original.get(),
             'work_mode': self.work_mode.get(),
-            'item_layout': self.item_layout.get(),
+            'item_layout': self.default_item_layout.get(),
         })
         try:
             PREFS_DIR.mkdir(parents=True, exist_ok=True)
-            PREFS_FILE.write_text(json.dumps(self.settings, ensure_ascii=False, indent=2), encoding='utf-8')
+            content = json.dumps(self.settings, ensure_ascii=False, indent=2).encode('utf-8')
+            atomic_write(PREFS_FILE, lambda fp: fp.write(content))
         except OSError as exc:
             self.status.set(f'Не удалось сохранить настройки: {exc}')
 

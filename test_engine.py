@@ -23,6 +23,44 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.mask.getpixel((200, 200)), 255)
         self.assertEqual(self.mask.getpixel((200, 399)), 0)
 
+    def test_small_zoom_does_not_crop_outside_source(self):
+        from unittest.mock import patch
+        image = Image.new('RGBA', (2500, 2500), (20, 30, 40, 255))
+        crop = Image.Image.crop
+        def guarded(img, box=None):
+            if box is not None:
+                self.assertGreaterEqual(min(box[:2]), 0)
+                self.assertLessEqual(box[2], img.width)
+                self.assertLessEqual(box[3], img.height)
+            return crop(img, box)
+        with patch.object(Image.Image, 'crop', guarded):
+            self.assertEqual(compose(image, self.frame, self.mask, 512, Adjust(zoom=5)).size, (512, 512))
+
+    def test_open_thick_ring_rejected(self):
+        frame = Image.new('RGBA', (100, 100))
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((0, 0, 99, 99), fill='black')
+        draw.rectangle((30, 30, 70, 70), fill=(0, 0, 0, 0))
+        draw.rectangle((45, 0, 55, 30), fill=(0, 0, 0, 0))
+        with self.assertRaises(ValueError):
+            frame_interior(frame)
+
+    def test_atomic_write_preserves_previous_file(self):
+        from token_engine import atomic_write
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / 'output.webp'
+            dest.write_bytes(b'old')
+            def failed(fp):
+                fp.write(b'partial')
+                raise OSError('encoder failed')
+            with self.assertRaises(OSError):
+                atomic_write(dest, failed)
+            self.assertEqual(dest.read_bytes(), b'old')
+            self.assertFalse(atomic_write(dest, lambda fp: fp.write(b'new'), replace=False))
+            self.assertEqual(dest.read_bytes(), b'old')
+            self.assertEqual(list(Path(directory).iterdir()), [dest])
+
     def test_render_shape_and_alpha(self):
         token = compose(self.figure, self.frame, self.mask, 256)
         self.assertEqual(token.size, (256, 256))

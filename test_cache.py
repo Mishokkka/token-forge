@@ -43,6 +43,24 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
         self.assertFalse(path.exists())
 
+    def test_unreadable_cache_cleanup_is_best_effort(self):
+        path = self.cache.path_for(self.source, 'm', False, 'e')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'corrupt')
+        with patch.object(Path, 'unlink', side_effect=PermissionError('read-only')):
+            self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
+
+    def test_source_replaced_during_inference_does_not_poison_cache(self):
+        app = self.make_mock_app()
+        def replace_source(*args):
+            Image.new('RGB', (171, 220), 'red').save(self.source)
+            return Image.new('RGBA', (170, 220), 'blue')
+        with patch('tokenforge.remove_background', side_effect=replace_source), \
+             patch.dict('sys.modules', {'rembg': SimpleNamespace(new_session=lambda name: object())}):
+            with self.assertRaises(OSError):
+                app._get_cutout(self.source, 'm', False, 'e')
+        self.assertIsNone(self.cache.load(self.source, 'm', False, 'e'))
+
     def make_mock_app(self):
         app = TokenForge.__new__(TokenForge)
         app.disk_cache = self.cache
