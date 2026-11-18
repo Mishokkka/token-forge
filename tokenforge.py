@@ -135,6 +135,7 @@ class TokenForge:
         self.preview_cached_only = False
         self.preview_retry = False
         self.preview_saved_only = False
+        self.preview_export_stamp = None
         self.frame_loading = False
         self.frame_generation = 0
         self.pending_frame = None
@@ -647,6 +648,7 @@ class TokenForge:
         self.preview_stamp = None
         self.preview_retry = False
         self.preview_saved_only = False
+        self.preview_export_stamp = None
         self.selected = None
         self.current_cutout = None
         self.current_key = None
@@ -669,6 +671,7 @@ class TokenForge:
         self.preview_stamp = None
         self.preview_retry = False
         self.preview_saved_only = False
+        self.preview_export_stamp = None
         self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
@@ -707,14 +710,26 @@ class TokenForge:
             self._request_preview(cached_only=not self.show_cutout.get())
 
     @staticmethod
-    def _load_saved_preview(source: Path, mode, ext):
-        """Worker-only I/O. No Tk controls or canvas access."""
+    def _saved_preview_candidates(source: Path, mode, ext):
         if mode == 'item':
-            candidates = [item_output_path(source)]
-        else:
-            candidates = [token_output_path(source, fmt)
-                          for fmt in dict.fromkeys([ext, 'webp', 'png'])]
-        for token in candidates:
+            return (item_output_path(source),)
+        return tuple(token_output_path(source, fmt)
+                     for fmt in dict.fromkeys([ext, 'webp', 'png']))
+
+    @classmethod
+    def _saved_export_stamp(cls, source, mode, ext):
+        """Track all candidates so a newly preferred format is noticed too."""
+        try:
+            return tuple((path, file_stamp(path))
+                         for path in cls._saved_preview_candidates(source, mode, ext))
+        except OSError:
+            # An incomplete observation must never enable the fast path.
+            return None
+
+    @classmethod
+    def _load_saved_preview(cls, source: Path, mode, ext):
+        """Worker-only I/O. No Tk controls or canvas access."""
+        for token in cls._saved_preview_candidates(source, mode, ext):
             if token.is_file():
                 try:
                     existing = read_owned_export_image(token, source, mode, include_owner=True)
@@ -826,6 +841,7 @@ class TokenForge:
         _, path, model, keep_alpha, edge_mode = request
         previous = self.current_key if verify else None
         previous_stamp = self.preview_stamp
+        previous_export_stamp = self.preview_export_stamp
         last_full_check = self.last_full_check
         saved_mode = self.work_mode.get()
         prefer_saved = (cached_only and not self.show_cutout.get() and not verify) or saved_only_check
@@ -837,12 +853,22 @@ class TokenForge:
         self.busy = True
         if not verify:
             self.preview_saved_only = False
+            self.preview_export_stamp = None
             self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
 
         def work():
-            saved = self._load_saved_preview(path, saved_mode, saved_ext) if prefer_saved and not verify else None
-            if saved is not None:
-                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved[0])))
+            export_stamp = self._saved_export_stamp(path, saved_mode, saved_ext) if prefer_saved else None
+
+            def read_saved(*, display_missing=False):
+                saved = self._load_saved_preview(path, saved_mode, saved_ext)
+                after = self._saved_export_stamp(path, saved_mode, saved_ext)
+                stable = export_stamp if export_stamp == after else None
+                if saved is not None or display_missing:
+                    self.events.put(('saved_preview', (request, saved_mode, saved_ext,
+                                                       saved[0] if saved is not None else None, stable)))
+                return saved
+
+            saved = read_saved() if prefer_saved and not verify else None
             if not can_render and saved is None and not saved_only_check:
                 self.events.put(('preview_no_frame', request))
                 return
@@ -850,7 +876,9 @@ class TokenForge:
             checked_at = time.monotonic()
             if (verify and previous is not None and observed is not None
                     and observed == previous_stamp and checked_at - last_full_check < 30
-                    and previous[-1] == model_revision(model)):
+                    and previous[-1] == model_revision(model)
+                    and (not saved_only_check or (export_stamp is not None
+                                                  and export_stamp == previous_export_stamp))):
                 self.events.put(('preview_unchanged', (request, previous_stamp, last_full_check)))
                 return
             key = self._cache_key(path, model, keep_alpha, edge_mode)
@@ -858,34 +886,34 @@ class TokenForge:
             # stable throughout the fingerprint.
             if file_stamp(path) != observed:
                 observed = None
-            if verify and key == previous:
+            if verify and not saved_only_check and key == previous:
                 self.events.put(('preview_unchanged', (request, observed, checked_at)))
                 return
             if saved_only_check:
-                # A saved-only view never starts extraction on a file watcher.
-                # Reinspect the generated image and warn about the new source.
-                saved = self._load_saved_preview(path, saved_mode, saved_ext)
+                # Full interval or changed export: verify saved pixels without
+                # starting inference. Keep watching even if the export is gone.
+                saved = read_saved(display_missing=True)
                 if saved is None:
-                    self.events.put(('preview', (request, None, None, observed, checked_at,
+                    self.events.put(('preview', (request, None, key, observed, checked_at,
                                                  ('Готовый результат отсутствует или повреждён. Измени ползунок для обработки.',))))
                     return
-                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved[0])))
             elif verify:
                 self.events.put(('preview_invalidated', request))
+            img = None
+            if not saved_only_check and can_render:
+                img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
+                                            key=key, cached_only=saved is not None)
             notice = ()
             if saved is not None:
+                # The cache-only probe can observe a newer model revision.
+                # Base both the warning and the watcher on its returned key.
                 extraction = extraction_provenance(model, keep_alpha, edge_mode, revision=key[-1])
                 recipe = (item_recipe(saved_adjustment, extraction) if saved_mode == 'item'
                           else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction)
                           if saved_frame is not None else None)
                 notice = freshness_warnings(saved[1], key[:4], recipe)
-            if saved_only_check or not can_render:
-                if not can_render:
-                    notice += ('Выбери корректное PNG-кольцо для редактирования.',)
-                self.events.put(('preview', (request, None, key, observed, checked_at, notice)))
-                return
-            img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
-                                        key=key, cached_only=saved is not None)
+            if not can_render:
+                notice += ('Выбери корректное PNG-кольцо для редактирования.',)
             self.events.put(('preview', (request, img, key, observed, checked_at, notice)))
 
         self._launch_worker(work, lambda exc: self.events.put(
@@ -1215,11 +1243,12 @@ class TokenForge:
                 else:
                     self._clear_selection()
         elif action == 'saved_preview':
-            request, mode, ext, image = data
+            request, mode, ext, image, stamp = data
             if (request == self._preview_request() and mode == self.work_mode.get()
                     and ext == self.ext.get() and not self.show_cutout.get()
                     and not (self.preview_pending and not self.preview_cached_only)):
                 self.preview_saved_only = True
+                self.preview_export_stamp = stamp
                 self._show_token(image)
         elif action == 'preview_no_frame':
             if data == self._preview_request():
@@ -1274,6 +1303,8 @@ class TokenForge:
                 self.current_cutout = img
                 self.current_key = key
                 self.preview_saved_only = img is None and key is not None
+                if not self.preview_saved_only:
+                    self.preview_export_stamp = None
                 if img is not None:
                     # This cutout satisfies a pending full extraction too.
                     self.preview_pending = False
