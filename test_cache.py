@@ -75,6 +75,17 @@ class CacheTests(unittest.TestCase):
                 app._get_cutout(self.source, 'birefnet-general', False, 'e')
         self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
 
+    def test_snapshot_decodes_captured_bytes_even_if_path_is_replaced(self):
+        from token_engine import source_identity, source_snapshot, read_image
+        identity = source_identity(self.source)
+        before = read_image(self.source).tobytes()
+        with source_snapshot(self.source, identity) as captured:
+            Image.new('RGBA', (50, 50), 'blue').save(self.source)
+            with Image.open(captured) as stored:
+                self.assertEqual(stored.convert('RGBA').tobytes(), before)
+        with self.assertRaisesRegex(OSError, 'изменился'):
+            read_image(self.source, identity=identity)
+
     def make_mock_app(self):
         app = TokenForge.__new__(TokenForge)
         app.disk_cache = self.cache

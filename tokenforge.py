@@ -19,13 +19,14 @@ from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
 
 from token_engine import (
-    Adjust, DiskCutoutCache, already_transparent, compose, frame_interior,
+    Adjust, DiskCutoutCache, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
     source_identity, assert_source_identity, is_owned_export, LoadedCutout,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import read_settings_file, save_settings_delta
-from local_models import LOCAL_MODELS, DEFAULT_MODEL, require_local_model, new_local_session
+from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session
+from cutout_service import load_cutout
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -670,36 +671,11 @@ class TokenForge:
         return (*source_identity(path), model, keep_alpha, edge_mode)
 
     def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False):
-        require_local_model(model)
         key = key if key is not None else self._cache_key(path, model, keep_alpha, edge_mode)
-        identity = key[:4]
-        if key in self.cache:
-            assert_source_identity(path, identity)
-            return self.cache[key], key
-        # Disk cache is checked before reading original and loading AI model.
-        cutout = self.disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity)
-        if cutout is None:
-            if cached_only:
-                assert_source_identity(path, identity)
-                return None, key
-            original = read_image(path)
-            assert_source_identity(path, identity)
-            if keep_alpha and already_transparent(original):
-                cutout = original
-            else:
-                if model not in self.sessions:
-                    self.sessions[model] = new_local_session(model)
-                cutout = remove_background(original, self.sessions[model], edge_mode)
-            try:
-                self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
-            except OSError:
-                pass  # Unwritable cache must not prevent creating tokens.
-        assert_source_identity(path, identity)
-        self.cache[key] = cutout
-        if len(self.cache) > 6:
-            oldest = next(iter(self.cache))
-            if oldest != key:
-                self.cache.pop(oldest)
+        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
+                            disk_cache=self.disk_cache, memory=self.cache, sessions=self.sessions,
+                            decode=read_image, extract=remove_background, session_factory=new_local_session,
+                            cached_only=cached_only)
         return cutout, key
 
     def _preview_request(self):

@@ -35,7 +35,7 @@
 Отдельные старые архивы v1.7.1 в репозитории не опубликованы. Один и тот же ZIP подходит для новой установки и обновления.
 
 1. Закрой TokenForge.
-2. Распакуй ZIP и скопируй содержимое его внутренней папки в существующую папку TokenForge с заменой файлов. Обновляй комплект целиком: `tokenforge.py`, `token_engine.py`, `item_engine.py`, `token_cli.py`, `runtime_streams.py`, `settings_store.py`, `process_lock.py`, `local_models.py`, `context_menu.py`, `sendto_entry.py`, `python_compat.py`, `diagnostics_tests.py`, BAT-скрипты, оба файла `requirements*.txt`, рамки и тесты. Сохрани свою нестандартную рамку отдельно, если она имеет имя одного из штатных файлов. Существующую `.venv` и папку кэша не удаляй.
+2. Распакуй ZIP и скопируй содержимое его внутренней папки в существующую папку TokenForge с заменой файлов. Обновляй комплект целиком: `tokenforge.py`, `token_engine.py`, `item_engine.py`, `token_cli.py`, `runtime_streams.py`, `settings_store.py`, `process_lock.py`, `local_models.py`, `cutout_service.py`, `context_menu.py`, `sendto_entry.py`, `python_compat.py`, `diagnostics_tests.py`, BAT-скрипты, оба файла `requirements*.txt`, рамки и тесты. Сохрани свою нестандартную рамку отдельно, если она имеет имя одного из штатных файлов. Существующую `.venv` и папку кэша не удаляй.
 3. Запусти `run.bat`. Обязательно выполни `install.bat`: минимальные версии Pillow и rembg повышены из соображений безопасности.
 4. Если контекстное меню было установлено прежней версией, повторно запусти `install_context_menu.bat` для миграции команд. Это относится и к v1.7.
 

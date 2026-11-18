@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -96,10 +97,33 @@ class DiskCutoutCache:
                 temporary.unlink(missing_ok=True)
 
 
-def read_image(path: Path) -> Image.Image:
-    with Image.open(path) as img:
-        result = ImageOps.exif_transpose(img).convert('RGBA')
-    return result
+@contextmanager
+def source_snapshot(path: Path, identity: tuple):
+    """Decode the same bytes whose digest identifies the source version.
+
+    A bounded in-memory spool rolls large inputs onto disk. Even if an
+    external writer changes and then restores the pathname during decoding,
+    the bytes passed to Pillow cannot change under the decoder.
+    """
+    digest = hashlib.sha256()
+    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b') as snapshot:
+        with path.open('rb') as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                digest.update(chunk)
+                snapshot.write(chunk)
+        if snapshot.tell() != identity[1] or digest.hexdigest() != identity[-1]:
+            raise OSError(f'Исходный файл изменился во время чтения: {path.name}')
+        snapshot.seek(0)
+        yield snapshot
+
+
+def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
+    if identity is None:
+        with Image.open(path) as img:
+            return ImageOps.exif_transpose(img).convert('RGBA')
+    with source_snapshot(path, identity) as snapshot:
+        with Image.open(snapshot) as img:
+            return ImageOps.exif_transpose(img).convert('RGBA')
 
 
 def already_transparent(img: Image.Image) -> bool:
@@ -533,7 +557,7 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
-                   input_identity: tuple | None = None) -> Publication:
+                   input_identity: tuple | None = None, collision_index=None) -> Publication:
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
@@ -554,6 +578,8 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
         if input_identity is not None:
             assert_source_identity(source, input_identity)
     def guard():
+        if collision_index is not None:
+            ensure_no_source_collision(destination, source, kind, collision_index)
         if prior is not None:
             assert_source_identity(destination, prior)
         check_input()
@@ -581,7 +607,7 @@ def token_output_path(source: Path, format_name: str = 'webp') -> Path:
     return source.with_name(f'{source.stem}t.{format_name.lower()}')
 
 
-def save_original_webp(source: Path) -> Publication:
+def save_original_webp(source: Path, *, collision_index=None) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
@@ -594,8 +620,14 @@ def save_original_webp(source: Path) -> Publication:
         if not is_owned_export(destination, source, 'copy'):
             raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
         return Publication(False)
+    if collision_index is not None:
+        ensure_no_source_collision(destination, source, 'copy', collision_index)
     identity = source_identity(source)
-    with Image.open(source) as raw:
+    def guard():
+        if collision_index is not None:
+            ensure_no_source_collision(destination, source, 'copy', collision_index)
+        assert_source_identity(source, identity)
+    with source_snapshot(source, identity) as snapshot, Image.open(snapshot) as raw:
         artwork = ImageOps.exif_transpose(raw)
         # Preserve true transparency without accidentally adding an opaque alpha.
         if 'A' in artwork.getbands() or 'transparency' in artwork.info:
@@ -607,7 +639,7 @@ def save_original_webp(source: Path) -> Publication:
         created = atomic_write(destination,
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
                                                        method=6, alpha_quality=100, exif=exif),
-                               replace=False, before_publish=lambda: assert_source_identity(source, identity),
+                               replace=False, before_publish=guard,
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
         if not created and not is_owned_export(destination, source, 'copy'):
@@ -678,7 +710,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
         if convert_original:
             try:
-                publication = save_original_webp(source)
+                publication = save_original_webp(source, collision_index=folders)
                 result.converted += int(bool(publication))
                 result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
             except Exception as exc:
@@ -704,7 +736,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 image = renderer(cutout, source)
                 publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
                                              approved_identity=(approved_outputs or {}).get(destination),
-                                             input_identity=identity)
+                                             input_identity=identity, collision_index=folders)
                 if publication:
                     result.created += 1
                     result.outputs.append(destination)

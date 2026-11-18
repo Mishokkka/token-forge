@@ -1,6 +1,7 @@
 """CLI actions for Windows Explorer. Does not create the main GUI."""
 from __future__ import annotations
 
+from cutout_service import load_cutout
 from settings_store import read_settings_file
 from local_models import DEFAULT_MODEL, require_local_model, new_local_session
 import os
@@ -9,10 +10,10 @@ from datetime import datetime
 from pathlib import Path
 
 from token_engine import (
-    IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
+    IMAGE_EXTS, Adjust, DiskCutoutCache,
     export_batch, frame_interior, list_source_images, read_image,
-    remove_background, token_output_path, source_identity, assert_source_identity, read_export_owner,
-    LoadedCutout, recorded_source_matches,
+    remove_background, token_output_path, source_identity, read_export_owner,
+    LoadedCutout,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -69,23 +70,13 @@ def _adjust_for(settings: dict, source: Path) -> Adjust:
 def make_cutout_loader(model, keep_alpha, edge_mode):
     require_local_model(model)
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
+    memory, sessions = {}, {}
     def get_cutout(path: Path):
         identity = source_identity(path)
-        cutout = cache.load(path, model, keep_alpha, edge_mode, identity=identity)
-        if cutout is not None:
-            assert_source_identity(path, identity)
-            return LoadedCutout(cutout, identity)
-        original = read_image(path)
-        assert_source_identity(path, identity)
-        if keep_alpha and already_transparent(original):
-            cutout = original
-        else:
-            cutout = remove_background(original, new_local_session(model), edge_mode)
-        try:
-            cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
-        except OSError:
-            pass
-        assert_source_identity(path, identity)
+        key = (*identity, model, keep_alpha, edge_mode)
+        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
+                            disk_cache=cache, memory=memory, sessions=sessions,
+                            decode=read_image, extract=remove_background, session_factory=new_local_session)
         return LoadedCutout(cutout, identity)
 
     return get_cutout
