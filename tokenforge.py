@@ -24,9 +24,10 @@ from token_engine import (
     Adjust, DiskCutoutCache, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
     source_identity, assert_source_identity, LoadedCutout, excluded_file, read_owned_export_image,
-    file_stamp, EXPECTED_ABSENT, inspect_existing_export,
+    file_stamp, EXPECTED_ABSENT, inspect_existing_export, load_frame,
+    freshness_warnings, token_recipe,
 )
-from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
+from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path, item_recipe
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
                             override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES,
                             EDGE_MODES, decode_settings, recover_settings_file, BatchAdjustments)
@@ -133,6 +134,9 @@ class TokenForge:
         self.last_full_check = 0.0
         self.preview_cached_only = False
         self.preview_retry = False
+        self.frame_loading = False
+        self.frame_generation = 0
+        self.pending_frame = None
         self.scan_running = False
         self.scan_generation = 0
         self.pending_scan = None
@@ -184,10 +188,7 @@ class TokenForge:
 
         self._build()
         self._on_work_mode_change(initial=True)
-        try:
-            self._set_frame(self.frame_path)
-        except Exception as exc:
-            self.status.set(f'Не удалось открыть рамку: {exc}')
+        self._request_frame(self.frame_path, initial=True)
         self._settings_baseline = self._settings_snapshot()
         # Preserve the actual persisted baseline for fields that were repaired
         # by the decoder, so the normal delta save writes these repairs.
@@ -306,7 +307,7 @@ class TokenForge:
         size_box = ttk.Combobox(options, values=['256', '512', '1024'], textvariable=self.size,
                                  state='readonly', width=8)
         size_box.grid(row=0, column=1, sticky='w', padx=(8, 0), pady=3)
-        size_box.bind('<<ComboboxSelected>>', lambda e: self._schedule_save())
+        size_box.bind('<<ComboboxSelected>>', lambda e: self._on_size_change())
         self._label(options, 'Формат:', font=('Segoe UI', 9)).grid(row=1, column=0, sticky='w', pady=3)
         ext_box = ttk.Combobox(options, values=['webp', 'png'], textvariable=self.ext,
                                 state='readonly', width=8)
@@ -534,26 +535,43 @@ class TokenForge:
         filename = filedialog.askopenfilename(title='Выбери PNG-кольцо',
                                                filetypes=[('PNG images', '*.png'), ('Все файлы', '*.*')])
         if filename:
-            try:
-                self._set_frame(Path(filename))
-                self._refresh_frame_sources()
-                if self.selected and self.current_cutout is not None:
-                    self._render()
-                elif self.selected:
-                    self._request_preview()
-                self._schedule_save()
-            except Exception as exc:
-                messagebox.showerror('Ошибка рамки', str(exc))
+            self._request_frame(Path(filename))
 
-    def _set_frame(self, path):
-        frame = read_image(path)
-        if frame.width != frame.height:
-            raise ValueError('Сейчас поддерживаются квадратные PNG-кольца.')
-        mask = frame_interior(frame)
-        self.frame = frame
-        self.interior = mask
-        self.frame_path = path
+    def _request_frame(self, path, *, initial=False):
+        if self.closing:
+            return
+        self.frame_generation += 1
+        self.pending_frame = (self.frame_generation, path, initial)
+        self.status.set(f'Подготовка рамки: {path.name}')
+        self._after_preview()
+
+    def _run_frame(self, request):
+        self.busy = self.frame_loading = True
+        def work():
+            frame, mask = load_frame(request[1])
+            self.events.put(('frame_loaded', (request, frame, mask, None)))
+        self._launch_worker(work, lambda exc: self.events.put(
+            ('frame_loaded', (request, None, None, self._worker_error_text(exc)))))
+
+    def _apply_frame(self, request, frame, mask, error):
+        self.frame_loading = False
+        generation, path, initial = request
+        if generation != self.frame_generation:
+            return
+        if error:
+            self.status.set(f'Не удалось открыть рамку: {error}')
+            if not initial:
+                messagebox.showerror('Ошибка рамки', error)
+            return
+        self.frame, self.interior, self.frame_path = frame, mask, path
         self.ring_label.set(path.name)
+        if not initial:
+            self._refresh_frame_sources()
+            if self.selected and self.current_cutout is not None:
+                self._render()
+            elif self.selected:
+                self._request_preview()
+            self._schedule_save()
 
     def _on_drop(self, event):
         # tk understands Windows file names with spaces and {braced paths}.
@@ -696,12 +714,20 @@ class TokenForge:
         for token in candidates:
             if token.is_file():
                 try:
-                    existing = read_owned_export_image(token, source, mode)
+                    existing = read_owned_export_image(token, source, mode, include_owner=True)
                     if existing is not None:
                         return existing
                 except (OSError, ValueError, SyntaxError, TypeError, RecursionError, Image.DecompressionBombError):
                     pass
         return None
+
+    def _on_size_change(self):
+        self._schedule_save()
+        if self.selected is not None and self.work_mode.get() == 'token':
+            if self.current_cutout is not None:
+                self._render()
+            else:
+                self._request_preview()
 
     def _on_format_change(self):
         self._schedule_save()
@@ -800,6 +826,10 @@ class TokenForge:
         saved_mode = self.work_mode.get()
         saved_ext = self.ext.get() if cached_only else None
         prefer_saved = cached_only and not self.show_cutout.get() and not verify
+        saved_adjustment = (self._current_item_adjust() if saved_mode == 'item'
+                            else self._current_adjust()) if prefer_saved else None
+        saved_size = int(self.size.get()) if prefer_saved and saved_mode == 'token' else None
+        saved_frame = self.frame if prefer_saved and saved_mode == 'token' else None
         self.busy = True
         if not verify:
             self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
@@ -807,8 +837,8 @@ class TokenForge:
         def work():
             saved = self._load_saved_preview(path, saved_mode, saved_ext) if prefer_saved else None
             if saved is not None:
-                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved)))
-            if not can_render:
+                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved[0])))
+            if not can_render and saved is None:
                 self.events.put(('preview_no_frame', request))
                 return
             observed = file_stamp(path)
@@ -827,9 +857,19 @@ class TokenForge:
                 return
             if verify:
                 self.events.put(('preview_invalidated', request))
+            notice = ()
+            if saved is not None:
+                extraction = (model, keep_alpha, edge_mode)
+                recipe = (item_recipe(saved_adjustment, extraction) if saved_mode == 'item'
+                          else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction)
+                          if saved_frame is not None else None)
+                notice = freshness_warnings(saved[1], key[:4], recipe)
+            if not can_render:
+                self.events.put(('preview_no_frame', request))
+                return
             img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
                                         key=key, cached_only=saved is not None)
-            self.events.put(('preview', (request, img, key, observed, checked_at)))
+            self.events.put(('preview', (request, img, key, observed, checked_at, notice)))
 
         self._launch_worker(work, lambda exc: self.events.put(
             ('error', (request, f'{path.name}: {self._worker_error_text(exc)}',
@@ -860,7 +900,7 @@ class TokenForge:
                                          self.current_cutout, mode, raw,
                                          None if mode == 'item' or raw else self.frame,
                                          None if mode == 'item' or raw else self.interior,
-                                         adjustment)
+                                         adjustment, int(self.size.get()) if mode == 'token' and not raw else 512)
         self._after_preview()
         return True
 
@@ -902,6 +942,9 @@ class TokenForge:
 
     def _start_export(self, image_files, force_overwrite=False, requested_mode=None, scan_folder=None):
         if self.closing or self.approval_pending:
+            return
+        if self.frame_loading or self.pending_frame is not None:
+            self.status.set('Дождись завершения подготовки рамки.')
             return
         if self.scan_running or self.pending_scan is not None:
             self.status.set('Дождись завершения поиска исходных артов.')
@@ -1069,6 +1112,9 @@ class TokenForge:
             request = self.pending_export
             self.pending_export = None
             self._run_export(request)
+        elif self.pending_frame is not None:
+            request, self.pending_frame = self.pending_frame, None
+            self._run_frame(request)
         elif self.pending_scan is not None:
             request = self.pending_scan
             self.pending_scan = None
@@ -1087,6 +1133,10 @@ class TokenForge:
         if self.running_batch:
             self.cancel_event.set()
             self.status.set('Остановка после текущего изображения…')
+        elif self.frame_loading or self.pending_frame is not None:
+            self.frame_generation += 1
+            self.pending_frame = None
+            self.status.set('Подготовка рамки отменена.')
         elif self.scan_running or self.pending_scan is not None:
             self.scan_generation += 1
             self.pending_scan = None
@@ -1118,7 +1168,7 @@ class TokenForge:
     def _handle_worker_event(self, action, data):
         terminal = action in ('folder_scan', 'preview_unchanged', 'preview', 'error',
                               'preview_no_frame', 'export_preflight', 'preflight_failure',
-                              'done', 'batch_failure', 'rendered')
+                              'done', 'batch_failure', 'rendered', 'frame_loaded')
         # Keep the reservation during completion handling, including modal
         # Tk loops; retries and queued exports cannot steal the worker slot.
         try:
@@ -1131,7 +1181,9 @@ class TokenForge:
                 self._after_preview()
 
     def _apply_worker_event(self, action, data):
-        if action == 'folder_scan':
+        if action == 'frame_loaded':
+            self._apply_frame(*data)
+        elif action == 'folder_scan':
             self.scan_running = False
             self.active_scan = None
             self._apply_folder_scan(*data)
@@ -1195,7 +1247,7 @@ class TokenForge:
                 self.preview_stamp = stamp
                 self.last_full_check = checked_at
         elif action == 'preview':
-            request, img, key, stamp, checked_at = data
+            request, img, key, stamp, checked_at, notice = data
             if request == self._preview_request():
                 self.preview_retry = False
                 self.preview_stamp = stamp
@@ -1207,7 +1259,8 @@ class TokenForge:
                     self.preview_pending = False
                     self._render()
                 else:
-                    self.status.set(f'Готовый результат: {self.selected.name}. Для редактирования измени ползунок.')
+                    self.status.set(' '.join(notice) if notice else
+                                    f'Готовый результат: {self.selected.name}. Для редактирования измени ползунок.')
         elif action == 'error':
             request, error, retry, verifying = data
             if request == self._preview_request():
@@ -1325,6 +1378,7 @@ class TokenForge:
         self.closing = True
         self.pending_scan = None
         self.pending_export = None
+        self.pending_frame = None
         self.pending_render = None
         self.preview_pending = False
         self.cancel_event.set()

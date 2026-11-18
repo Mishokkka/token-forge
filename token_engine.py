@@ -15,7 +15,7 @@ from local_models import call_rembg, model_revision
 from process_lock import process_lock
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
-CUTOUT_CACHE_VERSION = 3
+CUTOUT_CACHE_VERSION = 4
 MAX_ENCODED_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 MAX_IMAGE_SIDE = 16384
@@ -233,6 +233,41 @@ def source_snapshot(path: Path, identity: tuple):
         yield snapshot
 
 
+def decode_artwork(raw, *, force_alpha=False):
+    """Normalize tagged artwork to sRGB; preserve alpha independently of color.
+
+    Never attach a CMYK/grayscale source profile to converted RGB data.
+    Invalid embedded profiles fail with an actionable per-image error.
+    """
+    import io
+    from PIL import ImageCms
+    artwork = ImageOps.exif_transpose(raw)
+    has_alpha = 'A' in artwork.getbands() or 'transparency' in artwork.info
+    alpha = artwork.convert('RGBA').getchannel('A') if has_alpha and artwork.info.get('icc_profile') else None
+    profile = artwork.info.get('icc_profile')
+    if profile:
+        try:
+            source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+            target = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
+            if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB'):
+                color = artwork
+            elif artwork.mode == 'LA':
+                color = artwork.getchannel('L')
+            else:
+                color = artwork.convert('RGB')
+            result = ImageCms.profileToProfile(color, source, target, outputMode='RGB')
+            if alpha is not None:
+                result.putalpha(alpha)
+            elif force_alpha:
+                result = result.convert('RGBA')
+            result.info['icc_profile'] = target.tobytes()
+            return result
+        except (OSError, ValueError, TypeError, ImageCms.PyCMSError) as exc:
+            raise ValueError('Некорректный или неподдерживаемый цветовой профиль ICC. '
+                             'Сохрани изображение в sRGB и повтори обработку.') from exc
+    return artwork.convert('RGBA' if has_alpha or force_alpha else 'RGB')
+
+
 class BorrowedStream:
     """File API proxy with a borrowed (not transferred) lifetime."""
     def __init__(self, stream):
@@ -274,7 +309,7 @@ class CapturedArtwork:
 
     def decode(self):
         with self.open() as image:
-            return ImageOps.exif_transpose(image).convert('RGBA')
+            return decode_artwork(image, force_alpha=True)
 
 
 def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
@@ -282,10 +317,10 @@ def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
         if path.stat().st_size > MAX_ENCODED_BYTES:
             raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
         with open_art(path) as img:
-            return ImageOps.exif_transpose(img).convert('RGBA')
+            return decode_artwork(img, force_alpha=True)
     with source_snapshot(path, identity) as snapshot:
         with open_art(snapshot) as img:
-            return ImageOps.exif_transpose(img).convert('RGBA')
+            return decode_artwork(img, force_alpha=True)
 
 
 def already_transparent(img: Image.Image) -> bool:
@@ -403,6 +438,15 @@ def _enclosed_shape(barrier: Image.Image) -> Image.Image:
             if outside.getpixel((x, y)) == 0:
                 ImageDraw.floodfill(outside, (x, y), 255, thresh=0)
     return outside.point(lambda p: 0 if p == 255 else 255)
+
+
+def load_frame(path: Path):
+    frame = read_image(path)
+    if frame.width != frame.height:
+        raise ValueError('PNG-кольцо должно быть квадратным.')
+    if frame.width > 4096:
+        raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+    return frame, frame_interior(frame)
 
 
 def silhouette_geometry(cutout: Image.Image):
@@ -680,7 +724,14 @@ def recipe_digest(kind, **settings):
     return hashlib.sha256(payload.encode('ascii')).hexdigest()
 
 
-COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100)
+COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100, color='sRGB')
+
+
+def token_recipe(frame, adjustment, size, format_name, extraction, *, frame_digest=None):
+    digest = frame_digest if frame_digest is not None else hashlib.sha256(frame.tobytes()).hexdigest()
+    return recipe_digest('token', frame=digest, frame_size=frame.size, size=size,
+                         format=format_name.lower(), placement=canonical_placement(adjustment),
+                         extraction=extraction)
 
 
 def _valid_digest(value):
@@ -806,16 +857,17 @@ def inspect_existing_export(destination, source, kind):
         return identity, _owner_matches(owner, source, kind)
 
 
-def read_owned_export_image(destination, source, kind):
+def read_owned_export_image(destination, source, kind, *, include_owner=False):
     """Decode only the same verified bytes whose ownership was inspected."""
     with fingerprinted_snapshot(destination) as (identity, snapshot):
-        with open_art(snapshot) as stored:
+        with Image.open(snapshot, formats=('PNG', 'WEBP')) as stored:
+            validate_art_dimensions(stored)
             owner = _parse_owner(stored.getexif().get(270))
             if not _owner_matches(owner, source, kind):
                 return None
             image = stored.convert('RGBA')
     assert_source_identity(destination, identity)
-    return image
+    return (image, owner) if include_owner else image
 
 
 def _windows_stem_names(folder, stem):
@@ -1063,17 +1115,14 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
             approval_guard()
     capture_context = CapturedArtwork(source, identity) if captured is None else nullcontext(captured)
     with capture_context as capture, capture.open() as raw:
-        artwork = ImageOps.exif_transpose(raw)
-        # Preserve true transparency without accidentally adding an opaque alpha.
-        if 'A' in artwork.getbands() or 'transparency' in artwork.info:
-            artwork = artwork.convert('RGBA')
-        else:
-            artwork = artwork.convert('RGB')
+        artwork = decode_artwork(raw)
+        color_options = {'icc_profile': artwork.info['icc_profile']} if artwork.info.get('icc_profile') else {}
         exif = Image.Exif()
         exif[270] = export_owner(source, 'copy', source_digest=identity[-1], recipe=COPY_RECIPE)
         created = atomic_write(destination,
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
-                                                       method=6, alpha_quality=100, exif=exif),
+                                                       method=6, alpha_quality=100, exif=exif,
+                                                       **color_options),
                                replace=False, before_publish=guard,
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
@@ -1248,9 +1297,8 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
             return None
         if frame_digest is None:
             frame_digest = hashlib.sha256(frame.tobytes()).hexdigest()
-        return recipe_digest('token', frame=frame_digest, frame_size=frame.size,
-                             size=out_size, format=format_name.lower(),
-                             placement=canonical_placement(adjustments[source]), extraction=extraction_recipe)
+        return token_recipe(frame, adjustments[source], out_size, format_name, extraction_recipe,
+                            frame_digest=frame_digest)
     def render(cutout, source):
         ensure_frame()
         return compose(cutout, frame, interior, out_size, adjustments[source])

@@ -157,6 +157,22 @@ class EngineTests(unittest.TestCase):
                                    input_identity=identity)
             self.assertEqual(output.read_bytes(), original)
 
+    def test_tagged_art_is_normalized_to_srgb_and_copy_keeps_profile(self):
+        from PIL import ImageCms
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Tagged.png'
+            profile = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB')).tobytes()
+            self.figure.save(source, icc_profile=profile)
+            decoded = read_image(source)
+            self.assertEqual(decoded.getchannel('A').tobytes(), self.figure.getchannel('A').tobytes())
+            self.assertTrue(decoded.info.get('icc_profile'))
+            self.assertTrue(save_original_webp(source))
+            with Image.open(source.with_suffix('.webp')) as converted:
+                self.assertTrue(converted.info.get('icc_profile'))
+                parsed = ImageCms.ImageCmsProfile(io.BytesIO(converted.info['icc_profile']))
+                self.assertIn('sRGB', ImageCms.getProfileDescription(parsed))
+
     def test_resource_limits_and_decoder_allowlist(self):
         with tempfile.TemporaryDirectory() as d:
             disguised = Path(d) / 'not-png.png'

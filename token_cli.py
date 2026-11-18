@@ -12,7 +12,7 @@ from app_paths import preferences_dir
 
 from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache,
-    export_batch, frame_interior, list_source_images, read_image,
+    export_batch, load_frame, list_source_images, read_image,
     remove_background, token_output_path, source_identity, read_export_owner,
     LoadedCutout, excluded_file,
 )
@@ -96,11 +96,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='token')
     frame_path = Path(settings['ring'])
     source = resolve_context_source(filename, frame_path=frame_path)
-    def load_frame():
-        frame = read_image(frame_path)
-        if frame.width != frame.height:
-            raise ValueError('PNG-кольцо должно быть квадратным.')
-        return frame, frame_interior(frame)
+
 
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
@@ -111,7 +107,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_batch(
         [source], get_cutout, None, None, {source: _adjust_for(settings, source)},
-        frame_loader=load_frame,
+        frame_loader=lambda: load_frame(frame_path),
         out_size=size, format_name=ext,
         skip_exists=settings['skip_exists'],
         convert_original=settings['convert_original'],

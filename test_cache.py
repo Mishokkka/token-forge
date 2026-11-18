@@ -146,6 +146,10 @@ class CacheTests(unittest.TestCase):
         app.last_full_check = 0.0
         app.preview_cached_only = False
         app.preview_retry = False
+        app.frame_loading = False
+        app.frame_generation = 0
+        app.pending_frame = None
+        app.size = SimpleNamespace(get=lambda: '256')
         app.scan_running = False
         app.scan_generation = 0
         app.pending_scan = None
@@ -328,7 +332,7 @@ class CacheTests(unittest.TestCase):
         request = app._preview_request()
         app.preview_generation += 1
         app.selected = None
-        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key, None, 0.0)))
+        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key, None, 0.0, ())))
         with patch.object(app, '_cache_key', side_effect=AssertionError('GUI hashed source')):
             app._poll()
         self.assertFalse(app.busy)
@@ -372,7 +376,9 @@ class CacheTests(unittest.TestCase):
         from unittest.mock import Mock
         app = self.make_mock_app()
         app.selected = self.source
-        app.frame = object()
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        from token_engine import Adjust
+        app._current_adjust = lambda: Adjust()
         app.status, app._show_token = Mock(), Mock()
         app.events = queue.Queue()
         for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
@@ -381,7 +387,7 @@ class CacheTests(unittest.TestCase):
         saved = Image.new('RGBA', (256, 256), 'red')
         app._get_cutout = Mock(return_value=(None, ('key',)))
         with patch('tokenforge.threading.Thread') as launch, \
-             patch.object(app, '_load_saved_preview', return_value=saved) as load:
+             patch.object(app, '_load_saved_preview', return_value=(saved, (2, 'token', self.source.name))) as load:
             app._request_preview(cached_only=True)
             load.assert_not_called()
             launch.call_args.kwargs['target']()
@@ -421,6 +427,33 @@ class CacheTests(unittest.TestCase):
             launch.call_args.kwargs['target']()
             app._handle_worker_event(*app.events.get_nowait())
             self.assertIsInstance(app._show_token.call_args.args[0], Image.Image)
+
+    def test_frame_load_is_async_and_superseded_results_are_ignored(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        app.status, app.ring_label = Mock(), Mock()
+        app._refresh_frame_sources = Mock()
+        app._schedule_save = Mock()
+        first, second = self.directory / 'first.png', self.directory / 'second.png'
+        frame = Image.new('RGBA', (32, 32))
+        mask = Image.new('L', (32, 32))
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch('tokenforge.load_frame', return_value=(frame, mask)) as load:
+            app._request_frame(first)
+            older = launch.call_args.kwargs['target']
+            load.assert_not_called()
+            app._request_frame(second)
+            older()
+            app._handle_worker_event(*app.events.get_nowait())
+            self.assertEqual(launch.call_count, 2)
+            app._refresh_frame_sources.assert_not_called()
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+        self.assertEqual(app.frame_path, second)
+        app._refresh_frame_sources.assert_called_once()
+        app._schedule_save.assert_called_once()
 
     def test_slider_burst_coalesces_and_rejects_old_render(self):
         import queue
@@ -970,7 +1003,7 @@ class CacheTests(unittest.TestCase):
         app.work_mode = SimpleNamespace(get=lambda: 'token')
         displays = []
         app._show_token = lambda img: displays.append(img)
-        self.assertEqual(app._load_saved_preview(self.source, 'token', 'webp').size, (256, 256))
+        self.assertEqual(app._load_saved_preview(self.source, 'token', 'webp')[0].size, (256, 256))
         self.assertEqual(displays, [])
 
 

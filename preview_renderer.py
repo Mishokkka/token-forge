@@ -16,6 +16,7 @@ class PreviewJob:
     frame: Image.Image | None
     interior: Image.Image | None
     adjustment: object
+    size: int = 512
 
 
 class PreviewRenderer:
@@ -49,5 +50,5 @@ class PreviewRenderer:
             return compose_item(job.cutout, adjust, prepared=self._oriented)
         if self._geometry is None:
             self._geometry = silhouette_geometry(job.cutout)
-        return compose(job.cutout, job.frame, job.interior, 512,
+        return compose(job.cutout, job.frame, job.interior, job.size,
                        job.adjustment, geometry=self._geometry)

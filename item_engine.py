@@ -186,6 +186,11 @@ def outline_subject(canvas, stroke_px):
     return border
 
 
+def item_recipe(adjustment, extraction):
+    return recipe_digest('item', size=ITEM_SIZE, stroke=ITEM_STROKE,
+                         placement=canonical_placement(adjustment), extraction=extraction)
+
+
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
                  on_progress=None, approved_outputs=None, expected_inputs=None, extraction_recipe=None,
@@ -196,6 +201,4 @@ def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                          cancel_event=cancel_event, on_progress=on_progress,
                          approved_outputs=approved_outputs, expected_inputs=expected_inputs,
                          captured_loader=captured_loader,
-                         recipe_for=lambda source: recipe_digest(
-                             'item', size=ITEM_SIZE, stroke=ITEM_STROKE,
-                             placement=canonical_placement(adjustments[source]), extraction=extraction_recipe))
+                         recipe_for=lambda source: item_recipe(adjustments[source], extraction_recipe))
