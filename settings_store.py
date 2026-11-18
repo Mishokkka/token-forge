@@ -48,12 +48,20 @@ def merge_delta(latest: dict, baseline: dict, current: dict) -> dict:
     return result
 
 
-def save_settings_delta(path: Path, baseline: dict, current: dict) -> bool:
-    if baseline == current:
+def save_settings_delta(path: Path, baseline: dict, current: dict, *, resets=()) -> bool:
+    if baseline == current and not resets:
         return False
     with settings_lock(path):
         latest = read_settings_file(path, strict=True)
-        updated = merge_delta(latest, baseline, current)
+        # A reset is an explicit operation, even when the local snapshot
+        # never contained that override. Apply it to the latest document.
+        reset_latest, reset_baseline = deepcopy(latest), deepcopy(baseline)
+        for group, key in resets:
+            for document in (reset_latest, reset_baseline):
+                mapping = document.get(group)
+                if isinstance(mapping, dict):
+                    mapping.pop(key, None)
+        updated = merge_delta(reset_latest, reset_baseline, current)
         if updated == latest:
             return False
         payload = json.dumps(updated, ensure_ascii=False, indent=2).encode('utf-8')

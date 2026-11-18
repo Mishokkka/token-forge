@@ -103,6 +103,12 @@ class TokenForge:
         self.pending_export = None
         self.preview_generation = 0
         self.preview_cached_only = False
+        self.preview_retry = False
+        self.scan_running = False
+        self.scan_generation = 0
+        self.pending_scan = None
+        self.pending_resets = set()
+        self.save_retries = 0
         self.worker = None
         self.closing = False
         self.widget_values = {}
@@ -389,22 +395,62 @@ class TokenForge:
             self._set_folder(Path(chosen))
 
     def _set_folder(self, folder: Path, select_path: Path | None = None):
+        if self.closing:
+            return
+        if self.running_batch or self.pending_export is not None:
+            self.status.set('Сначала заверши или останови экспорт.')
+            return
+        self.scan_generation += 1
+        self._clear_selection()
+        self.folder = None
+        self.files = []
+        self.file_list.delete(0, tk.END)
+        self.status.set(f'Поиск исходных артов: {folder.name}')
+        request = (self.scan_generation, folder, select_path, self.frame_path)
         if self.busy:
-            self.status.set('Операция выполняется. Сначала дождись её завершения или останови.')
+            self.pending_scan = request
+            if self.scan_running:
+                self.cancel_event.set()
+        else:
+            self._run_scan(request)
+
+    def _run_scan(self, request):
+        generation, folder, select_path, frame_path = request
+        self.busy = self.scan_running = True
+        self.cancel_event.clear()
+
+        def work():
+            try:
+                files = list_source_images(folder, exclude=frame_path, cancel_event=self.cancel_event)
+                self.events.put(('folder_scan', (request, files, self.cancel_event.is_set(), None)))
+            except Exception as exc:
+                self.events.put(('folder_scan', (request, [], False, str(exc))))
+        self.worker = threading.Thread(target=work, daemon=False)
+        self.worker.start()
+
+    def _set_file_list(self, files):
+        self.files = files
+        self.file_list.delete(0, tk.END)
+        for p in files:
+            self.file_list.insert(tk.END, p.name)
+
+    def _apply_folder_scan(self, request, files, cancelled, error):
+        generation, folder, select_path, _ = request
+        if generation != self.scan_generation:
+            return
+        if cancelled or error:
+            self.status.set('Поиск остановлен.' if cancelled else f'Ошибка поиска: {error}')
             return
         self.folder = folder
         self.folder_label.set(str(folder))
-        self.files = list_source_images(folder, exclude=self.frame_path)
-        self.file_list.delete(0, tk.END)
-        for p in self.files:
-            self.file_list.insert(tk.END, p.name)
-        self.status.set(f'Исходных артов: {len(self.files)}. Результаты сохраняются рядом с оригиналами.')
-        if select_path is not None and select_path not in self.files:
+        self._set_file_list(files)
+        self.status.set(f'Исходных артов: {len(files)}. Результаты сохраняются рядом с оригиналами.')
+        if select_path is not None and select_path not in files:
             self._clear_selection()
             self.status.set(f'Не удалось открыть {select_path.name}: файл недоступен или исключён как рамка.')
-        elif self.files:
-            selected_path = select_path if select_path is not None else self.files[0]
-            index = self.files.index(selected_path)
+        elif files:
+            selected_path = select_path if select_path is not None else files[0]
+            index = files.index(selected_path)
             self.file_list.selection_set(index)
             self.file_list.see(index)
             self._select(selected_path)
@@ -516,6 +562,7 @@ class TokenForge:
 
     def _clear_selection(self):
         self.preview_generation += 1
+        self.preview_retry = False
         self.selected = None
         self.current_cutout = None
         self.current_key = None
@@ -527,6 +574,7 @@ class TokenForge:
         if self.closing:
             return
         self.preview_generation += 1
+        self.preview_retry = False
         self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
@@ -600,7 +648,9 @@ class TokenForge:
         if self.selected is None:
             return
         key = 'item_overrides' if self.work_mode.get() == 'item' else 'overrides'
-        self.settings.setdefault(key, {}).pop(str(self.selected.resolve()), None)
+        path_key = str(self.selected.resolve())
+        self.pending_resets.add((key, path_key))
+        self.settings.setdefault(key, {}).pop(path_key, None)
         self._select(self.selected)
         self._schedule_save()
 
@@ -683,7 +733,7 @@ class TokenForge:
                                             key=key, cached_only=cached_only)
                 self.events.put(('preview', (request, img, key)))
             except Exception as exc:
-                self.events.put(('error', (request, f'{path.name}: {exc}')))
+                self.events.put(('error', (request, f'{path.name}: {exc}', isinstance(exc, OSError), verify)))
         self.worker = threading.Thread(target=work, daemon=False)
         self.worker.start()
 
@@ -692,7 +742,7 @@ class TokenForge:
         # This also detects same-size, same-timestamp edits on a network share.
         if self.closing:
             return
-        if self.current_cutout is not None and not self.busy:
+        if (self.current_cutout is not None or self.preview_retry) and not self.busy:
             self._request_preview(verify=True)
         self.root.after(2500, self._watch_source)
 
@@ -737,24 +787,12 @@ class TokenForge:
         if not self.folder:
             messagebox.showinfo('Нет изображений', 'Сначала выбери папку с артами.')
             return
-        # Re-scan to include files added while the program was open, but not
-        # tokens or WebP copies produced by an earlier batch.
-        fresh_files = list_source_images(self.folder, exclude=self.frame_path)
-        if fresh_files != self.files:
-            self.files = fresh_files
-            self.file_list.delete(0, tk.END)
-            for path in self.files:
-                self.file_list.insert(tk.END, path.name)
-            if self.selected in self.files:
-                self.file_list.selection_set(self.files.index(self.selected))
-            else:
-                self._clear_selection()
-        self._start_export(fresh_files)
+        self._start_export(self.files, scan_folder=self.folder)
 
-    def _start_export(self, image_files, force_overwrite=False, requested_mode=None):
+    def _start_export(self, image_files, force_overwrite=False, requested_mode=None, scan_folder=None):
         if self.closing:
             return
-        if not self.folder or not image_files:
+        if not self.folder or (not image_files and scan_folder is None):
             messagebox.showinfo('Нет изображений', 'Сначала выбери папку с артами.')
             return
         if self.running_batch:
@@ -793,8 +831,12 @@ class TokenForge:
                 approved_outputs[destination] = identity
         expected_input = (self.current_key[:4] if force_overwrite and self.current_key is not None
                           and files == [self.selected] else None)
+        # A batch scan takes place on the worker; capture all controls and
+        # per-file overrides now, including defaults for newly discovered art.
+        scan = (scan_folder, self.frame_path, deepcopy(self.settings),
+                self.default_item_layout.get() if mode == 'item' else None) if scan_folder else None
         request = (files, mode, model, keep, edge_mode, ext, size, skip,
-                   convert, frame, interior, adjustments, approved_outputs, expected_input)
+                   convert, frame, interior, adjustments, approved_outputs, expected_input, scan)
         if self.busy:
             self.pending_export = request
             self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
@@ -803,15 +845,39 @@ class TokenForge:
 
     def _run_export(self, request):
         (files, mode, model, keep, edge_mode, ext, size, skip,
-         convert, frame, interior, adjustments, approved_outputs, expected_input) = request
+         convert, frame, interior, adjustments, approved_outputs, expected_input, scan) = request
         self.busy = True
         self.running_batch = True
         self.cancel_event.clear()
         self.progress['value'] = 0
-        self.status.set(f'Начата пакетная обработка: {len(files)} артов.')
+        self.status.set('Поиск исходных артов…' if scan else f'Начата пакетная обработка: {len(files)} артов.')
 
         def work():
             try:
+                selected_files, captured = files, adjustments
+                if scan is not None:
+                    folder, ring_path, settings, default_layout = scan
+                    selected_files = list_source_images(folder, exclude=ring_path, cancel_event=self.cancel_event)
+                    if self.cancel_event.is_set():
+                        from token_engine import BatchResult
+                        self.events.put(('done', BatchResult(errors=[], cancelled=True)))
+                        return
+                    self.events.put(('batch_scan', (folder, selected_files)))
+                    captured = {}
+                    for path in selected_files:
+                        if path in adjustments:
+                            captured[path] = adjustments[path]
+                            continue
+                        group = 'item_overrides' if mode == 'item' else 'overrides'
+                        stored = settings.get(group, {}).get(str(path.resolve()), {})
+                        stored = stored if isinstance(stored, dict) else {}
+                        if mode == 'item':
+                            keys = ('layout', 'zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
+                            values = {'layout': default_layout}
+                            values.update({k: stored[k] for k in keys if k in stored})
+                            captured[path] = ItemAdjust(**values)
+                        else:
+                            captured[path] = Adjust(**{k: stored[k] for k in ('zoom', 'x', 'y', 'gap') if k in stored})
                 def get_cutout(path):
                     if expected_input is not None:
                         assert_source_identity(path, expected_input)
@@ -821,13 +887,13 @@ class TokenForge:
                     return LoadedCutout(image, key[:4])
                 progress = lambda i, n, msg: self.events.put(('progress', (i, n, msg)))
                 if mode == 'item':
-                    result = export_items(files, get_cutout, adjustments,
+                    result = export_items(selected_files, get_cutout, captured,
                                           skip_exists=skip, convert_original=convert,
                                           cancel_event=self.cancel_event, on_progress=progress,
                                           approved_outputs=approved_outputs)
                 else:
-                    result = export_batch(files, get_cutout, frame, interior,
-                                          adjustments, out_size=size, format_name=ext,
+                    result = export_batch(selected_files, get_cutout, frame, interior,
+                                          captured, out_size=size, format_name=ext,
                                           skip_exists=skip, convert_original=convert,
                                           cancel_event=self.cancel_event, on_progress=progress,
                                           approved_outputs=approved_outputs)
@@ -841,7 +907,11 @@ class TokenForge:
         """Prioritize queued exports over another potentially slow preview."""
         if self.closing:
             return
-        if self.pending_export is not None:
+        if self.pending_scan is not None:
+            request = self.pending_scan
+            self.pending_scan = None
+            self._run_scan(request)
+        elif self.pending_export is not None:
             request = self.pending_export
             self.pending_export = None
             self._run_export(request)
@@ -852,7 +922,11 @@ class TokenForge:
             self._request_preview(cached_only=cached_only)
 
     def _cancel(self):
-        if self.running_batch:
+        if self.scan_running:
+            self.pending_scan = None
+            self.cancel_event.set()
+            self.status.set('Остановка поиска…')
+        elif self.running_batch:
             self.cancel_event.set()
             self.status.set('Остановка после текущего изображения…')
         elif self.pending_export is not None:
@@ -865,7 +939,20 @@ class TokenForge:
                 action, data = self.events.get_nowait()
                 if self.closing:
                     continue
-                if action == 'preview_invalidated':
+                if action == 'folder_scan':
+                    self.busy = self.scan_running = False
+                    self._apply_folder_scan(*data)
+                    if not self.busy:
+                        self._after_preview()
+                elif action == 'batch_scan':
+                    folder, files = data
+                    if folder == self.folder:
+                        self._set_file_list(files)
+                        if self.selected in files:
+                            self.file_list.selection_set(files.index(self.selected))
+                        else:
+                            self._clear_selection()
+                elif action == 'preview_invalidated':
                     if data == self._preview_request():
                         self.current_cutout = None
                         self.current_key = None
@@ -878,6 +965,7 @@ class TokenForge:
                     request, img, key = data
                     self.busy = False
                     if request == self._preview_request():
+                        self.preview_retry = False
                         if img is not None:
                             self.current_cutout = img
                             self.current_key = key
@@ -890,13 +978,14 @@ class TokenForge:
                     self._after_preview()
                 elif action == 'error':
                     self.busy = False
-                    request, error = data
+                    request, error, retry, verifying = data
                     if request == self._preview_request():
+                        self.preview_retry = retry
                         self.current_cutout = None
                         self.current_key = None
                         self._show_token(None)
                         self.status.set('Ошибка: ' + error)
-                        if not self.preview_pending:
+                        if not self.preview_pending and not verifying:
                             messagebox.showerror('Ошибка обработки', error)
                     self._after_preview()
                 elif action == 'progress':
@@ -920,7 +1009,9 @@ class TokenForge:
                             self._show_saved_token(self.selected)
                     messages = data.errors + data.warnings
                     if messages:
-                        messagebox.showwarning('Отчёт обработки', report + '\n\n' + '\n'.join(messages[:15]))
+                        # Preserve every message (especially recovery paths)
+                        # in a scrollable dialog instead of truncating them.
+                        self._show_batch_report(report, messages)
                     self._after_preview()
                 elif action == 'batch_failure':
                     self.busy = False
@@ -936,11 +1027,28 @@ class TokenForge:
             else:
                 self.root.after(120, self._poll)
 
+    def _show_batch_report(self, report, messages):
+        dialog = tk.Toplevel(self.root)
+        dialog.title('Отчёт обработки')
+        dialog.geometry('760x480')
+        ttk.Label(dialog, text=report, wraplength=720).pack(fill='x', padx=12, pady=8)
+        body = tk.Frame(dialog)
+        body.pack(fill='both', expand=True, padx=12)
+        scrollbar = ttk.Scrollbar(body)
+        scrollbar.pack(side='right', fill='y')
+        content = tk.Text(body, wrap='word', yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=content.yview)
+        content.pack(fill='both', expand=True)
+        content.insert('1.0', '\n\n'.join(messages))
+        content.configure(state='disabled')
+        ttk.Button(dialog, text='Закрыть', command=dialog.destroy).pack(pady=8)
+
     def _schedule_save(self):
         if self.closing:
             return
         if self.save_timer:
             self.root.after_cancel(self.save_timer)
+        self.save_retries = 0
         self.save_timer = self.root.after(500, self._save)
 
     def _settings_snapshot(self):
@@ -960,15 +1068,23 @@ class TokenForge:
         })
         return current
 
-    def _save(self):
+    def _save(self, allow_retry=True):
         self.save_timer = None
         current = self._settings_snapshot()
         try:
-            save_settings_delta(PREFS_FILE, self._settings_baseline, current)
+            save_settings_delta(PREFS_FILE, self._settings_baseline, current, resets=self.pending_resets)
+            self.pending_resets.clear()
+            self.save_retries = 0
             # Keep the baseline local: remote edits have not changed our controls.
             self._settings_baseline = deepcopy(current)
             return True
         except (OSError, ValueError) as exc:
+            # A reader holding settings.json can briefly deny replacement
+            # on Windows. Retry the whole locked merge, not a stale write.
+            if (allow_retry and isinstance(exc, OSError) and
+                    getattr(exc, 'winerror', None) in (5, 32, 33) and self.save_retries < 5):
+                self.save_retries += 1
+                self.save_timer = self.root.after(200 * self.save_retries, self._save)
             self.status.set(f'Не удалось сохранить настройки: {exc}')
             return False
 
@@ -978,10 +1094,11 @@ class TokenForge:
         if self.save_timer:
             self.root.after_cancel(self.save_timer)
             self.save_timer = None
-        if not self._save():
+        if not self._save(allow_retry=False):
             if not messagebox.askyesno('Настройки не сохранены', 'Закрыть программу без сохранения изменений?'):
                 return
         self.closing = True
+        self.pending_scan = None
         self.pending_export = None
         self.preview_pending = False
         self.cancel_event.set()

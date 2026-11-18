@@ -435,6 +435,8 @@ def export_owner(source: Path, kind: str) -> str:
 
 def read_export_owner(destination: Path) -> tuple | None:
     """Read a validated marker; arbitrary filename suffixes are never proof."""
+    if destination.suffix.lower() not in ('.png', '.webp'):
+        return None  # these are the only formats TokenForge has ever marked
     try:
         with Image.open(destination) as stored:
             owner = stored.getexif().get(270)
@@ -613,12 +615,22 @@ def save_original_webp(source: Path) -> Publication:
         return created
 
 
-def list_source_images(folder: Path, exclude: Path | None = None) -> list[Path]:
+def list_source_images(folder: Path, exclude: Path | None = None, *, cancel_event=None) -> list[Path]:
     """Only validated provenance excludes generated art, even if orphaned."""
     excluded = exclude.resolve() if exclude is not None else None
-    return [path for path in list_images(folder)
-            if (excluded is None or path.resolve() != excluded)
-            and read_export_owner(path) is None]
+    result = []
+    for path in list_images(folder):
+        if cancel_event is not None and cancel_event.is_set():
+            break
+        if excluded is not None and path.name.casefold() == excluded.name.casefold():
+            try:
+                if path.samefile(excluded):
+                    continue
+            except OSError:
+                pass
+        if read_export_owner(path) is None:
+            result.append(path)
+    return result
 
 
 @dataclass(frozen=True)

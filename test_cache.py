@@ -86,6 +86,12 @@ class CacheTests(unittest.TestCase):
         app.worker = None
         app.preview_generation = 0
         app.preview_cached_only = False
+        app.preview_retry = False
+        app.scan_running = False
+        app.scan_generation = 0
+        app.pending_scan = None
+        app.pending_resets = set()
+        app.save_retries = 0
         app.widget_values = {}
         return app
 
@@ -276,7 +282,7 @@ class CacheTests(unittest.TestCase):
         app.keep_alpha = SimpleNamespace(get=lambda: False)
         app.edge_mode = SimpleNamespace(get=lambda: 'e')
         app._request_preview = Mock()
-        app.events.put(('error', ((0, self.source, 'birefnet-general', False, 'e'), 'old failure')))
+        app.events.put(('error', ((0, self.source, 'birefnet-general', False, 'e'), 'old failure', True, False)))
         with patch('tokenforge.messagebox.showerror') as error:
             app._poll()
             error.assert_not_called()
@@ -345,6 +351,41 @@ class CacheTests(unittest.TestCase):
         app.root.destroy.assert_not_called()
         app._poll()
         app.root.destroy.assert_called_once()
+
+    def test_folder_scan_runs_in_worker_and_rejects_stale_result(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.root, app.status, app.file_list = Mock(), Mock(), Mock()
+        app._clear_selection = Mock()
+        app.events = queue.Queue()
+        app.cancel_event = threading.Event()
+        app.running_batch = app.busy = False
+        app.pending_export = None
+        app.frame_path = self.directory / 'Ring.png'
+        worker = Mock()
+        with patch('tokenforge.threading.Thread', return_value=worker) as launch, \
+             patch('tokenforge.list_source_images', return_value=[self.source]) as scan:
+            app._set_folder(self.directory)
+            scan.assert_not_called()
+            launch.call_args.kwargs['target']()
+            scan.assert_called_once()
+        _, data = app.events.get()
+        app.scan_generation += 1
+        app._set_file_list = Mock()
+        app._apply_folder_scan(*data)
+        app._set_file_list.assert_not_called()
+
+    def test_preview_verification_retries_without_cutout(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.root = Mock()
+        app.preview_retry = True
+        app.busy = False
+        app._request_preview = Mock()
+        app._watch_source()
+        app._request_preview.assert_called_once_with(verify=True)
 
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)

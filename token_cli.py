@@ -40,10 +40,15 @@ def resolve_context_source(filename: str | Path) -> Path:
     owner = read_export_owner(path)
     if owner is None:
         return path
-    candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
     if owner[0] == 2:
-        matches = [p for p in candidates if recorded_source_matches(p, owner[2])]
+        candidate = path.with_name(owner[2])
+        if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
+                and candidate.resolve() != path and read_export_owner(candidate) is None
+                and candidate.resolve() != (BASE / 'RingT.png').resolve()):
+            return candidate.resolve()
+        matches = []
     else:
+        candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
         matches = [p for p in candidates if p.stem.casefold() == owner[2].casefold()]
     if len(matches) != 1:
         raise ValueError(f'Не удалось однозначно найти исходный арт для {path.name}.')

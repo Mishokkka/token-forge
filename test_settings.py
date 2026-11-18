@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from settings_store import read_settings_file, save_settings_delta
+from settings_store import read_settings_file, save_settings_delta, settings_lock
 
 
 def write_from_process(path, field, value, overrides, start):
@@ -13,7 +13,45 @@ def write_from_process(path, field, value, overrides, start):
     save_settings_delta(path, {}, {field: value, 'overrides': overrides})
 
 
+def check_lock(path, results):
+    try:
+        with settings_lock(path, timeout=0):
+            results.put('acquired')
+    except TimeoutError:
+        results.put('blocked')
+
+
 class SettingsTests(unittest.TestCase):
+    def test_explicit_reset_of_remote_override(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            empty = {'overrides': {}}
+            save_settings_delta(path, empty, {'overrides': {'a': {'x': 12}, 'b': {'y': 4}}})
+            self.assertTrue(save_settings_delta(path, empty, empty, resets={('overrides', 'a')}))
+            self.assertEqual(read_settings_file(path), {'overrides': {'b': {'y': 4}}})
+
+    def test_lock_excludes_other_process_until_release(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            ctx = multiprocessing.get_context('spawn')
+            results = ctx.Queue()
+            def run():
+                proc = ctx.Process(target=check_lock, args=(path, results))
+                proc.start()
+                try:
+                    self.assertEqual(proc.exitcode, None)
+                    result = results.get(timeout=10)
+                    proc.join(10)
+                    self.assertEqual(proc.exitcode, 0)
+                    return result
+                finally:
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join()
+            with settings_lock(path):
+                self.assertEqual(run(), 'blocked')
+            self.assertEqual(run(), 'acquired')
+
     def test_invalid_top_level_defaults(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'settings.json'
