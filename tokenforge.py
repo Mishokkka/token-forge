@@ -23,6 +23,7 @@ from token_engine import (
     Adjust, DiskCutoutCache, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
     source_identity, assert_source_identity, is_owned_export, LoadedCutout, excluded_file, read_owned_export_image,
+    file_stamp, EXPECTED_ABSENT,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
@@ -115,6 +116,7 @@ class TokenForge:
         self.active_scan = None
         self.pending_resets = set()
         self.save_retries = 0
+        self.save_retryable = False
         self.worker = None
         self.closing = False
         self.widget_values = {}
@@ -279,7 +281,7 @@ class TokenForge:
         ext_box = ttk.Combobox(options, values=['webp', 'png'], textvariable=self.ext,
                                 state='readonly', width=8)
         ext_box.grid(row=1, column=1, sticky='w', padx=(8, 0), pady=3)
-        ext_box.bind('<<ComboboxSelected>>', lambda e: self._schedule_save())
+        ext_box.bind('<<ComboboxSelected>>', lambda e: self._on_format_change())
         options.columnconfigure(1, weight=1)
 
         self.item_controls = tk.Frame(settings_col, bg=PANEL)
@@ -647,28 +649,32 @@ class TokenForge:
         if force_preview:
             self._request_preview()
         else:
-            has_token = self._show_saved_token(path)
-            self._request_preview(cached_only=has_token and not self.show_cutout.get())
+            self._request_preview(cached_only=not self.show_cutout.get())
 
-    def _show_saved_token(self, source: Path):
-        # Show the finished token immediately; full editable cutout is loaded
-        # from disk or extracted asynchronously afterwards.
-        if self.work_mode.get() == 'item':
+    @staticmethod
+    def _load_saved_preview(source: Path, mode, ext):
+        """Worker-only I/O. No Tk controls or canvas access."""
+        if mode == 'item':
             candidates = [item_output_path(source)]
         else:
-            candidates = [token_output_path(source, ext)
-                          for ext in dict.fromkeys([self.ext.get(), 'webp', 'png'])]
+            candidates = [token_output_path(source, fmt)
+                          for fmt in dict.fromkeys([ext, 'webp', 'png'])]
         for token in candidates:
             if token.is_file():
                 try:
-                    existing = read_owned_export_image(token, source, self.work_mode.get())
+                    existing = read_owned_export_image(token, source, mode)
                     if existing is not None:
-                        self._show_token(existing)
-                        return True
+                        return existing
                 except (OSError, ValueError, SyntaxError, TypeError, RecursionError, Image.DecompressionBombError):
                     pass
-        self._show_token(None)
-        return False
+        return None
+
+    def _on_format_change(self):
+        self._schedule_save()
+        if self.selected is not None and self.work_mode.get() == 'token' and self.current_cutout is None:
+            self.preview_generation += 1
+            self._show_token(None)
+            self._request_preview(cached_only=not self.show_cutout.get())
 
     def _current_adjust(self):
         return Adjust(self.zoom.get(), self.x.get(), self.y.get(), self.gap.get())
@@ -686,10 +692,12 @@ class TokenForge:
     def _on_show_cutout(self):
         if self.current_cutout is not None:
             self._render()
-        elif self.show_cutout.get():
-            self._request_preview()
+        elif self.selected is not None:
+            self.preview_generation += 1
+            self._show_token(None)
+            self._request_preview(cached_only=not self.show_cutout.get())
         else:
-            self._show_saved_token(self.selected) if self.selected else self._show_token(None)
+            self._show_token(None)
 
     def _reset_current(self):
         if self.selected is None:
@@ -732,7 +740,8 @@ class TokenForge:
     def _request_preview(self, *, cached_only=False, verify=False):
         if self.closing or not self.selected:
             return
-        if self.work_mode.get() == 'token' and self.frame is None and not self.show_cutout.get():
+        can_render = self.work_mode.get() == 'item' or self.frame is not None or self.show_cutout.get()
+        if not can_render and not cached_only:
             return
         if self.busy or self.approval_pending:
             if not verify:
@@ -744,11 +753,20 @@ class TokenForge:
         request = self._preview_request()
         _, path, model, keep_alpha, edge_mode = request
         previous = self.current_key if verify else None
+        saved_mode = self.work_mode.get()
+        saved_ext = self.ext.get() if cached_only else None
+        prefer_saved = cached_only and not self.show_cutout.get() and not verify
         self.busy = True
         if not verify:
             self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
 
         def work():
+            saved = self._load_saved_preview(path, saved_mode, saved_ext) if prefer_saved else None
+            if saved is not None:
+                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved)))
+            if not can_render:
+                self.events.put(('preview_no_frame', request))
+                return
             key = self._cache_key(path, model, keep_alpha, edge_mode)
             if verify and key == previous:
                 self.events.put(('preview_unchanged', request))
@@ -756,7 +774,7 @@ class TokenForge:
             if verify:
                 self.events.put(('preview_invalidated', request))
             img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
-                                        key=key, cached_only=cached_only)
+                                        key=key, cached_only=saved is not None)
             self.events.put(('preview', (request, img, key)))
 
         self._launch_worker(work, lambda exc: self.events.put(
@@ -788,6 +806,7 @@ class TokenForge:
             self._show_token(image)
             return True
         except Exception as exc:
+            self._show_token(None)
             self.status.set(f'Ошибка компоновки: {exc}')
             return False
 
@@ -848,43 +867,25 @@ class TokenForge:
         expected_input = None
         scan = (scan_folder, self.frame_path, deepcopy(self.settings),
                 self.default_item_layout.get() if mode == 'item' else None) if scan_folder else None
+        preflight = None
         if force_overwrite and len(files) == 1:
             source = files[0]
             destination = item_output_path(source) if mode == 'item' else token_output_path(source, ext)
             try:
-                if self.current_key is not None and str(source) == str(self.selected):
-                    expected_input = self.current_key[:4]
-                    assert_source_identity(source, expected_input)
-                else:
-                    # With no editable cutout (an existing saved token), pin
-                    # the source as it exists at the user's Save click.
-                    expected_input = source_identity(source)
-                if excluded_file(source, self.frame_path):
-                    raise ValueError('Выбранный файл используется как рамка.')
-                identity = source_identity(destination) if destination.exists() else None
-                owned = identity is not None and is_owned_export(destination, source, mode, identity=identity)
-                if identity is not None:
-                    assert_source_identity(destination, identity)
+                source_stamp = file_stamp(source)
+                if source_stamp is None:
+                    raise FileNotFoundError(f'Файл не найден: {source.name}')
+                destination_stamp = file_stamp(destination)
             except (OSError, ValueError) as exc:
                 messagebox.showerror('Ошибка файла', str(exc))
                 return
-            if identity is not None and not owned:
-                self.approval_pending = True
-                accepted = False
-                try:
-                    accepted = messagebox.askyesno(
-                        'Подтверждение замены',
-                        f'{destination.name} не помечен как результат TokenForge. '
-                        'Это может быть старый токен или отдельный арт. Заменить его?')
-                finally:
-                    self.approval_pending = False
-                    if not accepted:
-                        self._after_preview()
-                if not accepted or self.closing:
-                    return
-                approved_outputs[destination] = identity
+            if self.current_key is not None and str(source) == str(self.selected):
+                expected_input = self.current_key[:4]
+            preflight = (source, destination, source_stamp, destination_stamp, self.frame_path)
         request = (files, mode, model, keep, edge_mode, ext, size, skip,
                    convert, frame, interior, adjustments, approved_outputs, expected_input, scan)
+        if preflight is not None:
+            request += (preflight,)
         # Only the dispatcher consumes queued requests.
         self.pending_export = request
         if self.busy:
@@ -913,7 +914,38 @@ class TokenForge:
         except (Exception, SystemExit) as exc:
             on_error(exc)
 
+    def _run_preflight(self, request):
+        source, destination, source_stamp, destination_stamp, frame_path = request[-1]
+        expected_input = request[13]
+        mode = request[1]
+        self.busy = self.running_batch = True
+        self.cancel_event.clear()
+        self.status.set(f'Проверка файлов перед сохранением: {source.name}')
+
+        def check_stamps():
+            if file_stamp(source) != source_stamp or file_stamp(destination) != destination_stamp:
+                raise OSError('Исходник или результат изменился после нажатия «Сохранить». Повтори сохранение.')
+
+        def work():
+            check_stamps()
+            if excluded_file(source, frame_path):
+                raise ValueError('Выбранный файл используется как рамка.')
+            identity = source_identity(source)
+            if expected_input is not None and expected_input != identity:
+                raise OSError(f'Исходный файл изменился: {source.name}')
+            prior = source_identity(destination) if destination_stamp is not None else EXPECTED_ABSENT
+            owned = prior is not EXPECTED_ABSENT and is_owned_export(destination, source, mode, identity=prior)
+            check_stamps()
+            ready = request[:12] + ({destination: prior}, identity, request[14])
+            self.events.put(('export_preflight', (ready, destination, prior is not EXPECTED_ABSENT and not owned)))
+
+        self._launch_worker(work, lambda exc: self.events.put(
+            ('preflight_failure', self._worker_error_text(exc))))
+
     def _run_export(self, request):
+        if len(request) == 16:
+            self._run_preflight(request)
+            return
         (files, mode, model, keep, edge_mode, ext, size, skip,
          convert, frame, interior, adjustments, approved_outputs, expected_input, scan) = request
         self.busy = True
@@ -1010,14 +1042,16 @@ class TokenForge:
                 self.root.after(120, self._poll)
 
     def _handle_worker_event(self, action, data):
-        terminal = action in ('folder_scan', 'preview_unchanged', 'preview', 'error', 'done', 'batch_failure')
+        terminal = action in ('folder_scan', 'preview_unchanged', 'preview', 'error',
+                              'preview_no_frame', 'export_preflight', 'preflight_failure',
+                              'done', 'batch_failure')
         # Keep the reservation during completion handling, including modal
         # Tk loops; retries and queued exports cannot steal the worker slot.
         try:
             self._apply_worker_event(action, data)
         finally:
             if terminal:
-                if action in ('done', 'batch_failure'):
+                if action in ('export_preflight', 'preflight_failure', 'done', 'batch_failure'):
                     self.running_batch = False
                 self.busy = False
                 self._after_preview()
@@ -1036,6 +1070,35 @@ class TokenForge:
                     self.file_list.selection_set(index)
                 else:
                     self._clear_selection()
+        elif action == 'saved_preview':
+            request, mode, ext, image = data
+            if (request == self._preview_request() and mode == self.work_mode.get()
+                    and ext == self.ext.get() and not self.show_cutout.get()
+                    and not (self.preview_pending and not self.preview_cached_only)):
+                self._show_token(image)
+        elif action == 'preview_no_frame':
+            if data == self._preview_request():
+                self.status.set('Выбери корректное PNG-кольцо для редактирования.')
+        elif action == 'export_preflight':
+            ready, destination, needs_approval = data
+            if self.cancel_event.is_set() or self.closing:
+                return
+            accepted = True
+            if needs_approval:
+                self.approval_pending = True
+                try:
+                    accepted = messagebox.askyesno(
+                        'Подтверждение замены',
+                        f'{destination.name} не помечен как результат TokenForge. '
+                        'Это может быть старый токен или отдельный арт. Заменить его?')
+                finally:
+                    self.approval_pending = False
+            if accepted and not self.closing and not self.cancel_event.is_set():
+                self.pending_export = ready
+        elif action == 'preflight_failure':
+            if not self.cancel_event.is_set():
+                self.status.set('Сохранение остановлено.')
+                messagebox.showerror('Ошибка файла', data)
         elif action == 'preview_invalidated':
             if data == self._preview_request():
                 self.current_cutout = None
@@ -1083,7 +1146,7 @@ class TokenForge:
                 expected = ([item_output_path(self.selected)] if self.work_mode.get() == 'item' else
                             [token_output_path(self.selected, ext) for ext in ('webp', 'png')])
                 if any(path in expected for path in data.outputs):
-                    self._show_saved_token(self.selected)
+                    self._request_preview(cached_only=True)
             messages = data.errors + data.warnings
             if messages:
                 # Preserve every message (especially recovery paths)
@@ -1137,6 +1200,7 @@ class TokenForge:
     def _save(self, allow_retry=True):
         self.save_timer = None
         current = self._settings_snapshot()
+        self.save_retryable = False
         try:
             save_settings_delta(PREFS_FILE, self._settings_baseline, current, resets=self.pending_resets)
             self.pending_resets.clear()
@@ -1147,12 +1211,16 @@ class TokenForge:
         except (OSError, ValueError) as exc:
             # A reader holding settings.json can briefly deny replacement
             # on Windows. Retry the whole locked merge, not a stale write.
-            if (allow_retry and isinstance(exc, OSError) and
-                    getattr(exc, 'winerror', None) in (5, 32, 33) and self.save_retries < 5):
-                self.save_retries += 1
-                self.save_timer = self.root.after(200 * self.save_retries, self._save)
+            self.save_retryable = isinstance(exc, OSError) and getattr(exc, 'winerror', None) in (5, 32, 33)
+            if allow_retry:
+                self._resume_save_retry()
             self.status.set(f'Не удалось сохранить настройки: {exc}')
             return False
+
+    def _resume_save_retry(self):
+        if self.save_retryable and self.save_retries < 5 and not self.closing and not self.save_timer:
+            self.save_retries += 1
+            self.save_timer = self.root.after(200 * self.save_retries, self._save)
 
     def _on_close(self):
         if self.closing:
@@ -1162,6 +1230,7 @@ class TokenForge:
             self.save_timer = None
         if not self._save(allow_retry=False):
             if not messagebox.askyesno('Настройки не сохранены', 'Закрыть программу без сохранения изменений?'):
+                self._resume_save_retry()
                 return
         self.closing = True
         self.pending_scan = None

@@ -118,6 +118,7 @@ class CacheTests(unittest.TestCase):
         app.selected = None
         app.pending_resets = set()
         app.save_retries = 0
+        app.save_retryable = False
         app.widget_values = {}
         return app
 
@@ -196,6 +197,9 @@ class CacheTests(unittest.TestCase):
                        'token', skip_exists=False)
         with patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
             app._export_current()
+            action, data = app.events.get_nowait()
+            self.assertEqual(action, 'export_preflight')
+            app._handle_worker_event(action, data)
         events = []
         while not app.events.empty():
             events.append(app.events.get_nowait())
@@ -290,8 +294,8 @@ class CacheTests(unittest.TestCase):
         app.work_mode = SimpleNamespace(get=lambda: 'token')
         images = []
         app._show_token = images.append
-        self.assertFalse(app._show_saved_token(self.source))
-        self.assertEqual(images, [None])
+        self.assertIsNone(app._load_saved_preview(self.source, 'token', 'webp'))
+        self.assertEqual(images, [])
 
     def test_saved_preview_cannot_display_a_replaced_foreign_file(self):
         import token_engine
@@ -311,8 +315,69 @@ class CacheTests(unittest.TestCase):
                 Image.new('RGBA', (32, 32), 'blue').save(existing)
             return result
         with patch('token_engine.source_identity', side_effect=race):
-            self.assertFalse(app._show_saved_token(self.source))
-        self.assertEqual(displays, [None])
+            self.assertIsNone(app._load_saved_preview(self.source, 'token', 'webp'))
+        self.assertEqual(displays, [])
+
+    def test_saved_preview_io_runs_in_worker_and_stale_mode_is_ignored(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.selected = self.source
+        app.frame = object()
+        app.status, app._show_token = Mock(), Mock()
+        app.events = queue.Queue()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        saved = Image.new('RGBA', (256, 256), 'red')
+        app._get_cutout = Mock(return_value=(None, ('key',)))
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch.object(app, '_load_saved_preview', return_value=saved) as load:
+            app._request_preview(cached_only=True)
+            load.assert_not_called()
+            launch.call_args.kwargs['target']()
+            load.assert_called_once_with(self.source, 'token', 'webp')
+            self.assertTrue(app._get_cutout.call_args.kwargs['cached_only'])
+        event, data = app.events.get_nowait()
+        self.assertEqual(event, 'saved_preview')
+        app._apply_worker_event(event, data)
+        app._show_token.assert_called_once_with(saved)
+        app._show_token.reset_mock()
+        app.work_mode = SimpleNamespace(get=lambda: 'item')
+        app._apply_worker_event(event, data)
+        app._show_token.assert_not_called()
+
+    def test_render_failure_clears_canvas_but_retains_cutout(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.current_cutout = Image.new('RGBA', (50, 50), (255, 0, 0, 7))
+        app._show_token, app.status = Mock(), Mock()
+        app.show_cutout = SimpleNamespace(get=lambda: False)
+        app.work_mode = SimpleNamespace(get=lambda: 'item')
+        from item_engine import ItemAdjust
+        app._current_item_adjust = lambda: ItemAdjust(clean_noise=True)
+        self.assertFalse(app._render())
+        app._show_token.assert_called_once_with(None)
+        self.assertIsNotNone(app.current_cutout)
+        app._current_item_adjust = lambda: ItemAdjust(clean_noise=False)
+        self.assertTrue(app._render())
+
+    def test_close_decline_rearms_only_transient_save_failure(self):
+        from unittest.mock import Mock
+        import threading
+        for retryable, answer, expected in ((True, False, True), (False, False, False), (True, True, False)):
+            with self.subTest(retryable=retryable, answer=answer):
+                app = self.make_mock_app()
+                app.root, app.status = Mock(), Mock()
+                app.save_timer = 'pending'
+                app.cancel_event = threading.Event()
+                app.save_retryable = retryable
+                app._save = Mock(return_value=False)
+                with patch('tokenforge.messagebox.askyesno', return_value=answer):
+                    app._on_close()
+                app.root.after_cancel.assert_called_once_with('pending')
+                self.assertEqual(app.root.after.called, expected)
+                self.assertEqual(app.closing, answer)
 
     def test_raw_preview_handles_extremely_thin_art(self):
         img = Image.new('RGBA', (1200, 1), 'red')
@@ -403,6 +468,10 @@ class CacheTests(unittest.TestCase):
         with patch('tokenforge.messagebox.askyesno', side_effect=nested) as dialog, \
              patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
             app._export_current()
+            dialog.assert_not_called()
+            action, data = app.events.get_nowait()
+            self.assertEqual(action, 'export_preflight')
+            app._handle_worker_event(action, data)
             dialog.assert_called_once()
         events = []
         while not app.events.empty():
@@ -734,8 +803,8 @@ class CacheTests(unittest.TestCase):
         app.work_mode = SimpleNamespace(get=lambda: 'token')
         displays = []
         app._show_token = lambda img: displays.append(img)
-        self.assertTrue(app._show_saved_token(self.source))
-        self.assertEqual(displays[0].size, (256, 256))
+        self.assertEqual(app._load_saved_preview(self.source, 'token', 'webp').size, (256, 256))
+        self.assertEqual(displays, [])
 
 
 if __name__ == '__main__':

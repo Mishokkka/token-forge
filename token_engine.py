@@ -27,10 +27,21 @@ class Adjust:
     gap: float = 11.0         # head-to-top gap, token-height percent
 
 
+def stat_signature(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def file_stamp(path: Path):
+    """Cheap metadata observation at a UI click; never read file contents."""
+    try:
+        return stat_signature(path.stat())
+    except FileNotFoundError:
+        return None
+
+
 def source_identity(source: Path) -> tuple:
     resolved = Path(source).resolve()
-    def signature(info):
-        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    signature = stat_signature
     path_before = resolved.stat()
     with resolved.open('rb') as stream:
         before = os.fstat(stream.fileno())
@@ -727,7 +738,9 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
-    if approved_identity is not None and prior != approved_identity:
+    if approved_identity is EXPECTED_ABSENT and prior is not None:
+        raise FileExistsError(f'Файл {destination.name} появился после начала сохранения. Повтори сохранение.')
+    if approved_identity is not None and approved_identity is not EXPECTED_ABSENT and prior != approved_identity:
         raise FileExistsError(f'Файл {destination.name} изменился после подтверждения замены. Подтверди заново.')
     if prior is not None:
         owned = is_owned_export(destination, source, kind, identity=prior)
@@ -789,6 +802,9 @@ def token_output_path(source: Path, format_name: str = 'webp') -> Path:
     return source.with_name(f'{source.stem}t.{format_name.lower()}')
 
 
+EXPECTED_ABSENT = object()
+
+
 class StaleApprovalError(OSError):
     """An explicit overwrite approval no longer matches its destination."""
 
@@ -796,7 +812,11 @@ class StaleApprovalError(OSError):
 def assert_approval(destination, approved):
     if approved is not None:
         try:
-            assert_source_identity(destination, approved)
+            if approved is EXPECTED_ABSENT:
+                if file_stamp(destination) is not None:
+                    raise FileExistsError(destination)
+            else:
+                assert_source_identity(destination, approved)
         except OSError as exc:
             raise StaleApprovalError(f'Файл {destination.name} изменился после подтверждения замены. Подтверди заново.') from exc
 
