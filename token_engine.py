@@ -190,8 +190,27 @@ def frame_interior(frame: Image.Image) -> Image.Image:
     if bbox[0] == 0 or bbox[1] == 0 or bbox[2] == frame.width or bbox[3] == frame.height:
         raise ValueError('Рамка разомкнута. Используй PNG с непрерывным кольцом.')
 
+    outer_shape = _enclosed_shape(barrier)
+    # The validation barrier is dilated by one pixel to seal minor gaps.
+    # Clip to the actual ring support, not that padded exterior.
+    support = alpha.point(lambda p: 128 if p else 0)
+    silhouette = _enclosed_shape(support)
+    if silhouette.getpixel(center) == 0:
+        # A small opening was closed by the validation barrier. Keep the
+        # enclosed interior and actual ring pixels, never the padded fringe.
+        silhouette = ImageChops.lighter(inside, alpha.point(lambda p: 255 if p else 0))
+    thickness = _ring_thickness(alpha)
+    under_ring = max(1, int(round(thickness * 0.5)))
+    clip_mask = square_dilate(inside, under_ring)
+    clip_mask = ImageChops.multiply(clip_mask, outer_shape)
+    feathered = clip_mask.filter(ImageFilter.GaussianBlur(.6))
+    return ImageChops.multiply(feathered, silhouette)
+
+
+def _enclosed_shape(barrier: Image.Image) -> Image.Image:
     outside = barrier.copy()
     # Fill every exterior component touching an edge, even when a corner is opaque.
+    frame = barrier
     for x in range(frame.width):
         for y in (0, frame.height - 1):
             if outside.getpixel((x, y)) == 0:
@@ -200,13 +219,7 @@ def frame_interior(frame: Image.Image) -> Image.Image:
         for x in (0, frame.width - 1):
             if outside.getpixel((x, y)) == 0:
                 ImageDraw.floodfill(outside, (x, y), 255, thresh=0)
-    outer_shape = outside.point(lambda p: 0 if p == 255 else 255)
-
-    thickness = _ring_thickness(alpha)
-    under_ring = max(1, int(round(thickness * 0.5)))
-    clip_mask = square_dilate(inside, under_ring)
-    clip_mask = ImageChops.multiply(clip_mask, outer_shape)
-    return clip_mask.filter(ImageFilter.GaussianBlur(.6))
+    return outside.point(lambda p: 0 if p == 255 else 255)
 
 
 def silhouette_geometry(cutout: Image.Image):
@@ -269,6 +282,9 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
         scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
         image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
     inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    support = interior.point(lambda a: 255 if a else 0).resize(
+        (out_size, out_size), Image.Resampling.NEAREST)
+    inner = ImageChops.multiply(inner, support)
     image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), inner))
     token = Image.alpha_composite(image_layer, frame.resize((out_size, out_size), Image.Resampling.LANCZOS))
     return token
@@ -285,51 +301,77 @@ def _publish_new(temporary: Path, path: Path) -> bool:
     return True
 
 
-def _replace_preserving_displaced(temporary: Path, destination: Path, expected: tuple) -> None:
-    """Never silently discard an externally replaced file.
+@dataclass(frozen=True)
+class Publication:
+    created: bool
+    warnings: tuple[str, ...] = ()
 
-    ReplaceFileW publishes atomically and saves the actual displaced file.
-    On POSIX use a recovery move followed by no-clobber publication.
-    """
+    def __bool__(self):
+        return self.created
+
+
+def _windows_replace(temporary, destination, backup):
+    import ctypes
+    from ctypes import wintypes
+    replace = ctypes.WinDLL('kernel32', use_last_error=True).ReplaceFileW
+    replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                        wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
+    replace.restype = wintypes.BOOL
+    if not replace(str(destination), str(temporary), str(backup), 0, None, None):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _restore_backup(backup, destination):
+    if not backup.exists():
+        return 'Резервный файл не найден.'
+    try:
+        if _publish_new(backup, destination):
+            backup.unlink(missing_ok=True)
+            return 'Предыдущий результат восстановлен.'
+    except OSError as exc:
+        return f'Не удалось восстановить предыдущий результат: {exc}. Резервная копия: {backup}'
+    return f'Имя уже занято; резервная копия сохранена: {backup}'
+
+
+def _replace_preserving_displaced(temporary: Path, destination: Path, expected: tuple) -> tuple[str, ...]:
+    """Publish without silently discarding an unexpected displaced file."""
     import uuid
     recovery = destination.parent / '.tokenforge-recovery'
     recovery.mkdir(exist_ok=True)
-    backup = recovery / f'{uuid.uuid4().hex}-{destination.name}'
+    backup = recovery / (uuid.uuid4().hex + destination.suffix)
     if os.name == 'nt':
-        import ctypes
-        from ctypes import wintypes
-        replace = ctypes.WinDLL('kernel32', use_last_error=True).ReplaceFileW
-        replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
-                            wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
-        replace.restype = wintypes.BOOL
-        if not replace(str(destination), str(temporary), str(backup), 0, None, None):
-            raise OSError(f'Не удалось заменить {destination.name}; '
-                          f'проверь также папку восстановления {recovery}: '
-                          f'{ctypes.WinError(ctypes.get_last_error())}')
+        try:
+            _windows_replace(temporary, destination, backup)
+        except OSError as exc:
+            detail = (_restore_backup(backup, destination) if getattr(exc, 'winerror', None) == 1177
+                      else f'Резервная копия, если создана: {backup}')
+            raise OSError(f'Не удалось заменить {destination.name}: {exc}. {detail}') from exc
     else:
         os.rename(destination, backup)
         try:
             if not _publish_new(temporary, destination):
                 raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
-        except BaseException:
-            # Restore only into a vacant name; never clobber another writer.
-            if _publish_new(backup, destination):
-                backup.unlink(missing_ok=True)
-            raise
-    # Compare the bytes of the actually displaced file, not the path checked
-    # before publication. Retain any unexpected version for recovery.
-    if source_identity(backup)[-1] != expected[-1]:
-        raise FileExistsError(f'Результат записан, но другой редактор изменил файл. '
-                              f'Вытесненная версия сохранена: {backup}')
-    backup.unlink()
-    # The recovery directory is intentionally kept; another writer may use it.
+        except BaseException as exc:
+            detail = _restore_backup(backup, destination)
+            raise OSError(f'Не удалось записать {destination.name}: {exc}. {detail}') from exc
+    # Publication has succeeded. Any subsequent issue is a warning, never
+    # an assertion that no output was produced.
+    try:
+        if source_identity(backup)[-1] != expected[-1]:
+            return (f'Другой редактор изменил файл. Вытесненная версия сохранена: {backup}',)
+        backup.unlink()
+    except OSError as exc:
+        return (f'Не удалось проверить или удалить резервную копию {backup}: {exc}',)
+    return ()
 
 
 def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=None,
-                 expected_destination=None) -> bool:
-    """Publish only a complete, closed file, optionally without replacement."""
+                 expected_destination=None, after_publish=None) -> Publication:
+    """Publish only a complete, closed file and distinguish success with warnings."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
+    warnings = []
+    created = False
     try:
         with tempfile.NamedTemporaryFile(mode='wb', dir=path.parent,
                                          prefix='.tokenforge-', suffix='.tmp', delete=False) as fp:
@@ -338,23 +380,36 @@ def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=Non
         if before_publish is not None:
             before_publish()
         if expected_destination is not None:
-            _replace_preserving_displaced(temporary, path, expected_destination)
+            warnings.extend(_replace_preserving_displaced(temporary, path, expected_destination))
+            created = True
         elif replace:
             os.replace(temporary, path)
+            created = True
         else:
-            return _publish_new(temporary, path)
-        return True
+            created = _publish_new(temporary, path)
+        if created and after_publish is not None:
+            try:
+                after_publish()
+            except OSError as exc:
+                warnings.append(f'Результат записан, но исходник изменился или недоступен: {exc}. '
+                                'Повтори обработку с отключённым пропуском готовых изображений.')
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as exc:
+                if not created:
+                    raise
+                warnings.append(f'Не удалось очистить временный файл {temporary}: {exc}')
+    return Publication(created, tuple(warnings))
 
 
 def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
                *, replace: bool = True) -> bool:
     if format_name.lower() == 'png':
-        return atomic_write(path, lambda fp: image.save(fp, 'PNG', optimize=True), replace=replace)
-    return atomic_write(path, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
-                        replace=replace)
+        return bool(atomic_write(path, lambda fp: image.save(fp, 'PNG', optimize=True), replace=replace))
+    return bool(atomic_write(path, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
+                             replace=replace))
 
 
 def export_owner(source: Path, kind: str) -> str:
@@ -377,7 +432,7 @@ def read_export_owner(destination: Path) -> tuple | None:
                 and '/' not in values[1] and '\\' not in values[1]
                 and values[1] not in ('.', '..')):
             return version, values[0], values[1]
-    except (OSError, ValueError, SyntaxError, TypeError):
+    except (OSError, ValueError, SyntaxError, TypeError, Image.DecompressionBombError):
         pass
     return None
 
@@ -415,14 +470,14 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> No
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
-                   input_identity: tuple | None = None) -> bool:
+                   input_identity: tuple | None = None) -> Publication:
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
     if prior is not None:
         owned = is_owned_export(destination, source, kind)
         if skip_exists and owned:
-            return False
+            return Publication(False)
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
@@ -432,13 +487,16 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     options = {'optimize': True} if fmt == 'PNG' else {'lossless': True, 'method': 6}
     def encode(fp):
         image.save(fp, fmt, exif=exif, **options)
-    def guard():
+    def check_input():
         if input_identity is not None:
             assert_source_identity(source, input_identity)
+    def guard():
         if prior is not None:
             assert_source_identity(destination, prior)
+        check_input()
     published = atomic_write(destination, encode, replace=False,
-                             before_publish=guard, expected_destination=prior)
+                             before_publish=guard, expected_destination=prior,
+                             after_publish=check_input)
     if not published and (not skip_exists or not is_owned_export(destination, source, kind)):
         raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
     return published
@@ -460,19 +518,19 @@ def token_output_path(source: Path, format_name: str = 'webp') -> Path:
     return source.with_name(f'{source.stem}t.{format_name.lower()}')
 
 
-def save_original_webp(source: Path) -> bool:
+def save_original_webp(source: Path) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
     WebP (which might be a hand-edited asset).
     """
     if source.suffix.lower() == '.webp':
-        return False
+        return Publication(False)
     destination = original_webp_path(source)
     if destination.exists():
         if not is_owned_export(destination, source, 'copy'):
             raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
-        return False
+        return Publication(False)
     identity = source_identity(source)
     with Image.open(source) as raw:
         artwork = ImageOps.exif_transpose(raw)
@@ -486,7 +544,8 @@ def save_original_webp(source: Path) -> bool:
         created = atomic_write(destination,
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
                                                        method=6, alpha_quality=100, exif=exif),
-                               replace=False, before_publish=lambda: assert_source_identity(source, identity))
+                               replace=False, before_publish=lambda: assert_source_identity(source, identity),
+                               after_publish=lambda: assert_source_identity(source, identity))
         if not created and not is_owned_export(destination, source, 'copy'):
             raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
         return created
@@ -516,6 +575,7 @@ class BatchResult:
     total: int = 0
     error_details: list[str] = field(default_factory=list)
     outputs: list[Path] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
     def record_error(self, source: Path, stage: str, exc: Exception) -> None:
         message = f'{source.name}: {stage}: {exc}'
@@ -541,7 +601,9 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
         if convert_original:
             try:
-                result.converted += int(save_original_webp(source))
+                publication = save_original_webp(source)
+                result.converted += int(bool(publication))
+                result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
             except Exception as exc:
                 result.record_error(source, 'преобразование оригинала', exc)
         destination = output_path(source)
@@ -563,11 +625,13 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     cutout = loaded
                 assert_source_identity(source, identity)
                 image = renderer(cutout, source)
-                if save_generated(image, destination, source, kind, skip_exists=skip_exists,
-                                  approved_identity=(approved_outputs or {}).get(destination),
-                                  input_identity=identity):
+                publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
+                                             approved_identity=(approved_outputs or {}).get(destination),
+                                             input_identity=identity)
+                if publication:
                     result.created += 1
                     result.outputs.append(destination)
+                    result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
                 else:
                     result.skipped += 1
         except Exception as exc:

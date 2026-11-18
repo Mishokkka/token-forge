@@ -176,7 +176,10 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
         cutoff = 128 if peak >= 128 else max(1, (peak + 1) // 2)
         contour = alpha.point(lambda a: 255 if a >= cutoff else 0)
         dilated = contour.filter(ImageFilter.MaxFilter(2 * stroke_px + 1))
-        border_alpha = ImageChops.subtract(dilated, alpha)
+        # An outline must not contribute opacity or black to any visible
+        # subject pixel, including translucent interiors and feathered edges.
+        occupied = alpha.point(lambda a: 255 if a else 0)
+        border_alpha = ImageChops.subtract(dilated, occupied)
         border = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
         border.putalpha(border_alpha)
         border.alpha_composite(canvas)

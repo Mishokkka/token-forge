@@ -80,9 +80,10 @@ class EngineTests(unittest.TestCase):
             prior = source_identity(dest)
             def race():
                 dest.write_bytes(b'external editor')
-            with self.assertRaisesRegex(FileExistsError, 'сохранена'):
-                atomic_write(dest, lambda fp: fp.write(b'new'),
-                             before_publish=race, expected_destination=prior)
+            result = atomic_write(dest, lambda fp: fp.write(b'new'),
+                                  before_publish=race, expected_destination=prior)
+            self.assertTrue(result)
+            self.assertTrue(any('сохранена' in warning for warning in result.warnings))
             self.assertEqual(dest.read_bytes(), b'new')
             recovered = list((dest.parent / '.tokenforge-recovery').iterdir())
             self.assertEqual(len(recovered), 1)
@@ -112,6 +113,102 @@ class EngineTests(unittest.TestCase):
                 self.assertTrue(result.errors)
                 self.assertIn('изменился', result.errors[0])
                 self.assertFalse(dest.exists())
+
+    def test_late_source_change_is_reported_as_published_warning(self):
+        from token_engine import save_generated, source_identity
+        from unittest.mock import patch
+        import token_engine
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'A.png'
+            self.figure.save(source)
+            output = token_output_path(source)
+            save_generated(self.figure, output, source, 'token', skip_exists=False)
+            identity = source_identity(source)
+            replace = token_engine._replace_preserving_displaced
+            def race(*args):
+                Image.new('RGBA', (30, 30), 'red').save(source)
+                return replace(*args)
+            with patch('token_engine._replace_preserving_displaced', side_effect=race):
+                result = save_generated(self.figure, output, source, 'token', skip_exists=False,
+                                        input_identity=identity)
+            self.assertTrue(result)
+            self.assertTrue(any('исходник изменился' in w for w in result.warnings))
+            self.assertTrue(output.is_file())
+
+    def test_source_edit_during_destination_validation_rejected(self):
+        from token_engine import save_generated, source_identity, assert_source_identity
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'A.png'
+            self.figure.save(source)
+            output = token_output_path(source)
+            save_generated(self.figure, output, source, 'token', skip_exists=False)
+            identity = source_identity(source)
+            original = output.read_bytes()
+            def race(path, expected):
+                assert_source_identity(path, expected)
+                if path == output:
+                    Image.new('RGBA', (30, 30), 'red').save(source)
+            with patch('token_engine.assert_source_identity', side_effect=race):
+                with self.assertRaisesRegex(OSError, 'изменился'):
+                    save_generated(self.figure, output, source, 'token', skip_exists=False,
+                                   input_identity=identity)
+            self.assertEqual(output.read_bytes(), original)
+
+    def test_oversized_source_is_discovered_without_disabling_limit(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            path = folder / 'A.png'
+            Image.new('RGB', (60, 60)).save(path)
+            with patch.object(Image, 'MAX_IMAGE_PIXELS', 100):
+                self.assertEqual(list_source_images(folder), [path])
+                result = export_batch([path], read_image, self.frame, self.mask,
+                                      {path: Adjust()}, convert_original=False)
+                self.assertTrue(result.errors)
+                self.assertEqual(result.created, 0)
+
+    def test_frame_mask_feather_does_not_escape_thin_ring(self):
+        from token_engine import _enclosed_shape
+        from PIL import ImageChops
+        frame = Image.new('RGBA', (120, 120))
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((10, 10, 109, 109), outline='black', width=1)
+        for rect in ((10, 48, 25, 71), (94, 48, 109, 71),
+                     (48, 10, 71, 25), (48, 94, 71, 109)):
+            draw.rectangle(rect, fill='black')
+        mask = frame_interior(frame)
+        shape = _enclosed_shape(frame.getchannel('A').point(lambda a: 128 if a else 0))
+        self.assertIsNone(ImageChops.subtract(mask, shape).getbbox())
+        for size in (63, 256):
+            # Use a fully opaque artwork to exercise the composition.
+            result = compose(Image.new('RGBA', (120, 120), 'red'), frame, mask, size,
+                             Adjust(zoom=320, gap=-20))
+            support = mask.point(lambda a: 255 if a else 0).resize((size, size), Image.Resampling.NEAREST)
+            frame_alpha = frame.resize((size, size), Image.Resampling.LANCZOS).getchannel('A')
+            exterior = ImageChops.multiply(result.getchannel('A'), support.point(lambda a: 255-a))
+            allowed = ImageChops.multiply(frame_alpha, support.point(lambda a: 255-a))
+            self.assertEqual(exterior.tobytes(), allowed.tobytes())
+
+    @unittest.skipUnless(__import__('os').name == 'nt', 'Windows replacement API')
+    def test_partial_windows_replace_restores_previous_output(self):
+        from token_engine import atomic_write, source_identity
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / 'output.webp'
+            dest.write_bytes(b'old')
+            identity = source_identity(dest)
+            def fail(temporary, destination, backup):
+                destination.rename(backup)
+                exc = OSError('partial replacement')
+                exc.winerror = 1177
+                raise exc
+            with patch('token_engine._windows_replace', side_effect=fail):
+                with self.assertRaisesRegex(OSError, 'восстановлен'):
+                    atomic_write(dest, lambda fp: fp.write(b'new'), expected_destination=identity)
+            self.assertEqual(dest.read_bytes(), b'old')
+            self.assertFalse(list(dest.parent.glob('.tokenforge-*.tmp')))
 
     def test_render_shape_and_alpha(self):
         token = compose(self.figure, self.frame, self.mask, 256)

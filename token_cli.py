@@ -116,6 +116,8 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
         skip_exists=bool(settings.get('skip_exists', True)),
         convert_original=bool(settings.get('convert_original', True)),
     )
+    for warning in result.warnings:
+        write_log(warning)
     if result.errors:
         for detail in result.error_details:
             write_log(detail)
@@ -123,9 +125,9 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
             raise RuntimeError('\n'.join(result.errors))
     destination = token_output_path(source, ext)
     if result.created:
-        return ('created_with_warning' if result.errors else 'created'), destination
+        return ('created_with_warning' if result.errors or result.warnings else 'created'), destination
     if result.skipped and destination.is_file():
-        return ('skipped_with_warning' if result.errors else 'skipped'), destination
+        return ('skipped_with_warning' if result.errors or result.warnings else 'skipped'), destination
     raise RuntimeError('Токен не был создан: неизвестный результат операции.')
 
 
@@ -147,6 +149,8 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=bool(settings.get('skip_exists', True)),
                           convert_original=bool(settings.get('convert_original', True)))
+    for warning in result.warnings:
+        write_log(warning)
     if result.errors:
         for detail in result.error_details:
             write_log(detail)
@@ -154,9 +158,9 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
             raise RuntimeError('\n'.join(result.errors))
     destination = item_output_path(source)
     if result.created:
-        return ('created_with_warning' if result.errors else 'created'), destination
+        return ('created_with_warning' if result.errors or result.warnings else 'created'), destination
     if result.skipped and destination.is_file():
-        return ('skipped_with_warning' if result.errors else 'skipped'), destination
+        return ('skipped_with_warning' if result.errors or result.warnings else 'skipped'), destination
     raise RuntimeError('Предмет не был создан.')
 
 
@@ -211,9 +215,10 @@ def run_auto(filename: str | Path, *, item: bool = False) -> int:
     try:
         status, destination = (automatic_item(filename) if item else automatic_token(filename))
         if status.endswith('_with_warning'):
-            write_log(f'Результат доступен, но преобразование оригинала не удалось: {destination}')
+            write_log(f'Результат доступен с предупреждениями: {destination}')
             notify_user('TokenForge: предупреждение',
-                        f'Результат: {destination.name}. Не удалось преобразовать оригинал. Подробности: {LOG_FILE}')
+                        f'Результат: {destination.name}. Обработка завершена с предупреждениями. Подробности: {LOG_FILE}',
+                        error=True)
         elif status == 'created':
             write_log(f'Создан: {destination}')
             notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')

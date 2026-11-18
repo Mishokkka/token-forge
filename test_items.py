@@ -112,6 +112,9 @@ class ItemTests(unittest.TestCase):
             image = compose_item(item, ItemAdjust(layout=mode), stroke_px=0)
             self.assertLess(abs(_major_axis_angle(image) - angle), 7)
         outlined = compose_item(item, ItemAdjust())
+        raw = compose_item(item, ItemAdjust(), stroke_px=0)
+        # Use an unscaled interior sample well away from the outline.
+        self.assertEqual(outlined.getpixel((250, 250)), raw.getpixel((250, 250)))
         self.assertGreater(outlined.getchannel('A').getextrema()[1], 128)
 
     def test_invalid_layout_and_blank_alpha(self):
@@ -160,6 +163,10 @@ class NoClipTests(unittest.TestCase):
                         for axis in (0, 1):
                             self.assertLessEqual(abs((ref_box[axis+2] - ref_box[axis]) -
                                                      (moved_box[axis+2] - moved_box[axis])), 1)
+                        for axis, direction in enumerate((x, y)):
+                            delta = (moved_box[axis]+moved_box[axis+2]
+                                     -ref_box[axis]-ref_box[axis+2]) / 2
+                            self.assertGreater(delta * (1 if direction > 0 else -1), 100)
                         ref_area = sum(a > 0 for a in ref_alpha.tobytes())
                         moved_area = sum(a > 0 for a in moved_alpha.tobytes())
                         self.assertAlmostEqual(moved_area, ref_area, delta=max(10, ref_area * .08))
