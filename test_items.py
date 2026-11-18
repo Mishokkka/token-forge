@@ -33,6 +33,22 @@ class ItemTests(unittest.TestCase):
         bbox = rendered.getchannel('A').getbbox()
         self.assertGreaterEqual(min(bbox[0], bbox[1], 49-bbox[2], 49-bbox[3]), 3)
 
+    def test_sparse_alpha_cannot_export_invisible_item(self):
+        from unittest.mock import Mock
+        sparse = Image.new('RGBA', (2000, 2000))
+        sparse.putpixel((0, 0), (255, 0, 0, 1))
+        sparse.putpixel((1999, 1999), (255, 0, 0, 1))
+        adjust = ItemAdjust(clean_noise=False)
+        with self.assertRaisesRegex(ValueError, 'полностью прозрачен'):
+            compose_item(sparse, adjust)
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'Sparse.png'
+            sparse.save(path)
+            result = export_items([path], Mock(return_value=sparse), {path: adjust}, convert_original=False)
+            self.assertEqual((result.created, result.skipped), (0, 0))
+            self.assertTrue(result.errors)
+            self.assertFalse(item_output_path(path).exists())
+
     def test_diagonal_axis(self):
         ascending = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[1]))
         descending = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[2]))

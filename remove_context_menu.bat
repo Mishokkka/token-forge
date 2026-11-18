@@ -52,7 +52,8 @@ pause
 exit /b 0
 :missing
 echo ERROR: Python missing. Press Win+R, enter shell:sendto and press Enter.
-echo Delete only the four shortcuts whose names begin with TokenForge -.
+echo Check each shortcut's Comment in Properties. Delete only TokenForge shortcuts
+echo with the exact Comment TokenForge.SendTo.v1.
 echo Older registry entries need separate cleanup; reinstall Python to run this script.
 :failed
 echo ERROR: Could not remove context menu entries.

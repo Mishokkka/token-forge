@@ -165,6 +165,8 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     new_width = max(1, min(available, int(math.floor(image.width * fit))))
     new_height = max(1, min(available, int(math.floor(image.height * fit))))
     placed = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    if placed.getchannel('A').getbbox() is None:
+        raise ValueError('После масштабирования предмет полностью прозрачен.')
 
     px = max(inset, min(int(round(cx - new_width / 2)), size - inset - new_width))
     py = max(inset, min(int(round(cy - new_height / 2)), size - inset - new_height))

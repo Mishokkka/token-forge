@@ -103,7 +103,7 @@ def merge_delta(latest: dict, baseline: dict, current: dict) -> dict:
             continue
         if new is _MISSING:
             result.pop(key, None)
-        elif isinstance(new, dict) and (isinstance(old, dict) or old is _MISSING):
+        elif isinstance(new, dict):
             remote = result.get(key)
             result[key] = merge_delta(remote if isinstance(remote, dict) else {},
                                       old if isinstance(old, dict) else {}, new)

@@ -407,6 +407,50 @@ class EngineTests(unittest.TestCase):
                 save_generated(self.figure, dest, source, 'token', skip_exists=False)
             self.assertFalse(dest.exists())
 
+    def test_late_owned_export_collision_is_not_successful_skip(self):
+        import token_engine
+        from token_engine import save_generated, FolderIndex
+        for late_in_publication in (False, True):
+            with self.subTest(late_in_publication=late_in_publication), tempfile.TemporaryDirectory() as d:
+                source = Path(d) / 'Hero.png'
+                self.figure.save(source)
+                dest = token_output_path(source)
+                index = FolderIndex()
+                list(index.candidates(source.parent, {source.stem}))
+                def other_export():
+                    exif = Image.Exif()
+                    exif[270] = token_engine.export_owner(source, 'token')
+                    self.figure.save(dest, exif=exif)
+                    self.figure.convert('RGB').save(source.with_suffix('.jpg'))
+                if late_in_publication:
+                    def late(temporary, destination):
+                        other_export()
+                        return False
+                    with patch.object(token_engine, '_publish_new', side_effect=late):
+                        with self.assertRaises(FileExistsError):
+                            save_generated(self.figure, dest, source, 'token', skip_exists=True, collision_index=index)
+                else:
+                    other_export()
+                    with self.assertRaises(FileExistsError):
+                        save_generated(self.figure, dest, source, 'token', skip_exists=True, collision_index=index)
+                self.assertTrue(dest.is_file())
+                source.with_suffix('.jpg').unlink()
+                self.assertFalse(save_generated(self.figure, dest, source, 'token',
+                                                skip_exists=True, collision_index=index))
+
+    def test_posix_exchange_unsupported_preserves_destination(self):
+        from token_engine import _replace_posix
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old, new, backup = root / 'old', root / 'new', root / 'backup'
+            old.write_bytes(b'original')
+            new.write_bytes(b'encoded')
+            with patch('token_engine._posix_exchange', side_effect=OSError('swap unsupported')):
+                with self.assertRaisesRegex(OSError, 'swap unsupported'):
+                    _replace_posix(new, old, backup)
+            self.assertEqual(old.read_bytes(), b'original')
+            self.assertFalse(backup.exists())
+
     def test_late_corrupt_export_is_not_a_successful_skip(self):
         from token_engine import save_generated, export_owner, InvalidExportError
         import token_engine

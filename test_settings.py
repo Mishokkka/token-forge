@@ -22,6 +22,16 @@ def check_lock(path, results):
 
 
 class SettingsTests(unittest.TestCase):
+    def test_repair_malformed_override_preserves_concurrent_fields(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            for malformed in (None, 3, 'bad', []):
+                with self.subTest(malformed=malformed):
+                    baseline = {'overrides': {'p': malformed}}
+                    path.write_text(json.dumps({'overrides': {'p': {'zoom': 80}}}), encoding='utf-8')
+                    self.assertTrue(save_settings_delta(path, baseline, {'overrides': {'p': {'x': 1}}}))
+                    self.assertEqual(read_settings_file(path), {'overrides': {'p': {'zoom': 80, 'x': 1}}})
+
     def test_explicit_reset_of_remote_override(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'settings.json'

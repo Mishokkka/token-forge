@@ -377,6 +377,47 @@ def _restore_backup(backup, destination):
     return f'Имя уже занято; резервная копия сохранена: {backup}'
 
 
+def _posix_exchange(first: Path, second: Path) -> None:
+    """Swap two names atomically or fail without changing either name.
+
+    Linux renameat2(RENAME_EXCHANGE) and macOS renamex_np(RENAME_SWAP)
+    provide this contract. A filesystem without swap support is refused.
+    No move-away/restore sequence or hard-link assumption is needed.
+    """
+    import ctypes
+    import errno
+    import sys
+    libc = ctypes.CDLL(None, use_errno=True)
+    a, b = os.fsencode(first), os.fsencode(second)
+    if sys.platform.startswith('linux') and hasattr(libc, 'renameat2'):
+        swap = libc.renameat2
+        swap.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        swap.restype = ctypes.c_int
+        result = swap(-100, a, -100, b, 2)
+    elif sys.platform == 'darwin' and hasattr(libc, 'renamex_np'):
+        swap = libc.renamex_np
+        swap.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        swap.restype = ctypes.c_int
+        result = swap(a, b, 2)
+    else:
+        raise OSError(errno.ENOTSUP, 'Файловая система не поддерживает безопасную замену.')
+    if result:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(second))
+
+
+def _replace_posix(temporary, destination, backup):
+    # Move only our freshly encoded file to private recovery storage before
+    # exchanging it. After a successful exchange, backup is the exact
+    # displaced directory entry. Never delete it on an exchange success.
+    os.rename(temporary, backup)
+    try:
+        _posix_exchange(backup, destination)
+    except BaseException:
+        backup.unlink(missing_ok=True)
+        raise
+
+
 def _replace_preserving_displaced(temporary: Path, destination: Path, expected: tuple) -> tuple[str, ...]:
     """Publish without silently discarding an unexpected displaced file."""
     import uuid
@@ -393,13 +434,7 @@ def _replace_preserving_displaced(temporary: Path, destination: Path, expected: 
                       else f'Резервная копия, если создана: {backup}')
             raise OSError(f'Не удалось заменить {destination.name}: {exc}. {detail}') from exc
     else:
-        os.rename(destination, backup)
-        try:
-            if not _publish_new(temporary, destination):
-                raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
-        except BaseException as exc:
-            detail = _restore_backup(backup, destination)
-            raise OSError(f'Не удалось записать {destination.name}: {exc}. {detail}') from exc
+        _replace_posix(temporary, destination, backup)
     # Publication has succeeded. Any subsequent issue is a warning, never
     # an assertion that no output was produced.
     try:
@@ -697,6 +732,8 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     if prior is not None:
         owned = is_owned_export(destination, source, kind, identity=prior)
         if skip_exists and owned:
+            if collision_index is not None:
+                ensure_no_source_collision(destination, source, kind, collision_index, live=True)
             validate_skip(destination, source, kind, identity=prior)
             if input_identity is not None:
                 assert_source_identity(source, input_identity)
@@ -727,6 +764,8 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     if not published:
         if not skip_exists:
             raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
+        if collision_index is not None:
+            ensure_no_source_collision(destination, source, kind, collision_index, live=True)
         validate_skip(destination, source, kind)
         check_input()
     return published
