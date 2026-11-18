@@ -25,7 +25,8 @@ from token_engine import (
     source_identity, assert_source_identity, is_owned_export, LoadedCutout, excluded_file, read_owned_export_image,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
-from settings_store import read_settings_file, save_settings_delta
+from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
+                            override_for, output_format, valid_layout)
 from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session
 from cutout_service import load_cutout
 
@@ -128,7 +129,7 @@ class TokenForge:
         self.show_cutout = tk.BooleanVar(value=False)
         saved_size = str(self.settings.get('size', 256))
         self.size = tk.StringVar(value=saved_size if saved_size in ('256', '512', '1024') else '256')
-        self.ext = tk.StringVar(value=self.settings.get('ext', 'webp'))
+        self.ext = tk.StringVar(value=output_format(self.settings.get('ext', 'webp')))
         self.keep_alpha = tk.BooleanVar(value=self.settings.get('keep_alpha', True))
         self.skip_exists = tk.BooleanVar(value=self.settings.get('skip_exists', True))
         self.convert_original = tk.BooleanVar(value=self.settings.get('convert_original', True))
@@ -407,13 +408,13 @@ class TokenForge:
             return
         self._queue_scan(folder, select_path, persist=persist)
 
-    def _queue_scan(self, folder, select_path=None, *, persist=False):
+    def _queue_scan(self, folder, select_path=None, *, persist=False, follow_selection=False):
         # A request is not a committed folder. Keep the previous list and
         # preferences intact until this particular scan succeeds.
         self.scan_generation += 1
         self.folder_label.set(f'Поиск: {folder}')
         self.status.set(f'Поиск исходных артов: {folder.name}')
-        request = (self.scan_generation, folder, select_path, self.frame_path, persist)
+        request = (self.scan_generation, folder, select_path, self.frame_path, persist, follow_selection)
         if self.busy or self.approval_pending:
             self.pending_scan = request
             if self.scan_running:
@@ -422,7 +423,7 @@ class TokenForge:
             self._run_scan(request)
 
     def _run_scan(self, request):
-        generation, folder, select_path, frame_path, persist = request
+        generation, folder, select_path, frame_path, persist, follow_selection = request
         self.busy = self.scan_running = True
         self.active_scan = request
         self.cancel_event.clear()
@@ -448,13 +449,17 @@ class TokenForge:
             self.file_list.insert(tk.END, p.name)
 
     def _apply_folder_scan(self, request, files, cancelled, error):
-        generation, folder, select_path, _, persist = request
+        generation, folder, select_path, _, persist, follow_selection = request
         if generation != self.scan_generation:
             return
         if cancelled or error:
             self._restore_folder_label()
             self.status.set('Поиск остановлен.' if cancelled else f'Ошибка поиска: {error}')
             return
+        # An automatic refresh updates the list, not the user's selection.
+        # Explicit folder/Explorer requests still honor their captured target.
+        if follow_selection:
+            select_path = self.selected
         self.folder = folder
         if persist:
             self.folder_preference = str(folder)
@@ -462,14 +467,15 @@ class TokenForge:
         self._set_file_list(files)
         self.status.set(f'Исходных артов: {len(files)}. Результаты сохраняются рядом с оригиналами.')
         index = self._exact_row(files, select_path)
-        if select_path is not None and index is None:
+        if select_path is not None and index is None and not follow_selection:
             self._clear_selection()
             self.status.set(f'Не удалось открыть {select_path.name}: файл недоступен или исключён как рамка.')
         elif files:
             index = index if index is not None else 0
             self.file_list.selection_set(index)
             self.file_list.see(index)
-            self._select(files[index])
+            if not follow_selection or self.selected is None or str(self.selected) != str(files[index]):
+                self._select(files[index])
         else:
             self._clear_selection()
             self.preview_label.set('Нет изображений в папке')
@@ -490,10 +496,10 @@ class TokenForge:
                 self.file_list.selection_set(index)
         request = self.pending_scan or self.active_scan
         if request is not None:
-            _, folder, target, _, persist = request
-            self._queue_scan(folder, target, persist=persist)
+            _, folder, target, _, persist, follow_selection = request
+            self._queue_scan(folder, target, persist=persist, follow_selection=follow_selection)
         elif self.folder is not None:
-            self._queue_scan(self.folder, selected, persist=False)
+            self._queue_scan(self.folder, persist=False, follow_selection=True)
 
     def _choose_ring(self):
         filename = filedialog.askopenfilename(title='Выбери PNG-кольцо',
@@ -535,19 +541,13 @@ class TokenForge:
             self._select(self.files[indexes[0]])
 
     def _item_adjust_for(self, path):
-        stored = self.settings.get('item_overrides', {}).get(str(path.resolve()), {})
-        if not isinstance(stored, dict):
-            stored = {}
-        defaults = {'layout': self.default_item_layout.get()}
-        defaults.update({key: stored[key] for key in ('layout', 'zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
-                         if key in stored})
-        return ItemAdjust(**defaults)
+        return adjustment_for(self.settings, path, 'item', self.default_item_layout.get())
 
     def _on_default_item_layout_change(self):
         # A new default applies to uncustomized items, not to explicit per-item
         # overrides. Keep the preview and the next batch in agreement.
-        stored = self.settings.get('item_overrides', {}).get(str(self.selected.resolve()), {}) if self.selected else {}
-        if self.selected is None or not isinstance(stored, dict) or 'layout' not in stored:
+        stored = override_for(self.settings, 'item_overrides', self.selected) if self.selected else {}
+        if self.selected is None or valid_layout(stored.get('layout'), None) is None:
             self.item_layout.set(self.default_item_layout.get())
             if 'item_overrides' in self.widget_values:
                 self.widget_values['item_overrides']['layout'] = self.item_layout.get()
@@ -577,10 +577,7 @@ class TokenForge:
                 self._request_preview()
 
     def _adjust_for(self, path):
-        stored = self.settings.get('overrides', {}).get(str(path.resolve()), {})
-        if not isinstance(stored, dict):
-            stored = {}
-        return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
+        return adjustment_for(self.settings, path, 'token')
 
     def _record_adjustment(self, name, path, adjusted, field):
         # Tk can clamp old values while loading a selection. Treat only the
@@ -614,30 +611,36 @@ class TokenForge:
         self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
-        self.sliders_updating = True
-        adj = self._adjust_for(path)
-        self.zoom.set(adj.zoom)
-        self.x.set(adj.x)
-        self.y.set(adj.y)
-        self.gap.set(adj.gap)
-        item = self._item_adjust_for(path)
-        self.item_layout.set(item.layout)
-        self.item_zoom.set(item.zoom)
-        self.item_x.set(item.x)
-        self.item_y.set(item.y)
-        self.item_rotation.set(item.rotation)
-        self.item_flip_horizontal.set(item.flip_horizontal)
-        self.item_flip_vertical.set(item.flip_vertical)
-        self.item_clean_noise.set(item.clean_noise)
-        self.widget_values = {'overrides': vars(self._current_adjust()),
-                              'item_overrides': vars(self._current_item_adjust())}
-        self.sliders_updating = False
         self.current_cutout = None
         self.current_key = None
+        self.widget_values = {}
+        self._show_token(None)
+        self.sliders_updating = True
+        try:
+            adj = self._adjust_for(path)
+            self.zoom.set(adj.zoom)
+            self.x.set(adj.x)
+            self.y.set(adj.y)
+            self.gap.set(adj.gap)
+            item = self._item_adjust_for(path)
+            self.item_layout.set(item.layout)
+            self.item_zoom.set(item.zoom)
+            self.item_x.set(item.x)
+            self.item_y.set(item.y)
+            self.item_rotation.set(item.rotation)
+            self.item_flip_horizontal.set(item.flip_horizontal)
+            self.item_flip_vertical.set(item.flip_vertical)
+            self.item_clean_noise.set(item.clean_noise)
+            self.widget_values = {'overrides': vars(self._current_adjust()),
+                                  'item_overrides': vars(self._current_item_adjust())}
+        except (OSError, ValueError, TypeError, RuntimeError, tk.TclError) as exc:
+            self.status.set(f'Не удалось загрузить параметры {path.name}: {exc}')
+            return
+        finally:
+            self.sliders_updating = False
         # Ordinary selection can show the saved result immediately. Explicit
         # Reset must produce a fresh preview even when the cutout is uncached.
         if force_preview:
-            self._show_token(None)
             self._request_preview()
         else:
             has_token = self._show_saved_token(path)
@@ -823,7 +826,7 @@ class TokenForge:
         if self.pending_export is not None:
             self.status.set('Экспорт уже в очереди. Нажми «Остановить», чтобы отменить его, затем запусти новый.')
             return
-        files = list(image_files)
+        files = list(image_files) if scan_folder is None else []
         mode = requested_mode or self.work_mode.get()
         if mode == 'token' and self.frame is None:
             messagebox.showerror('Нет рамки', 'Выбери корректное PNG-кольцо.')
@@ -881,7 +884,8 @@ class TokenForge:
         # Only the dispatcher consumes queued requests.
         self.pending_export = request
         if self.busy:
-            self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
+            self.status.set('Обработка папки в очереди.' if scan else
+                            f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
         self._after_preview()
 
     @staticmethod
@@ -926,19 +930,11 @@ class TokenForge:
                 self.events.put(('batch_scan', (folder, selected_files, ring_path)))
                 captured = {}
                 for path in selected_files:
-                    if path in adjustments:
-                        captured[path] = adjustments[path]
-                        continue
-                    group = 'item_overrides' if mode == 'item' else 'overrides'
-                    stored = settings.get(group, {}).get(str(path.resolve()), {})
-                    stored = stored if isinstance(stored, dict) else {}
-                    if mode == 'item':
-                        keys = ('layout', 'zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
-                        values = {'layout': default_layout}
-                        values.update({k: stored[k] for k in keys if k in stored})
-                        captured[path] = ItemAdjust(**values)
-                    else:
-                        captured[path] = Adjust(**{k: stored[k] for k in ('zoom', 'x', 'y', 'gap') if k in stored})
+                    if self.cancel_event.is_set():
+                        from token_engine import BatchResult
+                        self.events.put(('done', BatchResult(errors=[], cancelled=True, total=len(selected_files))))
+                        return
+                    captured[path] = adjustment_for(settings, path, mode, default_layout)
             def get_cutout(path):
                 if expected_input is not None:
                     assert_source_identity(path, expected_input)

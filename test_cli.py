@@ -243,6 +243,32 @@ class CliTests(unittest.TestCase):
         self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped')
         self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
 
+    def test_shared_adjustment_schema_keeps_valid_fields_and_rejects_unsafe_format(self):
+        from settings_store import adjustment_for, output_format
+        from item_engine import ITEM_MODES
+        key = str(self.photo.resolve())
+        self.settings['overrides'][key]['x'] = 'bad'
+        self.settings['item_overrides'] = {key: {'layout': 'bad', 'rotation': 22, 'zoom': 'bad',
+                                                 'flip_horizontal': 'false'}}
+        self.settings['item_layout'] = ITEM_MODES[1]
+        self.save_settings()
+        token = adjustment_for(self.settings, self.photo, 'token')
+        item = adjustment_for(self.settings, self.photo, 'item')
+        self.assertEqual((token.zoom, token.x), (130, 0))
+        self.assertEqual((item.layout, item.rotation, item.zoom, item.flip_horizontal),
+                         (ITEM_MODES[1], 22, 100, False))
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'created')
+        self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
+        for invalid in ('jpg', None, {}, '../png'):
+            self.assertEqual(output_format(invalid), 'webp')
+            with self.assertRaises(ValueError):
+                output_format(invalid, strict=True)
+        self.settings['ext'] = 'jpg'
+        self.save_settings()
+        with self.assertRaises(ValueError):
+            token_cli.automatic_token(self.photo)
+        self.assertEqual(output_format('PNG'), 'png')
+
     def test_conversion_warning_preserves_success(self):
         with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')):
             for action in (token_cli.automatic_token, token_cli.automatic_item):

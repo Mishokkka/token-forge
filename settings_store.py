@@ -3,9 +3,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import math
 from pathlib import Path
 
-from token_engine import atomic_write
+from token_engine import atomic_write, Adjust
+from item_engine import ItemAdjust, ITEM_MODES
 from process_lock import process_lock as settings_lock
 
 
@@ -25,6 +27,68 @@ def read_settings_file(path: Path, *, strict=False) -> dict:
     return {}
 
 
+
+
+TOKEN_RANGES = {'zoom': (5, 320), 'x': (-120, 120),
+                'y': (-120, 120), 'gap': (-20, 50)}
+ITEM_RANGES = {'zoom': (10, 100), 'x': (-100, 100),
+               'y': (-100, 100), 'rotation': (-180, 180)}
+
+
+def valid_layout(value, default=ITEM_MODES[0]):
+    return value if isinstance(value, str) and value in ITEM_MODES else default
+
+
+def output_format(value, *, strict=False):
+    if isinstance(value, str) and value.lower() in ('png', 'webp'):
+        return value.lower()
+    if strict:
+        raise ValueError('Неподдерживаемый формат токена в настройках.')
+    return 'webp'
+
+
+def override_for(settings, group, source):
+    mapping = settings.get(group)
+    stored = mapping.get(str(source.resolve()), {}) if isinstance(mapping, dict) else {}
+    return stored if isinstance(stored, dict) else {}
+
+
+def decode_adjustment(stored, mode, default_layout=ITEM_MODES[0]):
+    """Use one field-wise schema for GUI controls and both export entry points.
+
+    Valid legacy numeric values outside the current slider range are clamped
+    for rendering only; never silently rewrite unrelated stored fields.
+    """
+    item = mode == 'item'
+    defaults = ItemAdjust(layout=valid_layout(default_layout)) if item else Adjust()
+    ranges = ITEM_RANGES if item else TOKEN_RANGES
+    stored = stored if isinstance(stored, dict) else {}
+    for name, (low, high) in ranges.items():
+        value = stored.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        # Huge JSON integers can overflow conversion to float.
+        try:
+            number = float(value)
+        except (ValueError, OverflowError):
+            continue
+        if not math.isfinite(number) or (name == 'zoom' and number <= 0):
+            continue
+        setattr(defaults, name, min(high, max(low, round(number))))
+    if item:
+        defaults.layout = valid_layout(stored.get('layout'), defaults.layout)
+        for name in ('flip_horizontal', 'flip_vertical', 'clean_noise'):
+            value = stored.get(name)
+            if isinstance(value, bool):
+                setattr(defaults, name, value)
+    return defaults
+
+
+def adjustment_for(settings, source, mode, default_layout=None):
+    group = 'item_overrides' if mode == 'item' else 'overrides'
+    if default_layout is None:
+        default_layout = settings.get('item_layout', ITEM_MODES[0])
+    return decode_adjustment(override_for(settings, group, source), mode, default_layout)
 
 
 _MISSING = object()

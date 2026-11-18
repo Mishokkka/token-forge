@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from cutout_service import load_cutout
-from settings_store import read_settings_file
+from settings_store import read_settings_file, adjustment_for, output_format
 from local_models import DEFAULT_MODEL, require_local_model, new_local_session
 import os
 import traceback
@@ -16,7 +16,7 @@ from token_engine import (
     remove_background, token_output_path, source_identity, read_export_owner,
     LoadedCutout, excluded_file,
 )
-from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
+from item_engine import item_output_path, export_items
 
 BASE = Path(__file__).resolve().parent
 PREFS_DIR = preferences_dir()
@@ -66,15 +66,8 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     return matches[0]
 
 
-def override_for(settings, name, source):
-    mapping = settings.get(name)
-    stored = mapping.get(str(source.resolve()), {}) if isinstance(mapping, dict) else {}
-    return stored if isinstance(stored, dict) else {}
-
-
 def _adjust_for(settings: dict, source: Path) -> Adjust:
-    stored = override_for(settings, 'overrides', source)
-    return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
+    return adjustment_for(settings, source, 'token')
 
 
 def make_cutout_loader(model, keep_alpha, edge_mode):
@@ -110,9 +103,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
-    ext = str(settings.get('ext', 'webp')).lower()
-    if ext not in ('webp', 'png'):
-        raise ValueError('Неподдерживаемый формат токена в настройках.')
+    ext = output_format(settings.get('ext', 'webp'), strict=True)
     size = int(settings.get('size', 256))
     if size not in (256, 512, 1024):
         raise ValueError('Неподдерживаемый размер токена в настройках.')
@@ -147,13 +138,7 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
-    stored = override_for(settings, 'item_overrides', source)
-    layout = stored.get('layout', settings.get('item_layout', ITEM_MODES[0]))
-    if layout not in ITEM_MODES:
-        layout = ITEM_MODES[0]
-    adj = ItemAdjust(layout=layout,
-                     **{key: stored[key] for key in ('zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
-                        if key in stored})
+    adj = adjustment_for(settings, source, 'item')
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=bool(settings.get('skip_exists', True)),

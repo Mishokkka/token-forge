@@ -591,11 +591,91 @@ class CacheTests(unittest.TestCase):
         app.scan_generation = 2
         app.folder_label, app.status, app.file_list = Mock(), Mock(), Mock()
         app._select, app._schedule_save, app._clear_selection = Mock(), Mock(), Mock()
-        app._apply_folder_scan((2, self.directory, self.source, None, False),
+        app._apply_folder_scan((2, self.directory, self.source, None, False, False),
                                [self.source], False, None)
         self.assertEqual(app.folder, self.directory)
         self.assertEqual(app.folder_preference, 'saved')
         app._schedule_save.assert_not_called()
+
+    def test_ring_refresh_follows_latest_selection(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.scan_generation = 3
+        app.folder_label, app.status, app.file_list = Mock(), Mock(), Mock()
+        a, b = self.source, self.directory / 'Second.png'
+        app.selected = b
+        app._select, app._schedule_save, app._clear_selection = Mock(), Mock(), Mock()
+        app._apply_folder_scan((3, self.directory, a, None, False, True), [a, b], False, None)
+        app.file_list.selection_set.assert_called_with(1)
+        app._select.assert_not_called()
+        app._apply_folder_scan((3, self.directory, a, None, True, False), [a, b], False, None)
+        app._select.assert_called_once_with(a)
+
+    def test_folder_export_builds_validated_adjustments_only_in_worker(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        from token_engine import BatchResult
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.selected = self.source
+        app.running_batch = False
+        app.pending_export = None
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.events, app.cancel_event, app.progress = queue.Queue(), threading.Event(), {}
+        app.status = Mock()
+        app.settings = {'overrides': {str(self.source.resolve()): {'zoom': 140, 'x': 'bad'}}}
+        for name, value in {'work_mode': 'token', 'model': 'birefnet-general', 'keep_alpha': True,
+                            'edge_mode': 'Обычный', 'ext': 'webp', 'size': '256',
+                            'skip_exists': True, 'convert_original': False}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        app._adjust_for = Mock(side_effect=AssertionError('Tk resolved every source'))
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch('tokenforge.list_source_images', return_value=[self.source]), \
+             patch('tokenforge.export_batch', return_value=BatchResult(errors=[])) as export:
+            with patch.object(Path, 'resolve', side_effect=AssertionError('Tk resolved a path')):
+                app._start_export([self.source], scan_folder=self.directory)
+            app._adjust_for.assert_not_called()
+            export.assert_not_called()
+            # The worker uses the captured settings, not subsequent GUI edits.
+            app.settings['overrides'][str(self.source.resolve())]['zoom'] = 60
+            launch.call_args.kwargs['target']()
+            adjustment = export.call_args.args[4][self.source]
+            self.assertEqual((adjustment.zoom, adjustment.x), (140, 0))
+
+    def test_malformed_overrides_are_validated_field_by_field(self):
+        from item_engine import ITEM_MODES
+        app = self.make_mock_app()
+        key = str(self.source.resolve())
+        app.settings = {'overrides': {key: {'zoom': 130, 'x': 'bad', 'gap': float('nan'), 'y': True}},
+                        'item_overrides': {key: {'zoom': 140, 'x': 10**400, 'y': 20, 'rotation': None,
+                                                 'layout': [], 'flip_horizontal': 'false',
+                                                 'flip_vertical': True, 'clean_noise': False}}}
+        app.default_item_layout = SimpleNamespace(get=lambda: ITEM_MODES[2])
+        token = app._adjust_for(self.source)
+        item = app._item_adjust_for(self.source)
+        self.assertEqual((token.zoom, token.x, token.y, token.gap), (130, 0, 0, 11))
+        self.assertEqual((item.zoom, item.x, item.y, item.rotation), (100, 0, 20, 0))
+        self.assertEqual(item.layout, ITEM_MODES[2])
+        self.assertEqual((item.flip_horizontal, item.flip_vertical, item.clean_noise), (False, True, False))
+        self.assertEqual(app.settings['item_overrides'][key]['zoom'], 140)
+
+    def test_failed_selection_load_clears_stale_preview_and_unlocks_sliders(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.current_cutout = Image.new('RGBA', (10, 10), 'red')
+        app.current_key = ('old',)
+        app.preview_label, app.status, app._show_token = Mock(), Mock(), Mock()
+        app._adjust_for = Mock(side_effect=OSError('read failed'))
+        app._request_preview = Mock()
+        app._select(self.source)
+        self.assertFalse(app.sliders_updating)
+        self.assertIsNone(app.current_key)
+        self.assertIsNone(app.current_cutout)
+        app._show_token.assert_called_once_with(None)
+        app._request_preview.assert_not_called()
 
     def test_exact_row_is_not_windows_path_equality(self):
         from pathlib import PureWindowsPath
