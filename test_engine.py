@@ -157,6 +157,22 @@ class EngineTests(unittest.TestCase):
                                    input_identity=identity)
             self.assertEqual(output.read_bytes(), original)
 
+    def test_resource_limits_and_decoder_allowlist(self):
+        with tempfile.TemporaryDirectory() as d:
+            disguised = Path(d) / 'not-png.png'
+            Image.new('RGB', (10, 10)).save(disguised, format='GIF')
+            with self.assertRaises(OSError):
+                read_image(disguised)
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            with patch('token_engine.MAX_IMAGE_PIXELS', 100):
+                with self.assertRaises(ValueError):
+                    read_image(source)
+            with patch('token_engine.MAX_ENCODED_BYTES', 10):
+                from token_engine import source_identity
+                with self.assertRaises(OSError):
+                    source_identity(source)
+
     def test_oversized_source_is_discovered_without_disabling_limit(self):
         import tempfile
         with tempfile.TemporaryDirectory() as d:

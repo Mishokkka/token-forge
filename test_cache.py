@@ -19,6 +19,40 @@ class CacheTests(unittest.TestCase):
         Image.new('RGB', (170, 220), (60, 50, 40)).save(self.source)
         self.cache = DiskCutoutCache(self.directory / 'cache')
 
+    def test_memory_cache_evicts_by_decoded_bytes(self):
+        from cutout_service import remember
+        memory = {}
+        image = Image.new('RGBA', (20, 20), 'red')
+        remember(memory, 'first', image, byte_limit=2000)
+        remember(memory, 'second', image, byte_limit=2000)
+        self.assertEqual(list(memory), ['second'])
+        remember(memory, 'oversize', Image.new('RGBA', (50, 50)), byte_limit=2000)
+        self.assertEqual(list(memory), ['second'])
+
+    def test_model_revision_invalidates_disk_cache(self):
+        with patch('token_engine.model_revision', return_value=('version-one',)):
+            first = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
+        with patch('token_engine.model_revision', return_value=('version-two',)):
+            second = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
+        self.assertNotEqual(first, second)
+
+    def test_disk_prune_only_removes_old_owned_cache_names(self):
+        import os
+        self.cache.directory.mkdir()
+        keep = self.cache.directory / 'notes.png'
+        keep.write_bytes(b'foreign')
+        one = self.cache.directory / ('a' * 64 + '.png')
+        two = self.cache.directory / ('b' * 64 + '.png')
+        for path in (one, two):
+            path.write_bytes(b'cache')
+        os.utime(one, (100, 100))
+        os.utime(two, (200, 200))
+        cache = DiskCutoutCache(self.cache.directory, max_bytes=5, max_entries=1)
+        cache.prune()
+        self.assertFalse(one.exists())
+        self.assertTrue(two.exists())
+        self.assertEqual(keep.read_bytes(), b'foreign')
+
     def test_disk_cache_persists_full_rgba_unchanged(self):
         image = Image.new('RGBA', (170, 220), (11, 22, 33, 0))
         image.putpixel((20, 30), (71, 92, 154, 157))

@@ -11,10 +11,32 @@ import traceback
 from pathlib import Path
 from statistics import median
 import math
-from local_models import call_rembg
+from local_models import call_rembg, model_revision
+from process_lock import process_lock
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
-CUTOUT_CACHE_VERSION = 2
+CUTOUT_CACHE_VERSION = 3
+MAX_ENCODED_BYTES = 256 * 1024 * 1024
+MAX_IMAGE_PIXELS = 64 * 1024 * 1024
+MAX_IMAGE_SIDE = 16384
+ART_FORMATS = ('PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF')
+
+
+def validate_art_dimensions(image):
+    if (image.width > MAX_IMAGE_SIDE or image.height > MAX_IMAGE_SIDE
+            or image.width * image.height > MAX_IMAGE_PIXELS):
+        raise ValueError('Изображение превышает ресурсный лимит TokenForge (64 МиПикс, сторона 16384).')
+    return image
+
+
+def open_art(source):
+    # Pillow also keeps its own decompression-bomb limit.
+    image = Image.open(source, formats=ART_FORMATS)
+    try:
+        return validate_art_dimensions(image)
+    except BaseException:
+        image.close()
+        raise
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 
@@ -43,16 +65,20 @@ def _fingerprint(source: Path, snapshot=None) -> tuple:
     resolved = Path(source).resolve()
     signature = stat_signature
     path_before = resolved.stat()
+    if path_before.st_size > MAX_ENCODED_BYTES:
+        raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
     with resolved.open('rb') as stream:
         before = os.fstat(stream.fileno())
-        if snapshot is None:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        else:
-            hasher = hashlib.sha256()
-            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                hasher.update(chunk)
+        hasher = hashlib.sha256()
+        total = 0
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            total += len(chunk)
+            if total > MAX_ENCODED_BYTES:
+                raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+            hasher.update(chunk)
+            if snapshot is not None:
                 snapshot.write(chunk)
-            digest = hasher.hexdigest()
+        digest = hasher.hexdigest()
         after = os.fstat(stream.fileno())
         path_after = resolved.stat()
     # On Windows fstat and stat need not expose identical inode/device IDs.
@@ -61,7 +87,7 @@ def _fingerprint(source: Path, snapshot=None) -> tuple:
             or signature(path_before) != signature(path_after)
             or (after.st_size, after.st_mtime_ns) != (path_after.st_size, path_after.st_mtime_ns)):
         raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
-    if snapshot is not None and snapshot.tell() != path_after.st_size:
+    if total != path_after.st_size:
         raise OSError(f'Размер исходного файла изменился: {source.name}')
     return str(resolved), path_after.st_size, path_after.st_mtime_ns, digest
 
@@ -87,26 +113,34 @@ def assert_source_identity(source: Path, identity: tuple) -> None:
 class DiskCutoutCache:
     """Lossless persistent cache. No image extraction rerun for unchanged inputs."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, max_bytes=2 * 1024**3, max_entries=4096):
         self.directory = Path(directory)
+        self.max_bytes = max_bytes
+        self.max_entries = max_entries
+        self._last_prune = None
+        self._bytes_since_prune = 0
 
     def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
-                 *, identity: tuple | None = None) -> Path:
+                 *, identity: tuple | None = None, revision=None) -> Path:
         version = identity or source_identity(source)
+        revision = model_revision(model) if revision is None else revision
         key = [CUTOUT_CACHE_VERSION, version[0], version[-1],
-               model, bool(keep_alpha), edge_mode]
+               model, bool(keep_alpha), edge_mode, revision]
         digest = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode('utf-8')).hexdigest()
         return self.directory / f'{digest}.png'
 
     def load(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
-             *, identity: tuple | None = None) -> Image.Image | None:
-        path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
+             *, identity: tuple | None = None, revision=None) -> Image.Image | None:
+        path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
         try:
-            with Image.open(path) as stored:
-                stored.load()
-                if stored.format != 'PNG':
-                    raise ValueError('Invalid cache format')
-                return stored.convert('RGBA')
+            with Image.open(path, formats=('PNG',)) as stored:
+                validate_art_dimensions(stored)
+                image = stored.convert('RGBA')
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+            return image
         except FileNotFoundError:
             return None
         except (OSError, ValueError, Image.DecompressionBombError):
@@ -115,21 +149,66 @@ class DiskCutoutCache:
             return None
 
     def save(self, source: Path, model: str, keep_alpha: bool,
-             edge_mode: str, cutout: Image.Image, *, identity: tuple | None = None) -> None:
-        destination = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
-        if identity is not None:
-            assert_source_identity(source, identity)
+             edge_mode: str, cutout: Image.Image, *, identity: tuple | None = None,
+             revision=None) -> None:
+        destination = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
+        validate_art_dimensions(cutout)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='wb', suffix='.png', dir=destination.parent,
                                              prefix='.tmp-', delete=False) as tmp:
                 temporary = Path(tmp.name)
-                cutout.convert('RGBA').save(tmp, format='PNG', compress_level=1)
-            os.replace(temporary, destination)
+                rgba = cutout if cutout.mode == 'RGBA' else cutout.convert('RGBA')
+                rgba.save(tmp, format='PNG', compress_level=1)
+            if identity is not None:
+                assert_source_identity(source, identity)
+            encoded_bytes = temporary.stat().st_size
+            if encoded_bytes <= self.max_bytes:
+                os.replace(temporary, destination)
+                self._bytes_since_prune += encoded_bytes
+                self._maybe_prune()
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def _maybe_prune(self):
+        import time
+        now = time.monotonic()
+        if (self._last_prune is None or now - self._last_prune >= 30
+                or self._bytes_since_prune >= min(self.max_bytes // 8, 128 * 1024**2)):
+            try:
+                self.prune()
+                self._last_prune = now
+                self._bytes_since_prune = 0
+            except OSError:
+                pass  # Cache maintenance never blocks successful exports.
+
+    def prune(self):
+        """Best-effort LRU of only our cache names; never touch source images."""
+        with process_lock(self.directory / '.maintenance', timeout=0):
+            entries = []
+            for path in self.directory.glob('*.png'):
+                if not _valid_digest(path.stem) or path.is_symlink():
+                    continue
+                try:
+                    st = path.stat()
+                    if path.is_file():
+                        entries.append((st.st_mtime_ns, st.st_size, path))
+                except OSError:
+                    continue
+            total, count = sum(item[1] for item in entries), len(entries)
+            for stamp, size, path in sorted(entries):
+                if total <= self.max_bytes and count <= self.max_entries:
+                    break
+                try:
+                    st = path.stat()
+                    if (st.st_mtime_ns, st.st_size) == (stamp, size):
+                        path.unlink()
+                        total -= size
+                        count -= 1
+                except OSError:
+                    continue
 
 
 @contextmanager
@@ -144,6 +223,8 @@ def source_snapshot(path: Path, identity: tuple):
     with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b') as snapshot:
         with path.open('rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                if snapshot.tell() + len(chunk) > min(identity[1], MAX_ENCODED_BYTES):
+                    raise OSError(f'Исходный файл изменился во время чтения: {path.name}')
                 digest.update(chunk)
                 snapshot.write(chunk)
         if snapshot.tell() != identity[1] or digest.hexdigest() != identity[-1]:
@@ -154,10 +235,12 @@ def source_snapshot(path: Path, identity: tuple):
 
 def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
     if identity is None:
-        with Image.open(path) as img:
+        if path.stat().st_size > MAX_ENCODED_BYTES:
+            raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+        with open_art(path) as img:
             return ImageOps.exif_transpose(img).convert('RGBA')
     with source_snapshot(path, identity) as snapshot:
-        with Image.open(snapshot) as img:
+        with open_art(snapshot) as img:
             return ImageOps.exif_transpose(img).convert('RGBA')
 
 
@@ -615,10 +698,11 @@ def _parse_owner(owner):
 def _probe_owner(stream, *, require_pixels=False):
     """Discovery is not evidence that the pixels are decodable."""
     try:
-        with Image.open(stream) as stored:
+        with Image.open(stream, formats=('PNG', 'WEBP')) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if owner and require_pixels:
                 try:
+                    validate_art_dimensions(stored)
                     stored.load()
                 except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
                     raise InvalidExportError('Готовое изображение повреждено.') from exc
@@ -681,7 +765,7 @@ def inspect_existing_export(destination, source, kind):
 def read_owned_export_image(destination, source, kind):
     """Decode only the same verified bytes whose ownership was inspected."""
     with fingerprinted_snapshot(destination) as (identity, snapshot):
-        with Image.open(snapshot) as stored:
+        with open_art(snapshot) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if not _owner_matches(owner, source, kind):
                 return None
@@ -932,7 +1016,7 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         assert_source_identity(source, identity)
         if approval_guard is not None:
             approval_guard()
-    with source_snapshot(source, identity) as snapshot, Image.open(snapshot) as raw:
+    with source_snapshot(source, identity) as snapshot, open_art(snapshot) as raw:
         artwork = ImageOps.exif_transpose(raw)
         # Preserve true transparency without accidentally adding an opaque alpha.
         if 'A' in artwork.getbands() or 'transparency' in artwork.info:
