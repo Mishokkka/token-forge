@@ -243,7 +243,7 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
     return token
 
 
-def atomic_write(path: Path, writer, *, replace: bool = True) -> bool:
+def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=None) -> bool:
     """Publish only a complete, closed file, optionally without replacement."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -252,6 +252,8 @@ def atomic_write(path: Path, writer, *, replace: bool = True) -> bool:
                                          prefix='.tokenforge-', suffix='.tmp', delete=False) as fp:
             temporary = Path(fp.name)
             writer(fp)
+        if before_publish is not None:
+            before_publish()
         if replace:
             os.replace(temporary, path)
         else:
@@ -274,6 +276,46 @@ def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
         return atomic_write(path, lambda fp: image.save(fp, 'PNG', optimize=True), replace=replace)
     return atomic_write(path, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
                         replace=replace)
+
+
+def export_owner(source: Path, kind: str) -> str:
+    # ASCII JSON works in the EXIF ImageDescription field of PNG and WebP.
+    return 'TokenForge/1:' + json.dumps([kind, source.stem.casefold()], ensure_ascii=True)
+
+
+def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
+    try:
+        with Image.open(destination) as stored:
+            return stored.getexif().get(270) == export_owner(source, kind)
+    except (OSError, ValueError, SyntaxError):
+        return False
+
+
+def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
+                   *, skip_exists: bool, approved_identity: tuple | None = None) -> bool:
+    # A suffix is not proof of ownership. Old unmarked exports require explicit
+    # confirmation; automatic and batch jobs may only overwrite marked results.
+    prior = source_identity(destination) if destination.exists() else None
+    if prior is not None:
+        if skip_exists:
+            return False
+        if not is_owned_export(destination, source, kind) and prior != approved_identity:
+            raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
+                                  'Переименуй его или подтверди замену вручную.')
+    exif = Image.Exif()
+    exif[270] = export_owner(source, kind)
+    fmt = 'PNG' if destination.suffix.lower() == '.png' else 'WEBP'
+    options = {'optimize': True} if fmt == 'PNG' else {'lossless': True, 'method': 6}
+    def encode(fp):
+        image.save(fp, fmt, exif=exif, **options)
+    def guard():
+        if prior is not None:
+            assert_source_identity(destination, prior)
+    published = atomic_write(destination, encode, replace=prior is not None,
+                             before_publish=guard)
+    if not published and not skip_exists:
+        raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
+    return published
 
 
 def list_images(folder: Path) -> list[Path]:
@@ -370,7 +412,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image,
                  interior: Image.Image, adjustments: dict[Path, Adjust],
                  out_size: int = 256, format_name: str = 'webp',
                  skip_exists: bool = True, convert_original: bool = True,
-                 cancel_event=None, on_progress=None) -> BatchResult:
+                 cancel_event=None, on_progress=None, approved_outputs=None) -> BatchResult:
     """Export all sources independently; a failed image never aborts the rest."""
     result = BatchResult(errors=[], total=len(files))
     for index, source in enumerate(files):
@@ -392,7 +434,8 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image,
                 cutout = get_cutout(source)
                 final_image = compose(cutout, frame, interior, out_size,
                                       adjustments[source])
-                if save_token(final_image, destination, format_name, replace=not skip_exists):
+                if save_generated(final_image, destination, source, 'token', skip_exists=skip_exists,
+                                  approved_identity=(approved_outputs or {}).get(destination)):
                     result.created += 1
                 else:
                     result.skipped += 1

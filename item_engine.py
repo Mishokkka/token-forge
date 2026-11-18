@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, save_original_webp, atomic_write
+from token_engine import BatchResult, save_original_webp, save_generated
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -183,7 +183,7 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
 
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
-                 on_progress=None) -> BatchResult:
+                 on_progress=None, approved_outputs=None) -> BatchResult:
     result = BatchResult(errors=[], total=len(files))
     for index, source in enumerate(files):
         if cancel_event is not None and cancel_event.is_set():
@@ -204,8 +204,8 @@ def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                 cutout = get_cutout(source)
                 image = compose_item(cutout, adjustments[source])
                 # Lossless for crisp 3px outlines and correct alpha.
-                if atomic_write(destination, lambda fp: image.save(fp, 'WEBP', lossless=True, method=6),
-                                replace=not skip_exists):
+                if save_generated(image, destination, source, 'item', skip_exists=skip_exists,
+                                  approved_identity=(approved_outputs or {}).get(destination)):
                     result.created += 1
                 else:
                     result.skipped += 1

@@ -21,7 +21,7 @@ from PIL import Image, ImageDraw, ImageTk
 from token_engine import (
     Adjust, DiskCutoutCache, already_transparent, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
-    atomic_write, source_identity, assert_source_identity,
+    atomic_write, source_identity, assert_source_identity, is_owned_export,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 
@@ -681,8 +681,24 @@ class TokenForge:
         interior = self.interior.copy() if self.interior is not None else None
         adjustments = {p: (self._item_adjust_for(p) if mode == 'item'
                             else self._adjust_for(p)) for p in files}
+        approved_outputs = {}
+        if force_overwrite and len(files) == 1:
+            source = files[0]
+            destination = item_output_path(source) if mode == 'item' else token_output_path(source, ext)
+            if destination.exists() and not is_owned_export(destination, source, mode):
+                try:
+                    identity = source_identity(destination)
+                except OSError as exc:
+                    messagebox.showerror('Ошибка файла', str(exc))
+                    return
+                if not messagebox.askyesno(
+                        'Подтверждение замены',
+                        f'{destination.name} не помечен как результат TokenForge. '
+                        'Это может быть старый токен или отдельный арт. Заменить его?'):
+                    return
+                approved_outputs[destination] = identity
         request = (files, mode, model, keep, edge_mode, ext, size, skip,
-                   convert, frame, interior, adjustments)
+                   convert, frame, interior, adjustments, approved_outputs)
         if self.busy:
             self.pending_export = request
             self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
@@ -691,7 +707,7 @@ class TokenForge:
 
     def _run_export(self, request):
         (files, mode, model, keep, edge_mode, ext, size, skip,
-         convert, frame, interior, adjustments) = request
+         convert, frame, interior, adjustments, approved_outputs) = request
         self.busy = True
         self.running_batch = True
         self.cancel_event.clear()
@@ -705,12 +721,14 @@ class TokenForge:
                 if mode == 'item':
                     result = export_items(files, get_cutout, adjustments,
                                           skip_exists=skip, convert_original=convert,
-                                          cancel_event=self.cancel_event, on_progress=progress)
+                                          cancel_event=self.cancel_event, on_progress=progress,
+                                          approved_outputs=approved_outputs)
                 else:
                     result = export_batch(files, get_cutout, frame, interior,
                                           adjustments, out_size=size, format_name=ext,
                                           skip_exists=skip, convert_original=convert,
-                                          cancel_event=self.cancel_event, on_progress=progress)
+                                          cancel_event=self.cancel_event, on_progress=progress,
+                                          approved_outputs=approved_outputs)
                 self.events.put(('done', result))
             except Exception as exc:
                 self.events.put(('batch_failure', traceback.format_exc()))

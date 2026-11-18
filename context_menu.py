@@ -40,6 +40,12 @@ def _registry():
     return winreg
 
 
+def _notify_shell() -> None:
+    if os.name == 'nt':
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)
+
+
 def install(base: Path = BASE) -> None:
     reg = _registry()
     pythonw, entry = interpreter_and_entry(base)
@@ -52,6 +58,7 @@ def install(base: Path = BASE) -> None:
                 reg.SetValueEx(key, 'Icon', 0, reg.REG_SZ, str(pythonw))
             with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, item + r'\command', 0, reg.KEY_WRITE) as key:
                 reg.SetValueEx(key, '', 0, reg.REG_SZ, command_for(pythonw, entry, action))
+    _notify_shell()
 
 
 def remove() -> None:
@@ -64,6 +71,7 @@ def remove() -> None:
                     reg.DeleteKey(reg.HKEY_CURRENT_USER, path)
                 except FileNotFoundError:
                     pass
+    _notify_shell()
 
 
 def main(argv=None) -> int:

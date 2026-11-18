@@ -1,5 +1,6 @@
 """Offline integration checks for v1.6. Run with: python -m unittest -v test_cli.py"""
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +30,8 @@ class CliTests(unittest.TestCase):
             patch.object(token_cli, 'PREFS_DIR', self.pref),
             patch.object(token_cli, 'PREFS_FILE', self.pref / 'settings.json'),
             patch.object(token_cli, 'BASE', self.base),
+            patch.dict(sys.modules, {'rembg': SimpleNamespace(
+                new_session=lambda *a, **k: self.fail('AI session invoked in offline test'))}),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -88,6 +91,10 @@ class CliTests(unittest.TestCase):
         with patch.object(token_cli, 'remove_background', side_effect=AssertionError('AI invoked')):
             self.assertEqual(token_cli.automatic_item(output)[0], 'skipped')
         self.assertEqual(token_cli.resolve_context_source(output), self.photo)
+        self.settings['skip_exists'] = False
+        self.save_settings()
+        with patch.object(token_cli, 'read_image', side_effect=AssertionError('Cache miss')):
+            self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
         self.assertFalse((self.art_folder / (self.photo.stem + '_item_item.webp')).exists())
 
     def test_gui_open_item_selects_user_target(self):
@@ -107,11 +114,31 @@ class CliTests(unittest.TestCase):
         status, token = token_cli.automatic_token(self.photo)
         self.assertEqual(status, 'created')
         self.settings['skip_exists'] = False
+        self.settings['size'] = 512
         self.save_settings()
         with patch.object(token_cli, 'remove_background', side_effect=AssertionError('AI invoked')):
             state, dest = token_cli.automatic_token(self.photo)
         self.assertEqual(state, 'created')
         self.assertEqual(dest, token)
+        with Image.open(dest) as image:
+            self.assertEqual(image.size, (512, 512))
+
+    def test_jpeg_ending_in_t_is_not_redirected(self):
+        ca = self.art_folder / 'Ca.png'
+        cat = self.art_folder / 'Cat.jpg'
+        Image.new('RGB', (10, 10)).save(ca)
+        Image.new('RGB', (10, 10)).save(cat)
+        self.assertIn(cat, __import__('token_engine').list_source_images(self.art_folder))
+        self.assertEqual(token_cli.resolve_context_source(cat), cat)
+
+    def test_conversion_warning_preserves_success(self):
+        with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')), \
+             patch('item_engine.save_original_webp', side_effect=OSError('conversion failed')):
+            for action in (token_cli.automatic_token, token_cli.automatic_item):
+                state, dest = action(self.photo)
+                self.assertEqual(state, 'created_with_warning')
+                self.assertTrue(dest.is_file())
+                self.assertEqual(action(self.photo)[0], 'skipped_with_warning')
 
     def test_context_command_quotes_file_paths_and_mode(self):
         exe = self.base / '.venv' / 'Scripts' / 'pythonw.exe'
@@ -151,10 +178,12 @@ class RegistryTests(unittest.TestCase):
             REG_SZ = 1
             def __init__(self):
                 self.created = {}
+                self.live = set()
                 self.deleted = []
             def CreateKeyEx(self, hive, path, reserved, flags):
                 assert hive == self.HKEY_CURRENT_USER
                 self.created.setdefault(path, {})
+                self.live.add(path)
                 class Context:
                     def __enter__(inner): return path
                     def __exit__(inner, *args): return False
@@ -162,6 +191,12 @@ class RegistryTests(unittest.TestCase):
             def SetValueEx(self, key, name, reserved, kind, value):
                 self.created[key][name] = value
             def DeleteKey(self, hive, path):
+                assert hive == self.HKEY_CURRENT_USER
+                if path not in self.live:
+                    raise FileNotFoundError(path)
+                if any(k.startswith(path + '\\') for k in self.live):
+                    raise OSError('Key still has children')
+                self.live.remove(path)
                 self.deleted.append(path)
 
         with tempfile.TemporaryDirectory() as temp:
@@ -176,6 +211,7 @@ class RegistryTests(unittest.TestCase):
                 context_menu.remove()
             self.assertEqual(len(reg.created), len(context_menu.EXTENSIONS) * len(context_menu.ACTION_NAMES) * 2)
             self.assertEqual(len(reg.deleted), len(reg.created))
+            self.assertFalse(reg.live)
             allkeys = list(reg.created.keys())
             self.assertTrue(all(k.startswith(context_menu.ROOT) for k in allkeys))
             for ext in context_menu.EXTENSIONS:
@@ -183,7 +219,12 @@ class RegistryTests(unittest.TestCase):
             cmd = [v.get('') for k, v in reg.created.items() if k.endswith('\\command')]
             self.assertEqual(len(cmd), 28)
             self.assertTrue(all('"%1"' in s for s in cmd))
-            self.assertTrue(all('--auto' in s or '--open' in s for s in cmd))
+            expected = {'TokenForge.Create': '--auto', 'TokenForge.Open': '--open',
+                        'TokenForge.CreateItem': '--auto-item', 'TokenForge.OpenItem': '--open-item'}
+            for ext in context_menu.EXTENSIONS:
+                for verb, flag in expected.items():
+                    key = context_menu.ROOT + '\\' + ext + '\\shell\\' + verb + '\\command'
+                    self.assertEqual(reg.created[key][''], f'"{exe}" "{base / "tokenforge.py"}" {flag} "%1"')
 
 
 if __name__ == '__main__':

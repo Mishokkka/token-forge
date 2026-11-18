@@ -1,10 +1,15 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
+if %errorlevel% neq 0 (
+    echo ERROR: Could not enter the program directory.
+    pause
+    exit /b 1
+)
 title TokenForge
 if not exist ".venv\Scripts\python.exe" goto need_install
 ".venv\Scripts\python.exe" "tokenforge.py" %*
-if errorlevel 1 goto failed
+if %errorlevel% neq 0 goto failed
 exit /b 0
 
 :need_install

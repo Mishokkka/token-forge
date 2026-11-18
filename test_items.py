@@ -86,6 +86,25 @@ class ItemTests(unittest.TestCase):
             self.assertEqual(again.created,0)
             self.assertEqual(len(calls),2)
 
+    def test_unknown_existing_item_is_not_overwritten(self):
+        from token_engine import source_identity
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'Sword.png'
+            self.sword.save(source)
+            destination = item_output_path(source)
+            self.potion.save(destination, 'WEBP')
+            before = destination.read_bytes()
+            args = ([source], read_image, {source: ItemAdjust()})
+            result = export_items(*args, skip_exists=False, convert_original=False)
+            self.assertEqual(result.created, 0)
+            self.assertTrue(result.errors)
+            self.assertEqual(destination.read_bytes(), before)
+            result = export_items(*args, skip_exists=False, convert_original=False,
+                                  approved_outputs={destination: source_identity(destination)})
+            self.assertEqual(result.created, 1)
+            result = export_items(*args, skip_exists=False, convert_original=False)
+            self.assertEqual(result.created, 1)
+
     def test_invalid_layout_and_blank_alpha(self):
         with self.assertRaises(ValueError):
             compose_item(self.sword,ItemAdjust(layout='not-valid'))
@@ -115,14 +134,26 @@ class NoClipTests(unittest.TestCase):
                                     (100, -100, 100), (180, 100, -100)):
                     with self.subTest(mode=mode, rotation=rotation,
                                       zoom=zoom, x=x, y=y):
+                        margin = round(500 * (.05 if mode == ITEM_MODES[0] else .018))
+                        available = 500 - 2 * (margin + 3)
+                        # Both axes are shifted by 160 px. The permitted span
+                        # loses 320 px relative to the centered composition.
+                        reference_zoom = min(zoom, 100) * (available - 320) / available
                         centered = compose_item(self.item, ItemAdjust(
-                            layout=mode, zoom=zoom, rotation=rotation))
+                            layout=mode, zoom=reference_zoom, rotation=rotation))
                         shifted = compose_item(self.item, ItemAdjust(
                             layout=mode, zoom=zoom, x=x, y=y, rotation=rotation))
-                        self.assertEqual(
-                            sum(a > 0 for a in centered.getchannel('A').tobytes()),
-                            sum(a > 0 for a in shifted.getchannel('A').tobytes()))
-                        margin = round(500 * (.05 if mode == ITEM_MODES[0] else .018))
+                        ref_alpha = centered.getchannel('A')
+                        moved_alpha = shifted.getchannel('A')
+                        ref_box, moved_box = ref_alpha.getbbox(), moved_alpha.getbbox()
+                        self.assertIsNotNone(moved_box)
+                        # Identical fitted geometry except for one-pixel rounding.
+                        for axis in (0, 1):
+                            self.assertLessEqual(abs((ref_box[axis+2] - ref_box[axis]) -
+                                                     (moved_box[axis+2] - moved_box[axis])), 1)
+                        ref_area = sum(a > 0 for a in ref_alpha.tobytes())
+                        moved_area = sum(a > 0 for a in moved_alpha.tobytes())
+                        self.assertAlmostEqual(moved_area, ref_area, delta=max(10, ref_area * .08))
                         for rendered in (centered, shifted):
                             left, top, right, bottom = rendered.getchannel('A').getbbox()
                             self.assertGreaterEqual(left, margin - 1)
@@ -135,7 +166,9 @@ class NoClipTests(unittest.TestCase):
         img = Image.new('RGBA', (100, 100))
         img.putpixel((1, 40), (200, 100, 60, 1))
         img.putpixel((99, 60), (200, 100, 60, 2))
-        self.assertEqual(_subject_bbox(img), (0, 38, 100, 63))
+        self.assertEqual(_subject_bbox(img, clean_noise=False), (0, 38, 100, 63))
+        rotated = compose_item(img, ItemAdjust(rotation=90, clean_noise=False))
+        self.assertIsNotNone(rotated.getchannel('A').getbbox())
 
 
 if __name__=='__main__':
