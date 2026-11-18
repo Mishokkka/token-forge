@@ -63,29 +63,94 @@ def shortcut_arguments(entry, flag):
     return f'"{entry}" {flag}'
 
 
+# Use the documented Unicode Shell Link interface rather than WScript's
+# automation wrapper, which can misread links with non-ANSI filenames.
+SHELL_LINK_TYPE = r"""
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"),
+ InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IShellLinkW {
+    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path,
+                 int size, IntPtr findData, uint flags);
+    void GetIDList(out IntPtr idList);
+    void SetIDList(IntPtr idList);
+    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder name, int size);
+    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);
+    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder dir, int size);
+    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string dir);
+    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder args, int size);
+    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string args);
+    void GetHotkey(out short key);
+    void SetHotkey(short key);
+    void GetShowCmd(out int command);
+    void SetShowCmd(int command);
+    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int size, out int index);
+    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+    void Resolve(IntPtr window, uint flags);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+}
+public static class TokenForgeShellLink {
+    static object Create() {
+        return Activator.CreateInstance(Type.GetTypeFromCLSID(
+            new Guid("00021401-0000-0000-C000-000000000046")));
+    }
+    public static void Write(string file, string target, string args, string dir, string owner) {
+        object instance = Create();
+        try {
+            IShellLinkW link = (IShellLinkW)instance;
+            link.SetPath(target);
+            link.SetArguments(args);
+            link.SetWorkingDirectory(dir);
+            link.SetDescription(owner);
+            ((IPersistFile)instance).Save(file, true);
+        } finally {
+            Marshal.FinalReleaseComObject(instance);
+        }
+    }
+    public static string[] Read(string file) {
+        object instance = Create();
+        try {
+            ((IPersistFile)instance).Load(file, 0);
+            IShellLinkW link = (IShellLinkW)instance;
+            var desc = new StringBuilder(32768);
+            var path = new StringBuilder(32768);
+            var args = new StringBuilder(32768);
+            link.GetDescription(desc, desc.Capacity);
+            link.GetPath(path, path.Capacity, IntPtr.Zero, 4);
+            link.GetArguments(args, args.Capacity);
+            return new string[] {desc.ToString(), path.ToString(), args.ToString()};
+        } finally {
+            Marshal.FinalReleaseComObject(instance);
+        }
+    }
+}
+"""
+
+
+def _shell_link(script, **variables):
+    return _powershell("Add-Type -TypeDefinition @'\n" + SHELL_LINK_TYPE +
+                       "\n'@\n" + script, **variables)
+
+
 def _write_shortcut(path, pythonw, entry, flag):
-    _powershell(r"""
-$s = New-Object -ComObject WScript.Shell
-$l = $s.CreateShortcut($env:TF_LINK)
-$l.TargetPath = $env:TF_TARGET
-$l.Arguments = $env:TF_ARGS
-$l.WorkingDirectory = $env:TF_DIR
-$l.Description = $env:TF_OWNER
-$l.Save()
+    _shell_link(r"""
+[TokenForgeShellLink]::Write($env:TF_LINK, $env:TF_TARGET, $env:TF_ARGS, $env:TF_DIR, $env:TF_OWNER)
 """, LINK=path, TARGET=pythonw, ARGS=shortcut_arguments(entry, flag),
         DIR=entry.parent, OWNER=LINK_OWNER)
 
 
 def _shortcut_metadata(path):
-    # PowerShell object output, rather than Console.WriteLine overloads,
-    # is consistently captured by the host in CI and desktop sessions.
-    data = _powershell(r"""
-$s = New-Object -ComObject WScript.Shell
-$l = $s.CreateShortcut($env:TF_LINK)
+    data = _shell_link(r"""
+$result = [TokenForgeShellLink]::Read($env:TF_LINK)
 [pscustomobject]@{
-    description = [string]$l.Description
-    target = [string]$l.TargetPath
-    arguments = [string]$l.Arguments
+    description = $result[0]
+    target = $result[1]
+    arguments = $result[2]
 } | ConvertTo-Json -Compress
 """, LINK=path)
     return json.loads(data)
