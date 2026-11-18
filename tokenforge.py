@@ -86,7 +86,7 @@ class TokenForge:
             if not isinstance(self.settings.get(name), dict):
                 self.settings[name] = {}
         self.folder = None
-        self.frame_path = Path(self.settings.get('ring', str(BASE / 'RingT.png')))
+        self.frame_path = Path(self.settings.get('ring') or BASE / 'RingT.png')
         self.frame = None
         self.interior = None
         self.files = []
@@ -100,6 +100,11 @@ class TokenForge:
         self.running_batch = False
         self.preview_pending = False
         self.pending_export = None
+        self.preview_generation = 0
+        self.preview_cached_only = False
+        self.worker = None
+        self.closing = False
+        self.widget_values = {}
         self.cancel_event = threading.Event()
         self.events = queue.Queue()
         self.sliders_updating = False
@@ -108,7 +113,8 @@ class TokenForge:
         self.model = tk.StringVar(value=self.settings.get('model', MODELS[0]))
         self.edge_mode = tk.StringVar(value=self.settings.get('edge_mode', EDGE_MODES[0]))
         self.show_cutout = tk.BooleanVar(value=False)
-        self.size = tk.StringVar(value=str(self.settings.get('size', 256)))
+        saved_size = str(self.settings.get('size', 256))
+        self.size = tk.StringVar(value=saved_size if saved_size in ('256', '512', '1024') else '256')
         self.ext = tk.StringVar(value=self.settings.get('ext', 'webp'))
         self.keep_alpha = tk.BooleanVar(value=self.settings.get('keep_alpha', True))
         self.skip_exists = tk.BooleanVar(value=self.settings.get('skip_exists', True))
@@ -151,6 +157,7 @@ class TokenForge:
                 self._set_folder(Path(last_folder))
         self._settings_baseline = self._settings_snapshot()
         self.root.after(120, self._poll)
+        self.root.after(2500, self._watch_source)
         if DND_FILES is not None:
             for widget in (self.root, self.file_list):
                 widget.drop_target_register(DND_FILES)
@@ -234,7 +241,7 @@ class TokenForge:
             ('Вертикаль, %', self.y, -120, 120),
             ('Отступ над головой, %', self.gap, -20, 50),
         ]
-        for title, var, low, high in fields:
+        for (title, var, low, high), name in zip(fields, ('zoom', 'x', 'y', 'gap')):
             field = tk.Frame(self.token_controls, bg=PANEL)
             field.pack(fill='x', pady=(0, 1))
             tk.Label(field, text=title, bg=PANEL, fg=FG, font=('Segoe UI', 9),
@@ -242,7 +249,8 @@ class TokenForge:
             slider = tk.Scale(field, from_=low, to=high, orient='horizontal', variable=var,
                               resolution=1, showvalue=True, length=108,
                               bg=PANEL, fg=FG, troughcolor=INPUT, highlightthickness=0,
-                              activebackground=BLUE, borderwidth=0, command=self._on_adjust)
+                              activebackground=BLUE, borderwidth=0,
+                              command=lambda value, field=name: self._on_adjust(field))
             slider.pack(side='left', fill='x', expand=True)
 
         options = tk.Frame(self.token_controls, bg=PANEL)
@@ -268,7 +276,7 @@ class TokenForge:
         layout_box = ttk.Combobox(layout_row, values=list(ITEM_MODES), textvariable=self.item_layout,
                                   state='readonly', width=18)
         layout_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
-        layout_box.bind('<<ComboboxSelected>>', lambda e: self._on_item_adjust())
+        layout_box.bind('<<ComboboxSelected>>', lambda e: self._on_item_adjust('layout'))
         default_row = tk.Frame(self.item_controls, bg=PANEL)
         default_row.pack(fill='x', pady=(0, 5))
         self._label(default_row, 'Для новых артов:', font=('Segoe UI', 9)).pack(side='left')
@@ -276,11 +284,11 @@ class TokenForge:
                                    textvariable=self.default_item_layout, state='readonly', width=16)
         default_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
         default_box.bind('<<ComboboxSelected>>', lambda e: self._on_default_item_layout_change())
-        for title, var, low, high in [
-            ('Масштаб, %', self.item_zoom, 10, 100),
-            ('Горизонталь, %', self.item_x, -100, 100),
-            ('Вертикаль, %', self.item_y, -100, 100),
-            ('Поворот, °', self.item_rotation, -180, 180),
+        for name, title, var, low, high in [
+            ('zoom', 'Масштаб, %', self.item_zoom, 10, 100),
+            ('x', 'Горизонталь, %', self.item_x, -100, 100),
+            ('y', 'Вертикаль, %', self.item_y, -100, 100),
+            ('rotation', 'Поворот, °', self.item_rotation, -180, 180),
         ]:
             row = tk.Frame(self.item_controls, bg=PANEL)
             row.pack(fill='x', pady=(0, 1))
@@ -290,16 +298,16 @@ class TokenForge:
                      resolution=1, showvalue=False, length=108, width=10, sliderlength=17,
                      bg=PANEL, fg=FG, troughcolor=INPUT, highlightthickness=0,
                      activebackground=BLUE, borderwidth=0,
-                     command=self._on_item_adjust).pack(side='left', fill='x', expand=True)
+                     command=lambda value, field=name: self._on_item_adjust(field)).pack(side='left', fill='x', expand=True)
             tk.Label(row, textvariable=var, bg=PANEL, fg=FG, width=5,
                      font=('Segoe UI', 9)).pack(side='right')
-        for title, value in [
-            ('Отразить по горизонтали', self.item_flip_horizontal),
-            ('Отразить по вертикали', self.item_flip_vertical),
-            ('Игнорировать почти прозрачный мусор', self.item_clean_noise),
+        for name, title, value in [
+            ('flip_horizontal', 'Отразить по горизонтали', self.item_flip_horizontal),
+            ('flip_vertical', 'Отразить по вертикали', self.item_flip_vertical),
+            ('clean_noise', 'Игнорировать почти прозрачный мусор', self.item_clean_noise),
         ]:
             tk.Checkbutton(self.item_controls, text=title, variable=value,
-                           command=self._on_item_adjust, bg=PANEL, fg=FG,
+                           command=lambda field=name: self._on_item_adjust(field), bg=PANEL, fg=FG,
                            activebackground=PANEL, activeforeground=FG,
                            selectcolor=INPUT, highlightthickness=0,
                            font=('Segoe UI', 9)).pack(anchor='w')
@@ -389,8 +397,11 @@ class TokenForge:
         for p in self.files:
             self.file_list.insert(tk.END, p.name)
         self.status.set(f'Исходных артов: {len(self.files)}. Результаты сохраняются рядом с оригиналами.')
-        if self.files:
-            selected_path = select_path if select_path in self.files else self.files[0]
+        if select_path is not None and select_path not in self.files:
+            self._clear_selection()
+            self.status.set(f'Не удалось открыть {select_path.name}: файл недоступен или исключён как рамка.')
+        elif self.files:
+            selected_path = select_path if select_path is not None else self.files[0]
             index = self.files.index(selected_path)
             self.file_list.selection_set(index)
             self.file_list.see(index)
@@ -406,8 +417,11 @@ class TokenForge:
         if filename:
             try:
                 self._set_frame(Path(filename))
-                if self.selected and self.current_cutout is not None:
-                    self._render()
+                if self.selected:
+                    if self.current_cutout is not None:
+                        self._render()
+                    else:
+                        self._request_preview()
                 self._schedule_save()
             except Exception as exc:
                 messagebox.showerror('Ошибка рамки', str(exc))
@@ -451,6 +465,8 @@ class TokenForge:
         stored = self.settings.get('item_overrides', {}).get(str(self.selected.resolve()), {}) if self.selected else {}
         if self.selected is None or not isinstance(stored, dict) or 'layout' not in stored:
             self.item_layout.set(self.default_item_layout.get())
+            if 'item_overrides' in self.widget_values:
+                self.widget_values['item_overrides']['layout'] = self.item_layout.get()
             if self.selected is not None:
                 if self.current_cutout is not None:
                     self._render()
@@ -466,17 +482,15 @@ class TokenForge:
                           flip_vertical=self.item_flip_vertical.get(),
                           clean_noise=self.item_clean_noise.get())
 
-    def _on_item_adjust(self, _value=None):
-        if self.sliders_updating:
+    def _on_item_adjust(self, field):
+        if self.closing or self.sliders_updating or self.selected is None:
             return
-        if self.selected is not None:
-            adj = self._current_item_adjust()
-            self._record_adjustment('item_overrides', self.selected, adj, self._item_adjust_for(self.selected))
+        if self._record_adjustment('item_overrides', self.selected, self._current_item_adjust(), field):
+            self._schedule_save()
             if self.current_cutout is not None:
                 self._render()
             else:
                 self._request_preview()
-        self._schedule_save()
 
     def _adjust_for(self, path):
         stored = self.settings.get('overrides', {}).get(str(path.resolve()), {})
@@ -484,19 +498,22 @@ class TokenForge:
             stored = {}
         return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
 
-    def _record_adjustment(self, name, path, adjusted, previous):
-        # Persist only fields actually changed, so two windows editing different
-        # controls on the same art do not overwrite each other's adjustments.
-        delta = {key: value for key, value in vars(adjusted).items()
-                 if value != vars(previous)[key]}
-        if not delta:
-            return
+    def _record_adjustment(self, name, path, adjusted, field):
+        # Tk can clamp old values while loading a selection. Treat only the
+        # edited widget as a local setting change, never other clamped values.
+        value = vars(adjusted)[field]
+        snapshot = self.widget_values.setdefault(name, {})
+        if field in snapshot and snapshot[field] == value:
+            return False
+        snapshot[field] = value
         mapping = self.settings.setdefault(name, {})
         path_key = str(path.resolve())
         stored = mapping.get(path_key)
-        mapping[path_key] = {**(stored if isinstance(stored, dict) else {}), **delta}
+        mapping[path_key] = {**(stored if isinstance(stored, dict) else {}), field: value}
+        return True
 
     def _clear_selection(self):
+        self.preview_generation += 1
         self.selected = None
         self.current_cutout = None
         self.current_key = None
@@ -505,6 +522,9 @@ class TokenForge:
         self._show_token(None)
 
     def _select(self, path):
+        if self.closing:
+            return
+        self.preview_generation += 1
         self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
@@ -523,25 +543,15 @@ class TokenForge:
         self.item_flip_horizontal.set(item.flip_horizontal)
         self.item_flip_vertical.set(item.flip_vertical)
         self.item_clean_noise.set(item.clean_noise)
+        self.widget_values = {'overrides': vars(self._current_adjust()),
+                              'item_overrides': vars(self._current_item_adjust())}
         self.sliders_updating = False
         self.current_cutout = None
         self.current_key = None
         has_token = self._show_saved_token(path)
-        model, edge = self.model.get(), self.edge_mode.get()
-        keep = self.keep_alpha.get()
-        try:
-            key = self._cache_key(path, model, keep, edge)
-            has_cached_cutout = (key in self.cache or
-                                 self.disk_cache.path_for(path, model, keep, edge, identity=key[:4]).is_file())
-        except OSError:
-            self.status.set(f'Исходный файл недоступен: {path.name}')
-            return
-        # Navigating existing tokens should not waste time running the AI.
-        # Extract only when the user begins editing or requests the raw cutout.
-        if not has_token or has_cached_cutout:
-            self._request_preview()
-        else:
-            self.status.set(f'Готовый токен: {path.name}. Для редактирования измени ползунок.')
+        # Show an existing result immediately, but probe the content-addressed
+        # cache in the worker. Raw-cutout mode always requests extraction.
+        self._request_preview(cached_only=has_token and not self.show_cutout.get())
 
     def _show_saved_token(self, source: Path):
         # Show the finished token immediately; full editable cutout is loaded
@@ -558,7 +568,7 @@ class TokenForge:
                         existing.load()
                         self._show_token(existing.convert('RGBA'))
                     return True
-                except (OSError, ValueError):
+                except (OSError, ValueError, Image.DecompressionBombError):
                     pass
         self._show_token(None)
         return False
@@ -566,16 +576,15 @@ class TokenForge:
     def _current_adjust(self):
         return Adjust(self.zoom.get(), self.x.get(), self.y.get(), self.gap.get())
 
-    def _on_adjust(self, _value=None):
-        if self.sliders_updating or self.selected is None:
+    def _on_adjust(self, field):
+        if self.closing or self.sliders_updating or self.selected is None:
             return
-        adj = self._current_adjust()
-        self._record_adjustment('overrides', self.selected, adj, self._adjust_for(self.selected))
-        self._schedule_save()
-        if self.current_cutout is not None:
-            self._render()
-        else:
-            self._request_preview()
+        if self._record_adjustment('overrides', self.selected, self._current_adjust(), field):
+            self._schedule_save()
+            if self.current_cutout is not None:
+                self._render()
+            else:
+                self._request_preview()
 
     def _on_show_cutout(self):
         if self.current_cutout is not None:
@@ -596,6 +605,7 @@ class TokenForge:
     def _on_model_change(self):
         self._schedule_save()
         if self.selected:
+            self.preview_generation += 1
             self.current_cutout = None
             self.current_key = None
             self._request_preview()
@@ -603,8 +613,8 @@ class TokenForge:
     def _cache_key(self, path, model, keep_alpha, edge_mode):
         return (*source_identity(path), model, keep_alpha, edge_mode)
 
-    def _get_cutout(self, path, model, keep_alpha, edge_mode):
-        key = self._cache_key(path, model, keep_alpha, edge_mode)
+    def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False):
+        key = key if key is not None else self._cache_key(path, model, keep_alpha, edge_mode)
         identity = key[:4]
         if key in self.cache:
             assert_source_identity(path, identity)
@@ -612,6 +622,9 @@ class TokenForge:
         # Disk cache is checked before reading original and loading AI model.
         cutout = self.disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity)
         if cutout is None:
+            if cached_only:
+                assert_source_identity(path, identity)
+                return None, key
             original = read_image(path)
             assert_source_identity(path, identity)
             if keep_alpha and already_transparent(original):
@@ -633,23 +646,53 @@ class TokenForge:
                 self.cache.pop(oldest)
         return cutout, key
 
-    def _request_preview(self):
-        if not self.selected or (self.work_mode.get() == 'token' and self.frame is None):
+    def _preview_request(self):
+        return (self.preview_generation, self.selected, self.model.get(),
+                self.keep_alpha.get(), self.edge_mode.get())
+
+    def _request_preview(self, *, cached_only=False, verify=False):
+        if self.closing or not self.selected:
+            return
+        if self.work_mode.get() == 'token' and self.frame is None and not self.show_cutout.get():
             return
         if self.busy:
-            self.preview_pending = True
+            if not verify:
+                # A requested full extraction must supersede a cache-only probe.
+                self.preview_cached_only = cached_only if not self.preview_pending else (
+                    self.preview_cached_only and cached_only)
+                self.preview_pending = True
             return
-        path, model, keep_alpha, edge_mode = self.selected, self.model.get(), self.keep_alpha.get(), self.edge_mode.get()
+        request = self._preview_request()
+        _, path, model, keep_alpha, edge_mode = request
+        previous = self.current_key if verify else None
         self.busy = True
-        self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
+        if not verify:
+            self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
 
         def work():
             try:
-                img, key = self._get_cutout(path, model, keep_alpha, edge_mode)
-                self.events.put(('preview', (path, img, key)))
+                key = self._cache_key(path, model, keep_alpha, edge_mode)
+                if verify and key == previous:
+                    self.events.put(('preview_unchanged', request))
+                    return
+                if verify:
+                    self.events.put(('preview_invalidated', request))
+                img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
+                                            key=key, cached_only=cached_only)
+                self.events.put(('preview', (request, img, key)))
             except Exception as exc:
-                self.events.put(('error', (path, model, keep_alpha, edge_mode, f'{path.name}: {exc}')))
-        threading.Thread(target=work, daemon=True).start()
+                self.events.put(('error', (request, f'{path.name}: {exc}')))
+        self.worker = threading.Thread(target=work, daemon=False)
+        self.worker.start()
+
+    def _watch_source(self):
+        # Hash periodically in the existing worker, not on every slider event.
+        # This also detects same-size, same-timestamp edits on a network share.
+        if self.closing:
+            return
+        if self.current_cutout is not None and not self.busy:
+            self._request_preview(verify=True)
+        self.root.after(2500, self._watch_source)
 
     def _render(self):
         if self.current_cutout is None:
@@ -707,6 +750,8 @@ class TokenForge:
         self._start_export(fresh_files)
 
     def _start_export(self, image_files, force_overwrite=False, requested_mode=None):
+        if self.closing:
+            return
         if not self.folder or not image_files:
             messagebox.showinfo('Нет изображений', 'Сначала выбери папку с артами.')
             return
@@ -744,8 +789,10 @@ class TokenForge:
                         'Это может быть старый токен или отдельный арт. Заменить его?'):
                     return
                 approved_outputs[destination] = identity
+        expected_input = (self.current_key[:4] if force_overwrite and self.current_key is not None
+                          and files == [self.selected] else None)
         request = (files, mode, model, keep, edge_mode, ext, size, skip,
-                   convert, frame, interior, adjustments, approved_outputs)
+                   convert, frame, interior, adjustments, approved_outputs, expected_input)
         if self.busy:
             self.pending_export = request
             self.status.set(f'В очереди: {len(files)} артов. Начнётся после текущего предпросмотра.')
@@ -754,7 +801,7 @@ class TokenForge:
 
     def _run_export(self, request):
         (files, mode, model, keep, edge_mode, ext, size, skip,
-         convert, frame, interior, adjustments, approved_outputs) = request
+         convert, frame, interior, adjustments, approved_outputs, expected_input) = request
         self.busy = True
         self.running_batch = True
         self.cancel_event.clear()
@@ -764,7 +811,11 @@ class TokenForge:
         def work():
             try:
                 def get_cutout(path):
+                    if expected_input is not None:
+                        assert_source_identity(path, expected_input)
                     image, key = self._get_cutout(path, model, keep, edge_mode)
+                    if expected_input is not None and key[:4] != expected_input:
+                        raise OSError(f'Исходный файл изменился во время обработки: {path.name}')
                     return LoadedCutout(image, key[:4])
                 progress = lambda i, n, msg: self.events.put(('progress', (i, n, msg)))
                 if mode == 'item':
@@ -781,17 +832,22 @@ class TokenForge:
                 self.events.put(('done', result))
             except Exception as exc:
                 self.events.put(('batch_failure', traceback.format_exc()))
-        threading.Thread(target=work, daemon=True).start()
+        self.worker = threading.Thread(target=work, daemon=False)
+        self.worker.start()
 
     def _after_preview(self):
         """Prioritize queued exports over another potentially slow preview."""
+        if self.closing:
+            return
         if self.pending_export is not None:
             request = self.pending_export
             self.pending_export = None
             self._run_export(request)
         elif self.preview_pending:
             self.preview_pending = False
-            self._request_preview()
+            cached_only = self.preview_cached_only
+            self.preview_cached_only = False
+            self._request_preview(cached_only=cached_only)
 
     def _cancel(self):
         if self.running_batch:
@@ -805,34 +861,41 @@ class TokenForge:
         try:
             while True:
                 action, data = self.events.get_nowait()
-                if action == 'preview':
-                    path, img, key = data
+                if self.closing:
+                    continue
+                if action == 'preview_invalidated':
+                    if data == self._preview_request():
+                        self.current_cutout = None
+                        self.current_key = None
+                        self._show_token(None)
+                        self.status.set('Исходник изменился. Обновляю предпросмотр…')
+                elif action == 'preview_unchanged':
                     self.busy = False
-                    try:
-                        matches = path == self.selected and key == self._cache_key(
-                            path, self.model.get(), self.keep_alpha.get(), self.edge_mode.get())
-                    except OSError:
-                        matches = False
-                    if matches:
-                        self.current_cutout = img
-                        self.current_key = key
-                        self.preview_pending = False
-                        if self._render():
-                            self.status.set(f'Готово: {path.name}. Отрегулируй положение или экспортируй.')
-                    else:
-                        if not self.selected or not self.selected.is_file():
+                    self._after_preview()
+                elif action == 'preview':
+                    request, img, key = data
+                    self.busy = False
+                    if request == self._preview_request():
+                        if img is not None:
+                            self.current_cutout = img
+                            self.current_key = key
+                            # This cutout satisfies a pending full extraction too.
                             self.preview_pending = False
-                            self.status.set(f'Исходный файл недоступен: {path.name}')
-                        elif path == self.selected:
-                            self.preview_pending = True
+                            if self._render():
+                                self.status.set(f'Готово: {self.selected.name}. Отрегулируй положение или экспортируй.')
+                        else:
+                            self.status.set(f'Готовый результат: {self.selected.name}. Для редактирования измени ползунок.')
                     self._after_preview()
                 elif action == 'error':
                     self.busy = False
-                    path, model, keep, edge, error = data
-                    if ((path, model, keep, edge) ==
-                            (self.selected, self.model.get(), self.keep_alpha.get(), self.edge_mode.get())):
+                    request, error = data
+                    if request == self._preview_request():
+                        self.current_cutout = None
+                        self.current_key = None
+                        self._show_token(None)
                         self.status.set('Ошибка: ' + error)
-                        messagebox.showerror('Ошибка обработки', error)
+                        if not self.preview_pending:
+                            messagebox.showerror('Ошибка обработки', error)
                     self._after_preview()
                 elif action == 'progress':
                     n, total, text = data
@@ -843,6 +906,7 @@ class TokenForge:
                     self.running_batch = False
                     report = (f'Создано: {data.created}. Пропущено: {data.skipped}. '
                               f'Артов в WebP: {data.converted}. Ошибок: {len(data.errors)}. '
+                              f'Предупреждений: {len(data.warnings)}. '
                               f'Всего исходников: {data.total}.')
                     if data.cancelled:
                         report = 'Остановлено. ' + report
@@ -852,8 +916,9 @@ class TokenForge:
                                     [token_output_path(self.selected, ext) for ext in ('webp', 'png')])
                         if any(path in expected for path in data.outputs):
                             self._show_saved_token(self.selected)
-                    if data.errors:
-                        messagebox.showwarning('Отчёт об ошибках', report + '\n\n' + '\n'.join(data.errors[:15]))
+                    messages = data.errors + data.warnings
+                    if messages:
+                        messagebox.showwarning('Отчёт обработки', report + '\n\n' + '\n'.join(messages[:15]))
                     self._after_preview()
                 elif action == 'batch_failure':
                     self.busy = False
@@ -864,9 +929,14 @@ class TokenForge:
         except queue.Empty:
             pass
         finally:
-            self.root.after(120, self._poll)
+            if self.closing and (self.worker is None or not self.worker.is_alive()):
+                self.root.destroy()
+            else:
+                self.root.after(120, self._poll)
 
     def _schedule_save(self):
+        if self.closing:
+            return
         if self.save_timer:
             self.root.after_cancel(self.save_timer)
         self.save_timer = self.root.after(500, self._save)
@@ -901,11 +971,22 @@ class TokenForge:
             return False
 
     def _on_close(self):
+        if self.closing:
+            return
+        if self.save_timer:
+            self.root.after_cancel(self.save_timer)
+            self.save_timer = None
         if not self._save():
             if not messagebox.askyesno('Настройки не сохранены', 'Закрыть программу без сохранения изменений?'):
                 return
+        self.closing = True
+        self.pending_export = None
+        self.preview_pending = False
         self.cancel_event.set()
-        self.root.destroy()
+        if self.worker is None or not self.worker.is_alive():
+            self.root.destroy()
+        else:
+            self.status.set('Завершение текущей операции и очистка временных файлов…')
 
     def run(self):
         self.root.mainloop()

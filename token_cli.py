@@ -22,7 +22,7 @@ LOG_FILE = PREFS_DIR / 'context_actions.log'
 
 
 def read_settings() -> dict:
-    return read_settings_file(PREFS_FILE)
+    return read_settings_file(PREFS_FILE, strict=True)
 
 
 def resolve_context_source(filename: str | Path) -> Path:

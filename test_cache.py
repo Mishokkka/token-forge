@@ -80,6 +80,13 @@ class CacheTests(unittest.TestCase):
         app.disk_cache = self.cache
         app.cache = {}
         app.sessions = {}
+        app.current_key = None
+        app.current_cutout = None
+        app.closing = False
+        app.worker = None
+        app.preview_generation = 0
+        app.preview_cached_only = False
+        app.widget_values = {}
         return app
 
     def test_reuses_disk_without_neural_model_after_restart(self):
@@ -210,7 +217,7 @@ class CacheTests(unittest.TestCase):
         self.assertIsNone(app.pending_export)
         app._request_preview = Mock()
         app._after_preview()
-        app._request_preview.assert_called_once()
+        app._request_preview.assert_called_once_with(cached_only=False)
 
     def test_deleted_preview_source_does_not_stop_event_polling(self):
         import queue
@@ -228,8 +235,12 @@ class CacheTests(unittest.TestCase):
         app.edge_mode = SimpleNamespace(get=lambda: 'e')
         key = app._cache_key(self.source, 'm', False, 'e')
         self.source.unlink()
-        app.events.put(('preview', (self.source, Image.new('RGBA', (1, 1)), key)))
-        app._poll()
+        request = app._preview_request()
+        app.preview_generation += 1
+        app.selected = None
+        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key)))
+        with patch.object(app, '_cache_key', side_effect=AssertionError('GUI hashed source')):
+            app._poll()
         self.assertFalse(app.busy)
         self.assertFalse(app.preview_pending)
         app.root.after.assert_called_once_with(120, app._poll)
@@ -265,11 +276,75 @@ class CacheTests(unittest.TestCase):
         app.keep_alpha = SimpleNamespace(get=lambda: False)
         app.edge_mode = SimpleNamespace(get=lambda: 'e')
         app._request_preview = Mock()
-        app.events.put(('error', (self.source, 'm', False, 'e', 'old failure')))
+        app.events.put(('error', ((0, self.source, 'm', False, 'e'), 'old failure')))
         with patch('tokenforge.messagebox.showerror') as error:
             app._poll()
             error.assert_not_called()
-        app._request_preview.assert_called_once()
+        app._request_preview.assert_called_once_with(cached_only=False)
+
+    def test_clamped_widget_does_not_overwrite_unedited_setting(self):
+        from item_engine import ItemAdjust
+        app = self.make_mock_app()
+        name = str(self.source.resolve())
+        app.settings = {'item_overrides': {name: {'zoom': 140}}}
+        app.widget_values = {'item_overrides': vars(ItemAdjust(zoom=100))}
+        self.assertTrue(app._record_adjustment('item_overrides', self.source,
+                                             ItemAdjust(zoom=100, x=20), 'x'))
+        self.assertEqual(app.settings['item_overrides'][name], {'zoom': 140, 'x': 20})
+        self.assertTrue(app._record_adjustment('item_overrides', self.source,
+                                             ItemAdjust(zoom=90, x=20), 'zoom'))
+        self.assertEqual(app.settings['item_overrides'][name]['zoom'], 90)
+
+    def test_preview_verification_runs_only_in_worker(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        app.status = Mock()
+        app.selected = self.source
+        app.frame = object()
+        app.busy = False
+        app.preview_pending = False
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'model': 'm',
+                            'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        app.current_cutout = read_image(self.source)
+        app.current_key = app._cache_key(self.source, 'm', True, 'e')
+        Image.new('RGBA', (171, 220), (255, 0, 0, 200)).save(self.source)
+        worker = Mock()
+        with patch('tokenforge.threading.Thread', return_value=worker) as launch, \
+             patch.object(app, '_cache_key', wraps=app._cache_key) as hash_source:
+            app._request_preview(verify=True)
+            hash_source.assert_not_called()
+            launch.call_args.kwargs['target']()
+            hash_source.assert_called_once()
+        self.assertEqual(app.events.get()[0], 'preview_invalidated')
+        event = app.events.get()
+        self.assertEqual(event[0], 'preview')
+        self.assertNotEqual(event[1][2], app.current_key)
+
+    def test_close_waits_for_export_worker_and_discards_queue(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.root, app.status, app.worker = Mock(), Mock(), Mock()
+        app.worker.is_alive.side_effect = [True, True, False]
+        app.events = queue.Queue()
+        app.save_timer = None
+        app.cancel_event = threading.Event()
+        app.pending_export = object()
+        app.preview_pending = True
+        app._save = Mock(return_value=True)
+        app._on_close()
+        self.assertTrue(app.closing)
+        self.assertTrue(app.cancel_event.is_set())
+        self.assertIsNone(app.pending_export)
+        app.root.destroy.assert_not_called()
+        app._poll()
+        app.root.destroy.assert_not_called()
+        app._poll()
+        app.root.destroy.assert_called_once()
 
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)

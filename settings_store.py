@@ -20,7 +20,11 @@ def read_settings_file(path: Path, *, strict=False) -> dict:
         if strict:
             raise
         return {}
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict):
+        return data
+    if strict:
+        raise ValueError('Файл настроек должен содержать JSON-объект.')
+    return {}
 
 
 @contextmanager

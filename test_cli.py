@@ -198,6 +198,15 @@ class CliTests(unittest.TestCase):
             auto.assert_called_once_with(str(self.photo), item=False)
             gui.assert_not_called()
 
+    def test_invalid_settings_prevent_automatic_publication(self):
+        settings = self.pref / 'settings.json'
+        for value in ('null', '[]', '{invalid'):
+            settings.write_text(value, encoding='utf-8')
+            for action in (token_cli.automatic_token, token_cli.automatic_item):
+                with self.assertRaises(ValueError):
+                    action(self.photo)
+        self.assertEqual(list(self.art_folder.iterdir()), [self.photo])
+
     def test_invalid_file_is_rejected(self):
         with self.assertRaises(FileNotFoundError):
             token_cli.automatic_token(self.art_folder / 'нет.png')

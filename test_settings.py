@@ -20,6 +20,11 @@ class SettingsTests(unittest.TestCase):
             for value in (None, [], 8):
                 path.write_text(json.dumps(value), encoding='utf-8')
                 self.assertEqual(read_settings_file(path), {})
+                with self.assertRaises(ValueError):
+                    read_settings_file(path, strict=True)
+                with self.assertRaises(ValueError):
+                    save_settings_delta(path, {}, {'size': 256})
+                self.assertEqual(json.loads(path.read_text(encoding='utf-8')), value)
 
     def test_unchanged_close_and_independent_edits(self):
         with tempfile.TemporaryDirectory() as d:
@@ -46,18 +51,20 @@ class SettingsTests(unittest.TestCase):
             start = ctx.Event()
             a = ctx.Process(target=write_from_process, args=(path, 'size', 512, {'same': {'x': 12}}, start))
             b = ctx.Process(target=write_from_process, args=(path, 'ext', 'png', {'same': {'y': 23}}, start))
-            for proc in (a, b):
-                proc.start()
-            start.set()
+            started = []
             try:
                 for proc in (a, b):
+                    proc.start()
+                    started.append(proc)
+                start.set()
+                for proc in started:
                     proc.join(10)
                     self.assertEqual(proc.exitcode, 0)
             finally:
-                for proc in (a, b):
+                for proc in started:
                     if proc.is_alive():
                         proc.terminate()
-                        proc.join()
+                    proc.join()
             self.assertEqual(read_settings_file(path), {'size': 512, 'ext': 'png',
                 'overrides': {'same': {'x': 12, 'y': 23}}})
 
