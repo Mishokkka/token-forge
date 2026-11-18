@@ -28,13 +28,19 @@ def source_identity(source: Path) -> tuple:
     resolved = Path(source).resolve()
     def signature(info):
         return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    path_before = resolved.stat()
     with resolved.open('rb') as stream:
         before = os.fstat(stream.fileno())
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
         after = os.fstat(stream.fileno())
-    if signature(before) != signature(after) or signature(after) != signature(resolved.stat()):
+        path_after = resolved.stat()
+    # On Windows fstat and stat need not expose identical inode/device IDs.
+    # Compare each representation with its own earlier snapshot.
+    if (signature(before) != signature(after)
+            or signature(path_before) != signature(path_after)
+            or (after.st_size, after.st_mtime_ns) != (path_after.st_size, path_after.st_mtime_ns)):
         raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
-    return str(resolved), after.st_size, after.st_mtime_ns, digest
+    return str(resolved), path_after.st_size, path_after.st_mtime_ns, digest
 
 
 def assert_source_identity(source: Path, identity: tuple) -> None:
@@ -148,7 +154,7 @@ def square_dilate(mask: Image.Image, radius: int) -> Image.Image:
     for axis in (0, 1):
         covered = 0
         while covered < radius:
-            step = min(2 * covered + 1, radius - covered)
+            step = min(covered + 1, radius - covered)
             combined = result
             for sign in (-1, 1):
                 shifted = Image.new('L', result.size)
@@ -380,14 +386,21 @@ def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
     owner = read_export_owner(destination)
     if not owner or owner[1] != kind:
         return False
-    return owner[2].casefold() == (source.name if owner[0] == 2 else source.stem).casefold()
+    if owner[0] == 2:
+        return owner[2].casefold() == source.name.casefold()
+    if owner[2].casefold() != source.stem.casefold():
+        return False
+    # Old v1 markers lack an extension; resolve only when unambiguous.
+    return not any(p.resolve() != source.resolve()
+                   and p.stem.casefold() == source.stem.casefold()
+                   and read_export_owner(p) is None for p in list_images(source.parent))
 
 
 def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> None:
     # Two independent originals with the same stem have identical output names.
     # A different original may also need destination as its own WebP copy.
-    for candidate in list_source_images(source.parent):
-        if candidate == source:
+    for candidate in list_images(source.parent):
+        if candidate.resolve() == source.resolve():
             continue
         if candidate.resolve() == destination.resolve():
             # An unmarked exact-path conflict is handled by save_generated,
@@ -395,7 +408,7 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> No
             continue
         if (candidate.stem.casefold() == source.stem.casefold()
                 or (destination.suffix.lower() == '.webp'
-                    and candidate.stem.casefold() == destination.stem.casefold())):
+                    and candidate.stem.casefold() == destination.stem.casefold())) and read_export_owner(candidate) is None:
             raise FileExistsError(f'Имя {destination.name} конфликтует с исходником {candidate.name}. '
                                   'Переименуй один из исходников.')
 
@@ -487,6 +500,12 @@ def list_source_images(folder: Path, exclude: Path | None = None) -> list[Path]:
             and read_export_owner(path) is None]
 
 
+@dataclass(frozen=True)
+class LoadedCutout:
+    image: Image.Image
+    identity: tuple
+
+
 @dataclass
 class BatchResult:
     created: int = 0
@@ -534,7 +553,14 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 result.skipped += 1
             else:
                 identity = source_identity(source)
-                cutout = get_cutout(source)
+                loaded = get_cutout(source)
+                if isinstance(loaded, LoadedCutout):
+                    if loaded.identity != identity:
+                        raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+                    cutout = loaded.image
+                    identity = loaded.identity
+                else:
+                    cutout = loaded
                 assert_source_identity(source, identity)
                 image = renderer(cutout, source)
                 if save_generated(image, destination, source, kind, skip_exists=skip_exists,

@@ -88,6 +88,31 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(recovered), 1)
             self.assertEqual(recovered[0].read_bytes(), b'external editor')
 
+    def test_both_exporters_reject_changed_input_during_composition(self):
+        from item_engine import export_items, ItemAdjust, item_output_path
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'Hero.png'
+            for mode in ('token', 'item'):
+                self.figure.save(source)
+                def race(*args):
+                    Image.new('RGBA', (32, 32), 'red').save(source)
+                    return Image.new('RGBA', (256, 256), 'blue')
+                if mode == 'token':
+                    with patch('token_engine.compose', side_effect=race):
+                        result = export_batch([source], read_image, self.frame, self.mask,
+                            {source: Adjust()}, convert_original=False)
+                    dest = token_output_path(source)
+                else:
+                    with patch('item_engine.compose_item', side_effect=race):
+                        result = export_items([source], read_image, {source: ItemAdjust()},
+                                              convert_original=False)
+                    dest = item_output_path(source)
+                self.assertEqual(result.created, 0)
+                self.assertTrue(result.errors)
+                self.assertIn('изменился', result.errors[0])
+                self.assertFalse(dest.exists())
+
     def test_render_shape_and_alpha(self):
         token = compose(self.figure, self.frame, self.mask, 256)
         self.assertEqual(token.size, (256, 256))

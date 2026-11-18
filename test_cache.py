@@ -108,6 +108,7 @@ class CacheTests(unittest.TestCase):
         app.selected = self.source
         app.running_batch = False
         app.busy = False
+        app.pending_export = None
         app.frame = frame
         app.interior = interior
         app.model = SimpleNamespace(get=lambda: 'm')
@@ -159,6 +160,9 @@ class CacheTests(unittest.TestCase):
         app._adjust_for = lambda path: Adjust(zoom=70)
         app._run_export = Mock()
         app._start_export([self.source])
+        original_request = app.pending_export
+        app._start_export([self.source], force_overwrite=True)
+        self.assertIs(app.pending_export, original_request)
         app.ext, app.size = control('png'), control('1024')
         app._adjust_for = lambda path: Adjust(zoom=160)
         app._after_preview()
@@ -192,6 +196,43 @@ class CacheTests(unittest.TestCase):
         self.assertFalse(app.busy)
         self.assertFalse(app.preview_pending)
         app.root.after.assert_called_once_with(120, app._poll)
+
+    def test_unmarked_saved_result_is_not_shown(self):
+        existing = token_output_path(self.source)
+        Image.new('RGBA', (256, 256), 'blue').save(existing)
+        app = self.make_mock_app()
+        app.ext = SimpleNamespace(get=lambda: 'webp')
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        images = []
+        app._show_token = images.append
+        self.assertFalse(app._show_saved_token(self.source))
+        self.assertEqual(images, [None])
+
+    def test_raw_preview_handles_extremely_thin_art(self):
+        img = Image.new('RGBA', (1200, 1), 'red')
+        result = TokenForge._make_cutout_preview(img, 512)
+        self.assertIsNotNone(result.getbbox())
+        self.assertEqual(result.getbbox()[3] - result.getbbox()[1], 1)
+
+    def test_stale_preview_error_does_not_open_dialog(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.root, app.status = Mock(), Mock()
+        app.selected = self.directory / 'New.png'
+        app.events = queue.Queue()
+        app.pending_export = None
+        app.preview_pending = True
+        app.busy = True
+        app.model = SimpleNamespace(get=lambda: 'm')
+        app.keep_alpha = SimpleNamespace(get=lambda: False)
+        app.edge_mode = SimpleNamespace(get=lambda: 'e')
+        app._request_preview = Mock()
+        app.events.put(('error', (self.source, 'm', False, 'e', 'old failure')))
+        with patch('tokenforge.messagebox.showerror') as error:
+            app._poll()
+            error.assert_not_called()
+        app._request_preview.assert_called_once()
 
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)

@@ -8,7 +8,7 @@ if __name__ == '__main__':
     initialize_missing_streams()
 
 import argparse
-import json
+from copy import deepcopy
 import os
 import queue
 import threading
@@ -21,9 +21,10 @@ from PIL import Image, ImageDraw, ImageTk
 from token_engine import (
     Adjust, DiskCutoutCache, already_transparent, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
-    atomic_write, source_identity, assert_source_identity, is_owned_export,
+    source_identity, assert_source_identity, is_owned_export, LoadedCutout,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
+from settings_store import read_settings_file, save_settings_delta
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -47,10 +48,7 @@ EDGE_MODES = ['Очистка краёв', 'Обычный', 'Alpha matting (м�
 
 
 def settings_read():
-    try:
-        return json.loads(PREFS_FILE.read_text(encoding='utf-8'))
-    except (FileNotFoundError, OSError, ValueError):
-        return {}
+    return read_settings_file(PREFS_FILE)
 
 
 def checkerboard(size: int) -> Image.Image:
@@ -84,6 +82,9 @@ class TokenForge:
         self.style.configure('Horizontal.TProgressbar', troughcolor=INPUT, background=BLUE)
 
         self.settings = settings_read()
+        for name in ('overrides', 'item_overrides'):
+            if not isinstance(self.settings.get(name), dict):
+                self.settings[name] = {}
         self.folder = None
         self.frame_path = Path(self.settings.get('ring', str(BASE / 'RingT.png')))
         self.frame = None
@@ -148,6 +149,7 @@ class TokenForge:
             last_folder = self.settings.get('folder')
             if last_folder and Path(last_folder).is_dir():
                 self._set_folder(Path(last_folder))
+        self._settings_baseline = self._settings_snapshot()
         self.root.after(120, self._poll)
         if DND_FILES is not None:
             for widget in (self.root, self.file_list):
@@ -394,8 +396,7 @@ class TokenForge:
             self.file_list.see(index)
             self._select(selected_path)
         else:
-            self.selected = None
-            self._show_token(None)
+            self._clear_selection()
             self.preview_label.set('Нет изображений в папке')
         self._schedule_save()
 
@@ -447,7 +448,8 @@ class TokenForge:
     def _on_default_item_layout_change(self):
         # A new default applies to uncustomized items, not to explicit per-item
         # overrides. Keep the preview and the next batch in agreement.
-        if self.selected is None or str(self.selected.resolve()) not in self.settings.get('item_overrides', {}):
+        stored = self.settings.get('item_overrides', {}).get(str(self.selected.resolve()), {}) if self.selected else {}
+        if self.selected is None or not isinstance(stored, dict) or 'layout' not in stored:
             self.item_layout.set(self.default_item_layout.get())
             if self.selected is not None:
                 if self.current_cutout is not None:
@@ -469,7 +471,7 @@ class TokenForge:
             return
         if self.selected is not None:
             adj = self._current_item_adjust()
-            self.settings.setdefault('item_overrides', {})[str(self.selected.resolve())] = vars(adj)
+            self._record_adjustment('item_overrides', self.selected, adj, self._item_adjust_for(self.selected))
             if self.current_cutout is not None:
                 self._render()
             else:
@@ -478,9 +480,32 @@ class TokenForge:
 
     def _adjust_for(self, path):
         stored = self.settings.get('overrides', {}).get(str(path.resolve()), {})
+        if not isinstance(stored, dict):
+            stored = {}
         return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
 
+    def _record_adjustment(self, name, path, adjusted, previous):
+        # Persist only fields actually changed, so two windows editing different
+        # controls on the same art do not overwrite each other's adjustments.
+        delta = {key: value for key, value in vars(adjusted).items()
+                 if value != vars(previous)[key]}
+        if not delta:
+            return
+        mapping = self.settings.setdefault(name, {})
+        path_key = str(path.resolve())
+        stored = mapping.get(path_key)
+        mapping[path_key] = {**(stored if isinstance(stored, dict) else {}), **delta}
+
+    def _clear_selection(self):
+        self.selected = None
+        self.current_cutout = None
+        self.current_key = None
+        self.preview_pending = False
+        self.preview_label.set('Нет выбранного изображения')
+        self._show_token(None)
+
     def _select(self, path):
+        self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
         self.sliders_updating = True
@@ -527,7 +552,7 @@ class TokenForge:
             candidates = [token_output_path(source, ext)
                           for ext in dict.fromkeys([self.ext.get(), 'webp', 'png'])]
         for token in candidates:
-            if token.is_file():
+            if token.is_file() and is_owned_export(token, source, self.work_mode.get()):
                 try:
                     with Image.open(token) as existing:
                         existing.load()
@@ -545,7 +570,7 @@ class TokenForge:
         if self.sliders_updating or self.selected is None:
             return
         adj = self._current_adjust()
-        self.settings.setdefault('overrides', {})[str(self.selected.resolve())] = vars(adj)
+        self._record_adjustment('overrides', self.selected, adj, self._adjust_for(self.selected))
         self._schedule_save()
         if self.current_cutout is not None:
             self._render()
@@ -623,7 +648,7 @@ class TokenForge:
                 img, key = self._get_cutout(path, model, keep_alpha, edge_mode)
                 self.events.put(('preview', (path, img, key)))
             except Exception as exc:
-                self.events.put(('error', f'{path.name}: {exc}'))
+                self.events.put(('error', (path, model, keep_alpha, edge_mode, f'{path.name}: {exc}')))
         threading.Thread(target=work, daemon=True).start()
 
     def _render(self):
@@ -648,13 +673,14 @@ class TokenForge:
     @staticmethod
     def _make_cutout_preview(img: Image.Image, size: int) -> Image.Image:
         # This view shows the model's raw extraction, before ring clipping.
-        from PIL import ImageOps
         bbox = img.getchannel('A').point(lambda p: 255 if p >= 16 else 0).getbbox()
         target = Image.new('RGBA', (size, size), (0, 0, 0, 0))
         if not bbox:
             return target
         cropped = img.crop(bbox)
-        shrunk = ImageOps.contain(cropped, (size - 28, size - 28), Image.Resampling.LANCZOS)
+        fit = (size - 28) / max(cropped.size)
+        dimensions = tuple(max(1, round(length * fit)) for length in cropped.size)
+        shrunk = cropped.resize(dimensions, Image.Resampling.LANCZOS)
         target.alpha_composite(shrunk, ((size - shrunk.width) // 2, (size - shrunk.height) // 2))
         return target
 
@@ -676,6 +702,8 @@ class TokenForge:
                 self.file_list.insert(tk.END, path.name)
             if self.selected in self.files:
                 self.file_list.selection_set(self.files.index(self.selected))
+            else:
+                self._clear_selection()
         self._start_export(fresh_files)
 
     def _start_export(self, image_files, force_overwrite=False, requested_mode=None):
@@ -684,6 +712,9 @@ class TokenForge:
             return
         if self.running_batch:
             self.status.set('Пакетная обработка уже выполняется.')
+            return
+        if self.pending_export is not None:
+            self.status.set('Экспорт уже в очереди. Нажми «Остановить», чтобы отменить его, затем запусти новый.')
             return
         files = list(image_files)
         mode = requested_mode or self.work_mode.get()
@@ -732,7 +763,9 @@ class TokenForge:
 
         def work():
             try:
-                get_cutout = lambda p: self._get_cutout(p, model, keep, edge_mode)[0]
+                def get_cutout(path):
+                    image, key = self._get_cutout(path, model, keep, edge_mode)
+                    return LoadedCutout(image, key[:4])
                 progress = lambda i, n, msg: self.events.put(('progress', (i, n, msg)))
                 if mode == 'item':
                     result = export_items(files, get_cutout, adjustments,
@@ -787,14 +820,19 @@ class TokenForge:
                         if self._render():
                             self.status.set(f'Готово: {path.name}. Отрегулируй положение или экспортируй.')
                     else:
-                        self.preview_pending = bool(self.selected and self.selected.is_file())
-                        if not self.preview_pending:
+                        if not self.selected or not self.selected.is_file():
+                            self.preview_pending = False
                             self.status.set(f'Исходный файл недоступен: {path.name}')
+                        elif path == self.selected:
+                            self.preview_pending = True
                     self._after_preview()
                 elif action == 'error':
                     self.busy = False
-                    self.status.set('Ошибка: ' + str(data))
-                    messagebox.showerror('Ошибка обработки', str(data))
+                    path, model, keep, edge, error = data
+                    if ((path, model, keep, edge) ==
+                            (self.selected, self.model.get(), self.keep_alpha.get(), self.edge_mode.get())):
+                        self.status.set('Ошибка: ' + error)
+                        messagebox.showerror('Ошибка обработки', error)
                     self._after_preview()
                 elif action == 'progress':
                     n, total, text = data
@@ -809,6 +847,11 @@ class TokenForge:
                     if data.cancelled:
                         report = 'Остановлено. ' + report
                     self.status.set(report)
+                    if (self.selected and self.current_cutout is None and not self.show_cutout.get()):
+                        expected = ([item_output_path(self.selected)] if self.work_mode.get() == 'item' else
+                                    [token_output_path(self.selected, ext) for ext in ('webp', 'png')])
+                        if any(path in expected for path in data.outputs):
+                            self._show_saved_token(self.selected)
                     if data.errors:
                         messagebox.showwarning('Отчёт об ошибках', report + '\n\n' + '\n'.join(data.errors[:15]))
                     self._after_preview()
@@ -828,9 +871,9 @@ class TokenForge:
             self.root.after_cancel(self.save_timer)
         self.save_timer = self.root.after(500, self._save)
 
-    def _save(self):
-        self.save_timer = None
-        self.settings.update({
+    def _settings_snapshot(self):
+        current = deepcopy(self.settings)
+        current.update({
             'folder': str(self.folder) if self.folder else '',
             'ring': str(self.frame_path),
             'model': self.model.get(),
@@ -843,16 +886,25 @@ class TokenForge:
             'work_mode': self.work_mode.get(),
             'item_layout': self.default_item_layout.get(),
         })
+        return current
+
+    def _save(self):
+        self.save_timer = None
+        current = self._settings_snapshot()
         try:
-            PREFS_DIR.mkdir(parents=True, exist_ok=True)
-            content = json.dumps(self.settings, ensure_ascii=False, indent=2).encode('utf-8')
-            atomic_write(PREFS_FILE, lambda fp: fp.write(content))
-        except OSError as exc:
+            save_settings_delta(PREFS_FILE, self._settings_baseline, current)
+            # Keep the baseline local: remote edits have not changed our controls.
+            self._settings_baseline = deepcopy(current)
+            return True
+        except (OSError, ValueError) as exc:
             self.status.set(f'Не удалось сохранить настройки: {exc}')
+            return False
 
     def _on_close(self):
+        if not self._save():
+            if not messagebox.askyesno('Настройки не сохранены', 'Закрыть программу без сохранения изменений?'):
+                return
         self.cancel_event.set()
-        self._save()
         self.root.destroy()
 
     def run(self):

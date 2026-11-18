@@ -1,7 +1,7 @@
 """CLI actions for Windows Explorer. Does not create the main GUI."""
 from __future__ import annotations
 
-import json
+from settings_store import read_settings_file
 import os
 import traceback
 from datetime import datetime
@@ -11,6 +11,7 @@ from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
     export_batch, frame_interior, list_source_images, read_image,
     remove_background, token_output_path, source_identity, assert_source_identity, read_export_owner,
+    LoadedCutout,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -21,11 +22,7 @@ LOG_FILE = PREFS_DIR / 'context_actions.log'
 
 
 def read_settings() -> dict:
-    try:
-        result = json.loads(PREFS_FILE.read_text(encoding='utf-8'))
-        return result if isinstance(result, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return read_settings_file(PREFS_FILE)
 
 
 def resolve_context_source(filename: str | Path) -> Path:
@@ -68,7 +65,7 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
         cutout = cache.load(path, model, keep_alpha, edge_mode, identity=identity)
         if cutout is not None:
             assert_source_identity(path, identity)
-            return cutout
+            return LoadedCutout(cutout, identity)
         original = read_image(path)
         assert_source_identity(path, identity)
         if keep_alpha and already_transparent(original):
@@ -81,7 +78,7 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
         except OSError:
             pass
         assert_source_identity(path, identity)
-        return cutout
+        return LoadedCutout(cutout, identity)
 
     return get_cutout
 
@@ -147,88 +144,6 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
                      **{key: stored[key] for key in ('zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
                         if key in stored})
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
-    result = export_items([source], get_cutout, {source: adj},
-                          skip_exists=bool(settings.get('skip_exists', True)),
-                          convert_original=bool(settings.get('convert_original', True)))
-    if result.errors:
-        for detail in result.error_details:
-            write_log(detail)
-        if not (result.created or result.skipped):
-            raise RuntimeError('\n'.join(result.errors))
-    destination = item_output_path(source)
-    if result.created:
-        return ('created_with_warning' if result.errors else 'created'), destination
-    if result.skipped and destination.is_file():
-        return ('skipped_with_warning' if result.errors else 'skipped'), destination
-    raise RuntimeError('Предмет не был создан.')
-
-
-def write_log(message: str, exception: BaseException | None = None) -> None:
-    try:
-        PREFS_DIR.mkdir(parents=True, exist_ok=True)
-        with LOG_FILE.open('a', encoding='utf-8') as fp:
-            fp.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
-            if exception is not None:
-                fp.write(''.join(traceback.format_exception(exception)))
-    except OSError:
-        pass
-
-
-def notify_user(title: str, message: str, *, error: bool = False):
-    """Brief unobtrusive notification; display a persistent dialog on errors."""
-    import tkinter as tk
-    from tkinter import messagebox
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        if error:
-            messagebox.showerror(title, message, parent=root)
-        else:
-            toast = tk.Toplevel(root)
-            toast.overrideredirect(True)
-            toast.attributes('-topmost', True)
-            panel = tk.Frame(toast, bg='#242932', padx=17, pady=13,
-                             highlightbackground='#6689c7', highlightthickness=1)
-            panel.pack(fill='both', expand=True)
-            tk.Label(panel, text=title, fg='white', bg='#242932',
-                     font=('Segoe UI Semibold', 11)).pack(anchor='w')
-            tk.Label(panel, text=message, fg='#e3e7ed', bg='#242932',
-                     font=('Segoe UI', 10), wraplength=350, justify='left').pack(anchor='w', pady=(4, 0))
-            toast.update_idletasks()
-            w, h = toast.winfo_reqwidth(), toast.winfo_reqheight()
-            x = max(0, toast.winfo_screenwidth() - w - 24)
-            y = max(0, toast.winfo_screenheight() - h - 78)
-            toast.geometry(f'{w}x{h}+{x}+{y}')
-            toast.after(3200, root.destroy)
-            root.mainloop()
-        if error:
-            root.destroy()
-    except Exception:
-        # Logging is the fallback if GUI notification cannot be displayed.
-        pass
-
-
-def run_auto(filename: str | Path, *, item: bool = False) -> int:
-    from runtime_streams import initialize_missing_streams
-    initialize_missing_streams()
-    try:
-        status, destination = (automatic_item(filename) if item else automatic_token(filename))
-        if status.endswith('_with_warning'):
-            write_log(f'Результат доступен, но преобразование оригинала не удалось: {destination}')
-            notify_user('TokenForge: предупреждение',
-                        f'Результат: {destination.name}. Не удалось преобразовать оригинал. Подробности: {LOG_FILE}')
-        elif status == 'created':
-            write_log(f'Создан: {destination}')
-            notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')
-        else:
-            write_log(f'Пропущен (уже существует): {destination}')
-            notify_user('TokenForge', f'Файл уже существует: {destination.name}')
-        return 0
-    except Exception as exc:
-        write_log(f'ОШИБКА для {filename}: {exc}', exc)
-        notify_user('Ошибка TokenForge', f'{exc}\n\nПодробности: {LOG_FILE}', error=True)
-        return 1    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
-
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=bool(settings.get('skip_exists', True)),
                           convert_original=bool(settings.get('convert_original', True)))
