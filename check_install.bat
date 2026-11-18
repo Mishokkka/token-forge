@@ -27,6 +27,9 @@ if not errorlevel 0 goto check_failed
 ".venv\Scripts\python.exe" -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Python packages: OK')"
 if errorlevel 1 goto check_failed
 if not errorlevel 0 goto check_failed
+".venv\Scripts\python.exe" -m pip check
+if errorlevel 1 goto check_failed
+if not errorlevel 0 goto check_failed
 if not exist "diagnostics_tests.py" goto tests_missing
 ".venv\Scripts\python.exe" "diagnostics_tests.py"
 if errorlevel 2 goto tests_incomplete

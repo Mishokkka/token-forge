@@ -88,7 +88,7 @@ def checkerboard(size: int) -> Image.Image:
 class TokenForge:
     def __init__(self, startup_file: Path | None = None, startup_mode: str | None = None):
         self.root = RootClass()
-        self.root.title('TokenForge 1.7.3 | Tokens & Items')
+        self.root.title('TokenForge 1.8.0 | Tokens & Items')
         self.root.geometry('1070x785')
         self.root.minsize(945, 730)
         self.root.configure(bg=BG)

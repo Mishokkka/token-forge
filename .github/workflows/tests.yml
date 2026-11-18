@@ -2,6 +2,8 @@ name: Offline regression tests
 
 on:
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -16,14 +18,14 @@ jobs:
       matrix:
         python: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install test dependencies
-        run: python -m pip install -r requirements-base.txt
+        run: python -m pip install -r requirements-base.txt -c constraints/windows-${{ matrix.python }}.txt
       - name: Run image and CLI regression tests
         run: python diagnostics_tests.py
 
@@ -35,15 +37,30 @@ jobs:
       matrix:
         python: ['3.11', '3.12', '3.13']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: ${{ matrix.python }}
       - name: Install application dependencies
-        run: python -m pip install -r requirements.txt
+        run: python install_dependencies.py
       - name: Verify interpreter and Tcl prerequisites
         run: python python_compat.py
       - name: Verify installer imports (no model download)
         run: python -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Imports OK')"
+
+  gui-smoke:
+    runs-on: windows-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Install GUI-only dependencies
+        run: python -m pip install -r requirements-base.txt tkinterdnd2 -c constraints/windows-3.12.txt
+      - name: Run actual Tk event loop and export
+        run: python gui_smoke.py
