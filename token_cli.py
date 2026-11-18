@@ -1,0 +1,234 @@
+"""CLI actions for Windows Explorer. Does not create the main GUI."""
+from __future__ import annotations
+
+import json
+import os
+import traceback
+from datetime import datetime
+from pathlib import Path
+
+from token_engine import (
+    IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
+    export_batch, frame_interior, list_source_images, read_image,
+    remove_background, token_output_path,
+)
+from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
+
+BASE = Path(__file__).resolve().parent
+PREFS_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge'
+PREFS_FILE = PREFS_DIR / 'settings.json'
+LOG_FILE = PREFS_DIR / 'context_actions.log'
+
+
+def read_settings() -> dict:
+    try:
+        result = json.loads(PREFS_FILE.read_text(encoding='utf-8'))
+        return result if isinstance(result, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve_context_source(filename: str | Path) -> Path:
+    """Resolve a selected Explorer file to its source if it is a generated copy.
+
+    A generated .webp copy must map to the original PNG/JPEG where available,
+    so its saved placement and cached extraction can be reused.
+    """
+    path = Path(filename).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f'Файл не найден: {path}')
+    if path.suffix.lower() not in IMAGE_EXTS:
+        raise ValueError(f'Неподдерживаемый формат: {path.suffix}')
+    candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
+    by_stem = {p.stem.casefold(): p for p in candidates}
+    if path in candidates:
+        return path
+    # User clicked a generated token, e.g. "Maget.webp": redirect to "Mage.png".
+    if path.stem.casefold().endswith('t'):
+        original = by_stem.get(path.stem[:-1].casefold())
+        if original is not None:
+            return original
+    # User clicked 'Sword_item.webp': redirect to 'Sword.png' when available.
+    if path.stem.casefold().endswith('_item'):
+        original = by_stem.get(path.stem[:-5].casefold())
+        if original is not None:
+            return original
+    # User clicked an exported webp copy, e.g. 'Mage.webp': use 'Mage.png'.
+    return by_stem.get(path.stem.casefold(), path)
+
+
+def _adjust_for(settings: dict, source: Path) -> Adjust:
+    stored = settings.get('overrides', {}).get(str(source.resolve()), {})
+    if not isinstance(stored, dict):
+        stored = {}
+    return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
+
+
+def automatic_token(filename: str | Path) -> tuple[str, Path]:
+    """Create a single token with the saved settings and disk extraction cache.
+
+    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
+    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
+    """
+    source = resolve_context_source(filename)
+    settings = read_settings()
+    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    frame = read_image(frame_path)
+    if frame.width != frame.height:
+        raise ValueError('PNG-кольцо должно быть квадратным.')
+    interior = frame_interior(frame)
+
+    model = settings.get('model', 'birefnet-general')
+    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    keep_alpha = bool(settings.get('keep_alpha', True))
+    ext = str(settings.get('ext', 'webp')).lower()
+    if ext not in ('webp', 'png'):
+        raise ValueError('Неподдерживаемый формат токена в настройках.')
+    size = int(settings.get('size', 256))
+    if size not in (256, 512, 1024):
+        raise ValueError('Неподдерживаемый размер токена в настройках.')
+
+    cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
+    def get_cutout(path: Path):
+        cutout = cache.load(path, model, keep_alpha, edge_mode)
+        if cutout is not None:
+            return cutout
+        original = read_image(path)
+        if keep_alpha and already_transparent(original):
+            cutout = original
+        else:
+            from rembg import new_session
+            cutout = remove_background(original, new_session(model), edge_mode)
+        try:
+            cache.save(path, model, keep_alpha, edge_mode, cutout)
+        except OSError:
+            pass
+        return cutout
+
+    result = export_batch(
+        [source], get_cutout, frame, interior, {source: _adjust_for(settings, source)},
+        out_size=size, format_name=ext,
+        skip_exists=bool(settings.get('skip_exists', True)),
+        convert_original=bool(settings.get('convert_original', True)),
+    )
+    if result.errors:
+        for detail in result.error_details:
+            write_log(detail)
+        raise RuntimeError('\n'.join(result.errors))
+    destination = token_output_path(source, ext)
+    if result.created:
+        return 'created', destination
+    if result.skipped and destination.is_file():
+        return 'skipped', destination
+    raise RuntimeError('Токен не был создан: неизвестный результат операции.')
+
+
+def automatic_item(filename: str | Path) -> tuple[str, Path]:
+    """Create 500x500 equipment art using the same reusable cutout cache."""
+    source = resolve_context_source(filename)
+    settings = read_settings()
+    model = settings.get('model', 'birefnet-general')
+    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    keep_alpha = bool(settings.get('keep_alpha', True))
+    stored = settings.get('item_overrides', {}).get(str(source.resolve()), {})
+    if not isinstance(stored, dict):
+        stored = {}
+    layout = stored.get('layout', settings.get('item_layout', ITEM_MODES[0]))
+    if layout not in ITEM_MODES:
+        layout = ITEM_MODES[0]
+    adj = ItemAdjust(layout=layout,
+                     **{key: stored[key] for key in ('zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
+                        if key in stored})
+    cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
+    def get_cutout(path: Path):
+        cutout = cache.load(path, model, keep_alpha, edge_mode)
+        if cutout is not None:
+            return cutout
+        original = read_image(path)
+        if keep_alpha and already_transparent(original):
+            cutout = original
+        else:
+            from rembg import new_session
+            cutout = remove_background(original, new_session(model), edge_mode)
+        try:
+            cache.save(path, model, keep_alpha, edge_mode, cutout)
+        except OSError:
+            pass
+        return cutout
+
+    result = export_items([source], get_cutout, {source: adj},
+                          skip_exists=bool(settings.get('skip_exists', True)),
+                          convert_original=bool(settings.get('convert_original', True)))
+    if result.errors:
+        for detail in result.error_details:
+            write_log(detail)
+        raise RuntimeError('\n'.join(result.errors))
+    destination = item_output_path(source)
+    if result.created:
+        return 'created', destination
+    if result.skipped and destination.is_file():
+        return 'skipped', destination
+    raise RuntimeError('Предмет не был создан.')
+
+
+def write_log(message: str, exception: BaseException | None = None) -> None:
+    try:
+        PREFS_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open('a', encoding='utf-8') as fp:
+            fp.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
+            if exception is not None:
+                fp.write(''.join(traceback.format_exception(exception)))
+    except OSError:
+        pass
+
+
+def notify_user(title: str, message: str, *, error: bool = False):
+    """Brief unobtrusive notification; display a persistent dialog on errors."""
+    import tkinter as tk
+    from tkinter import messagebox
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        if error:
+            messagebox.showerror(title, message, parent=root)
+        else:
+            toast = tk.Toplevel(root)
+            toast.overrideredirect(True)
+            toast.attributes('-topmost', True)
+            panel = tk.Frame(toast, bg='#242932', padx=17, pady=13,
+                             highlightbackground='#6689c7', highlightthickness=1)
+            panel.pack(fill='both', expand=True)
+            tk.Label(panel, text=title, fg='white', bg='#242932',
+                     font=('Segoe UI Semibold', 11)).pack(anchor='w')
+            tk.Label(panel, text=message, fg='#e3e7ed', bg='#242932',
+                     font=('Segoe UI', 10), wraplength=350, justify='left').pack(anchor='w', pady=(4, 0))
+            toast.update_idletasks()
+            w, h = toast.winfo_reqwidth(), toast.winfo_reqheight()
+            x = max(0, toast.winfo_screenwidth() - w - 24)
+            y = max(0, toast.winfo_screenheight() - h - 78)
+            toast.geometry(f'{w}x{h}+{x}+{y}')
+            toast.after(3200, root.destroy)
+            root.mainloop()
+        if error:
+            root.destroy()
+    except Exception:
+        # Logging is the fallback if GUI notification cannot be displayed.
+        pass
+
+
+def run_auto(filename: str | Path, *, item: bool = False) -> int:
+    from runtime_streams import initialize_missing_streams
+    initialize_missing_streams()
+    try:
+        status, destination = (automatic_item(filename) if item else automatic_token(filename))
+        if status == 'created':
+            write_log(f'Создан: {destination}')
+            notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')
+        else:
+            write_log(f'Пропущен (уже существует): {destination}')
+            notify_user('TokenForge', f'Файл уже существует: {destination.name}')
+        return 0
+    except Exception as exc:
+        write_log(f'ОШИБКА для {filename}: {exc}', exc)
+        notify_user('Ошибка TokenForge', f'{exc}\n\nПодробности: {LOG_FILE}', error=True)
+        return 1
