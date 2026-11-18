@@ -47,6 +47,7 @@ class CacheTests(unittest.TestCase):
         Image.new('RGB', (40, 20), 'blue').save(bmp)
         os.utime(bmp, ns=(info.st_atime_ns, info.st_mtime_ns))
         self.assertEqual(bmp.stat().st_size, info.st_size)
+        self.assertEqual(bmp.stat().st_mtime_ns, info.st_mtime_ns)
         self.assertNotEqual(source_identity(bmp), identity)
         self.assertIsNone(self.cache.load(bmp, 'birefnet-general', False, 'e'))
 
@@ -69,10 +70,15 @@ class CacheTests(unittest.TestCase):
         def replace_source(*args):
             Image.new('RGB', (171, 220), 'red').save(self.source)
             return Image.new('RGBA', (170, 220), 'blue')
-        with patch('tokenforge.remove_background', side_effect=replace_source), \
+        key = app._cache_key(self.source, 'birefnet-general', False, 'e')
+        original_disk = self.cache.path_for(self.source, 'birefnet-general', False, 'e', identity=key[:4])
+        with patch('tokenforge.remove_background', side_effect=replace_source) as extracted, \
              patch.dict('sys.modules', {'rembg': SimpleNamespace(new_session=lambda name: object())}):
             with self.assertRaises(OSError):
                 app._get_cutout(self.source, 'birefnet-general', False, 'e')
+        extracted.assert_called_once()
+        self.assertNotIn(key, app.cache)
+        self.assertFalse(original_disk.exists())
         self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
 
     def test_snapshot_decodes_captured_bytes_even_if_path_is_replaced(self):
@@ -101,6 +107,11 @@ class CacheTests(unittest.TestCase):
         app.scan_running = False
         app.scan_generation = 0
         app.pending_scan = None
+        app.active_scan = None
+        app.folder = None
+        app.folder_preference = ''
+        app.files = []
+        app.selected = None
         app.pending_resets = set()
         app.save_retries = 0
         app.widget_values = {}
@@ -118,7 +129,9 @@ class CacheTests(unittest.TestCase):
             a, _ = first._get_cutout(self.source, 'birefnet-general', False, 'e')
             self.assertEqual(a.tobytes(), cutout.tobytes())
             second = self.make_mock_app()
-            b, _ = second._get_cutout(self.source, 'birefnet-general', False, 'e')
+            with patch('tokenforge.new_local_session', side_effect=AssertionError('model started on disk hit')) as init:
+                b, _ = second._get_cutout(self.source, 'birefnet-general', False, 'e')
+                init.assert_not_called()
             self.assertEqual(b.tobytes(), cutout.tobytes())
             self.assertEqual(len(count), 1)
             second._get_cutout(self.source, 'birefnet-general', False, 'different')
@@ -181,7 +194,7 @@ class CacheTests(unittest.TestCase):
             app._export_current()
         events = []
         while not app.events.empty():
-            events.append(app.events.get())
+            events.append(app.events.get_nowait())
         self.assertEqual(events[-1][0], 'done')
         self.assertEqual(events[-1][1].created, 1)
         with Image.open(destination) as result:
@@ -335,8 +348,8 @@ class CacheTests(unittest.TestCase):
             hash_source.assert_not_called()
             launch.call_args.kwargs['target']()
             hash_source.assert_called_once()
-        self.assertEqual(app.events.get()[0], 'preview_invalidated')
-        event = app.events.get()
+        self.assertEqual(app.events.get_nowait()[0], 'preview_invalidated')
+        event = app.events.get_nowait()
         self.assertEqual(event[0], 'preview')
         self.assertNotEqual(event[1][2], app.current_key)
 
@@ -382,11 +395,54 @@ class CacheTests(unittest.TestCase):
             scan.assert_not_called()
             launch.call_args.kwargs['target']()
             scan.assert_called_once()
-        _, data = app.events.get()
+        _, data = app.events.get_nowait()
         app.scan_generation += 1
         app._set_file_list = Mock()
         app._apply_folder_scan(*data)
         app._set_file_list.assert_not_called()
+
+    def test_cancelled_scan_keeps_committed_folder_and_preference(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.folder_preference = str(self.directory)
+        app.files = [self.source]
+        app.selected = self.source
+        app.frame_path = self.directory / 'Ring.png'
+        app.folder_label, app.status, app.cancel_event = Mock(), Mock(), Mock()
+        app.running_batch = False
+        app.scan_running = app.busy = True
+        app.pending_export = None
+        app._set_file_list = Mock()
+        app._set_folder(self.directory / 'new')
+        request = app.pending_scan
+        app._cancel()
+        app._apply_folder_scan(request, [], True, None)
+        self.assertEqual(app.folder, self.directory)
+        self.assertEqual(app.folder_preference, str(self.directory))
+        self.assertEqual(app.files, [self.source])
+        self.assertEqual(app.selected, self.source)
+        app.folder_label.set.assert_called_with(str(self.directory))
+        app.status.set.assert_called_with('Поиск остановлен.')
+
+    def test_restored_scan_is_not_a_settings_edit(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.folder_preference = 'saved'
+        app.scan_generation = 2
+        app.folder_label, app.status, app.file_list = Mock(), Mock(), Mock()
+        app._select, app._schedule_save, app._clear_selection = Mock(), Mock(), Mock()
+        app._apply_folder_scan((2, self.directory, self.source, None, False),
+                               [self.source], False, None)
+        self.assertEqual(app.folder, self.directory)
+        self.assertEqual(app.folder_preference, 'saved')
+        app._schedule_save.assert_not_called()
+
+    def test_exact_row_is_not_windows_path_equality(self):
+        from pathlib import PureWindowsPath
+        paths = [PureWindowsPath('Mage.png'), PureWindowsPath('mage.png')]
+        self.assertEqual(paths[0], paths[1])
+        self.assertEqual(TokenForge._exact_row(paths, paths[1]), 1)
 
     def test_preview_verification_retries_without_cutout(self):
         from unittest.mock import Mock

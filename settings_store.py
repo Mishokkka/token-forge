@@ -55,15 +55,14 @@ def save_settings_delta(path: Path, baseline: dict, current: dict, *, resets=())
         latest = read_settings_file(path, strict=True)
         # A reset is an explicit operation, even when the local snapshot
         # never contained that override. Apply it to the latest document.
-        reset_latest, reset_baseline = deepcopy(latest), deepcopy(baseline)
+        reset_latest = deepcopy(latest)
         for group, key in resets:
-            for document in (reset_latest, reset_baseline):
-                mapping = document.get(group)
-                if isinstance(mapping, dict):
-                    mapping.pop(key, None)
-        updated = merge_delta(reset_latest, reset_baseline, current)
+            mapping = reset_latest.get(group)
+            if isinstance(mapping, dict):
+                mapping.pop(key, None)
+        updated = merge_delta(reset_latest, baseline, current)
         if updated == latest:
             return False
-        payload = json.dumps(updated, ensure_ascii=False, indent=2).encode('utf-8')
+        payload = json.dumps(updated, ensure_ascii=True, indent=2).encode('utf-8')
         atomic_write(path, lambda stream: stream.write(payload))
     return True

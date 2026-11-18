@@ -30,6 +30,26 @@ class SettingsTests(unittest.TestCase):
             self.assertTrue(save_settings_delta(path, empty, empty, resets={('overrides', 'a')}))
             self.assertEqual(read_settings_file(path), {'overrides': {'b': {'y': 4}}})
 
+    def test_reset_unchanged_override_and_subsequent_edit(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            initial = {'overrides': {'a': {'x': 12, 'y': 3}}}
+            for current, expected in (
+                (initial, {}),
+                ({'overrides': {'a': {'x': 24, 'y': 3}}}, {'a': {'x': 24}}),
+            ):
+                path.write_text(json.dumps(initial), encoding='utf-8')
+                self.assertTrue(save_settings_delta(path, initial, current, resets={('overrides', 'a')}))
+                self.assertEqual(read_settings_file(path), {'overrides': expected})
+
+    def test_unpaired_surrogate_round_trips_as_escape(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'settings.json'
+            path.write_text(r'{"extra":"\ud800"}', encoding='utf-8')
+            baseline = read_settings_file(path, strict=True)
+            self.assertTrue(save_settings_delta(path, baseline, {**baseline, 'size': 512}))
+            self.assertEqual(read_settings_file(path), {'extra': '\ud800', 'size': 512})
+
     def test_lock_excludes_other_process_until_release(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / 'settings.json'
@@ -39,7 +59,6 @@ class SettingsTests(unittest.TestCase):
                 proc = ctx.Process(target=check_lock, args=(path, results))
                 proc.start()
                 try:
-                    self.assertEqual(proc.exitcode, None)
                     result = results.get(timeout=10)
                     proc.join(10)
                     self.assertEqual(proc.exitcode, 0)

@@ -87,7 +87,8 @@ class TokenForge:
         for name in ('overrides', 'item_overrides'):
             if not isinstance(self.settings.get(name), dict):
                 self.settings[name] = {}
-        self.folder = None
+        self.folder = None  # last successfully scanned folder
+        self.folder_preference = self.settings.get('folder') or ''
         self.frame_path = Path(self.settings.get('ring') or BASE / 'RingT.png')
         self.frame = None
         self.interior = None
@@ -108,6 +109,7 @@ class TokenForge:
         self.scan_running = False
         self.scan_generation = 0
         self.pending_scan = None
+        self.active_scan = None
         self.pending_resets = set()
         self.save_retries = 0
         self.worker = None
@@ -158,13 +160,13 @@ class TokenForge:
             self._set_frame(self.frame_path)
         except Exception as exc:
             self.status.set(f'Не удалось открыть рамку: {exc}')
+        self._settings_baseline = self._settings_snapshot()
         if startup_file is not None:
             self._set_folder(startup_file.parent, select_path=startup_file)
         else:
-            last_folder = self.settings.get('folder')
+            last_folder = self.folder_preference
             if last_folder and Path(last_folder).is_dir():
-                self._set_folder(Path(last_folder))
-        self._settings_baseline = self._settings_snapshot()
+                self._set_folder(Path(last_folder), persist=False)
         self.root.after(120, self._poll)
         self.root.after(2500, self._watch_source)
         if DND_FILES is not None:
@@ -395,20 +397,21 @@ class TokenForge:
         if chosen:
             self._set_folder(Path(chosen))
 
-    def _set_folder(self, folder: Path, select_path: Path | None = None):
+    def _set_folder(self, folder: Path, select_path: Path | None = None, *, persist=True):
         if self.closing:
             return
         if self.running_batch or self.pending_export is not None:
             self.status.set('Сначала заверши или останови экспорт.')
             return
+        self._queue_scan(folder, select_path, persist=persist)
+
+    def _queue_scan(self, folder, select_path=None, *, persist=False):
+        # A request is not a committed folder. Keep the previous list and
+        # preferences intact until this particular scan succeeds.
         self.scan_generation += 1
-        self._clear_selection()
-        self.folder = None
-        self.files = []
-        self.file_list.delete(0, tk.END)
         self.folder_label.set(f'Поиск: {folder}')
         self.status.set(f'Поиск исходных артов: {folder.name}')
-        request = (self.scan_generation, folder, select_path, self.frame_path)
+        request = (self.scan_generation, folder, select_path, self.frame_path, persist)
         if self.busy:
             self.pending_scan = request
             if self.scan_running:
@@ -417,8 +420,9 @@ class TokenForge:
             self._run_scan(request)
 
     def _run_scan(self, request):
-        generation, folder, select_path, frame_path = request
+        generation, folder, select_path, frame_path, persist = request
         self.busy = self.scan_running = True
+        self.active_scan = request
         self.cancel_event.clear()
 
         def work():
@@ -430,6 +434,13 @@ class TokenForge:
         self.worker = threading.Thread(target=work, daemon=False)
         self.worker.start()
 
+    def _restore_folder_label(self):
+        self.folder_label.set(str(self.folder) if self.folder else 'Папка не выбрана')
+
+    @staticmethod
+    def _exact_row(files, selected):
+        return next((i for i, p in enumerate(files) if p.name == selected.name), None) if selected else None
+
     def _set_file_list(self, files):
         self.files = files
         self.file_list.delete(0, tk.END)
@@ -437,32 +448,59 @@ class TokenForge:
             self.file_list.insert(tk.END, p.name)
 
     def _apply_folder_scan(self, request, files, cancelled, error):
-        generation, folder, select_path, _ = request
+        generation, folder, select_path, _, persist = request
         if generation != self.scan_generation:
             return
         if cancelled or error:
+            self._restore_folder_label()
             self.status.set('Поиск остановлен.' if cancelled else f'Ошибка поиска: {error}')
             return
         self.folder = folder
-        self.folder_label.set(str(folder))
+        if persist:
+            self.folder_preference = str(folder)
+        self._restore_folder_label()
         self._set_file_list(files)
         self.status.set(f'Исходных артов: {len(files)}. Результаты сохраняются рядом с оригиналами.')
-        # Python's WindowsPath equality alone is case insensitive, even
-        # in directories where the OS permits distinct case variants.
-        selected_target = next((p for p in files if p.name == select_path.name), None) if select_path else None
-        if select_path is not None and selected_target is None:
+        index = self._exact_row(files, select_path)
+        if select_path is not None and index is None:
             self._clear_selection()
             self.status.set(f'Не удалось открыть {select_path.name}: файл недоступен или исключён как рамка.')
         elif files:
-            selected_path = selected_target if selected_target is not None else files[0]
-            index = files.index(selected_path)
+            index = index if index is not None else 0
             self.file_list.selection_set(index)
             self.file_list.see(index)
-            self._select(selected_path)
+            self._select(files[index])
         else:
             self._clear_selection()
             self.preview_label.set('Нет изображений в папке')
-        self._schedule_save()
+        if persist:
+            self._schedule_save()
+
+    def _refresh_frame_sources(self):
+        # Exclude the new frame immediately. Then refresh discovery, including
+        # the previous frame if it is now an eligible image.
+        selected = self.selected
+        def is_frame(path):
+            if path.name.casefold() != self.frame_path.name.casefold():
+                return False
+            try:
+                return path.samefile(self.frame_path)
+            except OSError:
+                return False
+        filtered = [p for p in self.files if not is_frame(p)]
+        if len(filtered) != len(self.files):
+            self._set_file_list(filtered)
+            index = self._exact_row(filtered, selected)
+            if index is None:
+                self._clear_selection()
+            else:
+                self.file_list.selection_set(index)
+        request = self.pending_scan or self.active_scan
+        if request is not None:
+            _, folder, target, _, persist = request
+            self._queue_scan(folder, target, persist=persist)
+        elif self.folder is not None:
+            self._queue_scan(self.folder, selected, persist=False)
 
     def _choose_ring(self):
         filename = filedialog.askopenfilename(title='Выбери PNG-кольцо',
@@ -470,11 +508,11 @@ class TokenForge:
         if filename:
             try:
                 self._set_frame(Path(filename))
-                if self.selected:
-                    if self.current_cutout is not None:
-                        self._render()
-                    else:
-                        self._request_preview()
+                self._refresh_frame_sources()
+                if self.selected and self.current_cutout is not None:
+                    self._render()
+                elif self.selected:
+                    self._request_preview()
                 self._schedule_save()
             except Exception as exc:
                 messagebox.showerror('Ошибка рамки', str(exc))
@@ -656,6 +694,11 @@ class TokenForge:
         path_key = str(self.selected.resolve())
         self.pending_resets.add((key, path_key))
         self.settings.setdefault(key, {}).pop(path_key, None)
+        # A later edit after Reset is intentional even if it happens to
+        # match the value before Reset. Compare those edits with absence.
+        baseline = self._settings_baseline.get(key)
+        if isinstance(baseline, dict):
+            baseline.pop(path_key, None)
         self._select(self.selected)
         self._schedule_save()
 
@@ -772,6 +815,9 @@ class TokenForge:
     def _start_export(self, image_files, force_overwrite=False, requested_mode=None, scan_folder=None):
         if self.closing:
             return
+        if self.scan_running or self.pending_scan is not None:
+            self.status.set('Дождись завершения поиска исходных артов.')
+            return
         if not self.folder or (not image_files and scan_folder is None):
             messagebox.showinfo('Нет изображений', 'Сначала выбери папку с артами.')
             return
@@ -797,18 +843,21 @@ class TokenForge:
         if force_overwrite and len(files) == 1:
             source = files[0]
             destination = item_output_path(source) if mode == 'item' else token_output_path(source, ext)
-            if destination.exists() and not is_owned_export(destination, source, mode):
+            if destination.exists():
                 try:
                     identity = source_identity(destination)
+                    owned = is_owned_export(destination, source, mode, identity=identity)
+                    assert_source_identity(destination, identity)
                 except OSError as exc:
                     messagebox.showerror('Ошибка файла', str(exc))
                     return
-                if not messagebox.askyesno(
-                        'Подтверждение замены',
-                        f'{destination.name} не помечен как результат TokenForge. '
-                        'Это может быть старый токен или отдельный арт. Заменить его?'):
-                    return
-                approved_outputs[destination] = identity
+                if not owned:
+                    if not messagebox.askyesno(
+                            'Подтверждение замены',
+                            f'{destination.name} не помечен как результат TokenForge. '
+                            'Это может быть старый токен или отдельный арт. Заменить его?'):
+                        return
+                    approved_outputs[destination] = identity
         expected_input = (self.current_key[:4] if force_overwrite and self.current_key is not None
                           and files == [self.selected] else None)
         # A batch scan takes place on the worker; capture all controls and
@@ -842,7 +891,7 @@ class TokenForge:
                         from token_engine import BatchResult
                         self.events.put(('done', BatchResult(errors=[], cancelled=True)))
                         return
-                    self.events.put(('batch_scan', (folder, selected_files)))
+                    self.events.put(('batch_scan', (folder, selected_files, ring_path)))
                     captured = {}
                     for path in selected_files:
                         if path in adjustments:
@@ -889,14 +938,14 @@ class TokenForge:
         """Prioritize queued exports over another potentially slow preview."""
         if self.closing:
             return
-        if self.pending_scan is not None:
-            request = self.pending_scan
-            self.pending_scan = None
-            self._run_scan(request)
-        elif self.pending_export is not None:
+        if self.pending_export is not None:
             request = self.pending_export
             self.pending_export = None
             self._run_export(request)
+        elif self.pending_scan is not None:
+            request = self.pending_scan
+            self.pending_scan = None
+            self._run_scan(request)
         elif self.preview_pending:
             self.preview_pending = False
             cached_only = self.preview_cached_only
@@ -904,14 +953,16 @@ class TokenForge:
             self._request_preview(cached_only=cached_only)
 
     def _cancel(self):
-        if self.scan_running or self.pending_scan is not None:
-            self.scan_generation += 1
-            self.pending_scan = None
-            self.cancel_event.set()
-            self.status.set('Остановка поиска…')
-        elif self.running_batch:
+        if self.running_batch:
             self.cancel_event.set()
             self.status.set('Остановка после текущего изображения…')
+        elif self.scan_running or self.pending_scan is not None:
+            self.scan_generation += 1
+            self.pending_scan = None
+            if self.scan_running:
+                self.cancel_event.set()
+            self._restore_folder_label()
+            self.status.set('Поиск остановлен.')
         elif self.pending_export is not None:
             self.pending_export = None
             self.status.set('Запланированная пакетная обработка отменена.')
@@ -924,15 +975,17 @@ class TokenForge:
                     continue
                 if action == 'folder_scan':
                     self.busy = self.scan_running = False
+                    self.active_scan = None
                     self._apply_folder_scan(*data)
                     if not self.busy:
                         self._after_preview()
                 elif action == 'batch_scan':
-                    folder, files = data
-                    if folder == self.folder:
+                    folder, files, scanned_frame = data
+                    if folder == self.folder and str(scanned_frame) == str(self.frame_path):
                         self._set_file_list(files)
-                        if self.selected in files:
-                            self.file_list.selection_set(files.index(self.selected))
+                        index = self._exact_row(files, self.selected)
+                        if index is not None:
+                            self.file_list.selection_set(index)
                         else:
                             self._clear_selection()
                 elif action == 'preview_invalidated':
@@ -1037,7 +1090,7 @@ class TokenForge:
     def _settings_snapshot(self):
         current = deepcopy(self.settings)
         current.update({
-            'folder': str(self.folder) if self.folder else '',
+            'folder': self.folder_preference,
             'ring': str(self.frame_path),
             'model': self.model.get(),
             'edge_mode': self.edge_mode.get(),
