@@ -71,8 +71,10 @@ def decode_settings(raw, *, default_frame, strict=False, mode=None):
         if isinstance(size, str) and size in ('256', '512', '1024'):
             size = int(size)
         result['size'] = size if type(size) is int and size in (256, 512, 1024) else invalid('size', 256)
-    ring = raw.get('ring') or str(default_frame)
-    result['ring'] = ring if isinstance(ring, str) and '\0' not in ring else invalid('ring', str(default_frame))
+    ring = raw.get('ring', str(default_frame))
+    if not isinstance(ring, str) or '\0' in ring:
+        ring = invalid('ring', str(default_frame))
+    result['ring'] = ring or str(default_frame)
     folder = raw.get('folder', '')
     result['folder'] = folder if isinstance(folder, str) and '\0' not in folder else ''
     result['work_mode'] = raw.get('work_mode') if raw.get('work_mode') in ('token', 'item') else 'token'

@@ -31,46 +31,64 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
             return image
         return disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity, revision=revision)
 
+    def verify_revision():
+        if model_revision(model) != revision:
+            sessions.clear()
+            raise OSError('Файлы модели изменились во время удаления фона. Повтори обработку.')
+
+    def publish(image):
+        validate_art_dimensions(image)
+        verify_revision()
+        try:
+            disk_cache.save(path, model, keep_alpha, edge_mode, image,
+                            identity=identity, revision=revision)
+        except OSError:
+            # Caching is optional, source verification is not.
+            check()
+        verify_revision()
+
     cutout = cached()
-    new = cutout is None
-    if new:
+    if cutout is None:
         if cached_only:
             check()
             return None
         original = decode(path, identity=identity)
         if keep_alpha and already_transparent(original):
             cutout = original
+            publish(cutout)
         else:
-            # Cooperating automatic commands and GUI instances share one
-            # inference slot. No lock is held for cache-only viewing.
+            # Hold the shared inference reservation until publication. A waiting
+            # process can then reuse the completed result instead of rerunning AI.
             with process_lock(disk_cache.directory.parent / 'inference', timeout=120):
                 revision = model_revision(model)
                 memory_key = (*key, revision)
                 cutout = cached()
                 if cutout is None:
                     existing = sessions.get(model)
-                    if existing is None or existing[0] != revision:
-                        # Drop other ORT sessions before loading another model.
+                    if existing is not None and existing[0] == revision:
+                        session = existing[1]
+                    else:
+                        # Release previous native sessions before allocating another.
                         sessions.clear()
-                        session = session_factory(model)
-                        revision = model_revision(model)  # first download may change it
+                        del existing
+                        for attempt in range(2):
+                            session = session_factory(model)
+                            observed = model_revision(model)
+                            if observed == revision:
+                                break
+                            # A first download may legitimately change the revision.
+                            # Never relabel a session that loaded an unknown version.
+                            del session
+                            revision = observed
+                        else:
+                            raise OSError('Файлы модели нестабильны. Повтори обработку.')
                         memory_key = (*key, revision)
                         sessions[model] = (revision, session)
-                    else:
-                        session = existing[1]
                     cutout = extract(original, session, edge_mode)
-                    if model_revision(model) != revision:
-                        sessions.clear()
-                        raise OSError('Файлы модели изменились во время удаления фона. Повтори обработку.')
-        validate_art_dimensions(cutout)
-        # The cache writer checks the source after encoding, before publishing.
-        # If disk caching fails, validate independently before returning pixels.
-        try:
-            disk_cache.save(path, model, keep_alpha, edge_mode, cutout,
-                            identity=identity, revision=revision)
-        except OSError:
-            check()
-    else:
-        check()
+                    publish(cutout)
+
+    # Also verify hits (including the second lookup under the inference lock).
+    check()
+    verify_revision()
     remember(memory, memory_key, cutout, count_limit=memory_limit)
     return cutout

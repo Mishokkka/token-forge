@@ -202,6 +202,46 @@ class EngineTests(unittest.TestCase):
                 self.assertTrue(result.errors)
                 self.assertEqual(result.created, 0)
 
+    def test_16bit_gray_preserves_tonal_range(self):
+        from token_engine import decode_artwork
+        gray = Image.new('I;16', (4, 1))
+        gray.putdata([0, 16384, 32768, 65535])
+        self.assertEqual(list(decode_artwork(gray).getdata()),
+                         [(0, 0, 0), (64, 64, 64), (128, 128, 128), (255, 255, 255)])
+        gray.info['transparency'] = 16384
+        self.assertEqual(list(decode_artwork(gray).getchannel('A').getdata()), [255, 0, 255, 255])
+
+    def test_oversized_ring_and_discovery_reject_before_pixel_decode(self):
+        from token_engine import load_frame, read_export_owner
+        from PIL import PngImagePlugin
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / 'ring.png'
+            Image.new('L', (4097, 4097)).save(path)
+            with patch.object(PngImagePlugin.PngImageFile, 'load',
+                              side_effect=AssertionError('unexpected pixel decode')):
+                with self.assertRaisesRegex(ValueError, '4096'):
+                    load_frame(path)
+                with patch('token_engine.MAX_IMAGE_PIXELS', 100):
+                    self.assertIsNone(read_export_owner(path))
+
+    def test_frame_retry_records_actual_recipe_after_success(self):
+        from token_engine import read_export_owner, token_recipe
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            adjust = Adjust()
+            def export(loader, skip=True):
+                return export_batch([source], read_image, None, None, {source: adjust},
+                                    frame_loader=loader, convert_original=False, skip_exists=skip)
+            loader = unittest.mock.Mock(side_effect=[OSError('not ready'), (self.frame, self.mask)])
+            result = export(loader)
+            self.assertEqual(result.created, 1, result.errors)
+            token = token_output_path(source)
+            self.assertEqual(read_export_owner(token)[4], token_recipe(self.frame, adjust, 256, 'webp', None))
+            result = export(unittest.mock.Mock(side_effect=OSError('not ready')))
+            self.assertEqual(result.skipped, 1)
+            self.assertTrue(any('Не удалось проверить актуальность' in w for w in result.warnings))
+
     def test_frame_mask_feather_does_not_escape_thin_ring(self):
         from token_engine import _enclosed_shape
         from PIL import ImageChops
@@ -656,7 +696,8 @@ class EngineTests(unittest.TestCase):
             Image.new('RGBA', (320, 500), 'green').save(source)
             result = run()
             self.assertEqual(result.skipped, 1)
-            self.assertTrue(any('Исходник изменился' in w for w in result.warnings))
+            self.assertTrue(any(token.name in w and 'Исходник изменился' in w for w in result.warnings))
+            self.assertTrue(any(copy.name + ':' in w and 'Исходник изменился' in w for w in result.warnings))
             self.assertEqual(token.read_bytes(), original_token)
             self.assertEqual(copy.read_bytes(), original_copy)
             result = run(skip=False)

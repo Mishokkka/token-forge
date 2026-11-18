@@ -34,7 +34,11 @@ class SettingsTests(unittest.TestCase):
         for value in ('bad', [], 2, None):
             with self.assertRaises(ValueError):
                 decode_settings({'skip_exists': value}, default_frame='RingT.png', strict=True)
-        self.assertEqual(decode_settings({'ring': []}, default_frame='RingT.png')['ring'], 'RingT.png')
+        for value in ([], {}, False, 0, None):
+            self.assertEqual(decode_settings({'ring': value}, default_frame='RingT.png')['ring'], 'RingT.png')
+            with self.assertRaises(ValueError):
+                decode_settings({'ring': value}, default_frame='RingT.png', strict=True)
+        self.assertEqual(decode_settings({}, default_frame='RingT.png', strict=True)['ring'], 'RingT.png')
 
     def test_recovery_preserves_corrupt_bytes_and_concurrent_repair(self):
         from settings_store import recover_settings_file

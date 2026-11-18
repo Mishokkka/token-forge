@@ -248,7 +248,8 @@ class CliTests(unittest.TestCase):
         self.settings['overrides'] = None
         self.settings['item_overrides'] = None
         self.save_settings()
-        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped')
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped_with_warning')
+        self.assertIn('Не удалось проверить актуальность', token_cli.LOG_FILE.read_text(encoding='utf-8'))
         self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
 
     def test_shared_adjustment_schema_keeps_valid_fields_and_rejects_unsafe_format(self):

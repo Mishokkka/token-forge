@@ -111,9 +111,72 @@ class CacheTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 app._get_cutout(self.source, 'birefnet-general', False, 'e')
         extracted.assert_called_once()
-        self.assertNotIn(key, app.cache)
+        self.assertFalse(app.cache)
         self.assertFalse(original_disk.exists())
         self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
+
+    def test_model_reload_requires_stable_revision_and_publishes_under_lock(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        identity = source_identity(self.source)
+        model = 'birefnet-general'
+        revision = ['old']
+        memory, sessions = {}, {}
+        held = []
+        @contextmanager
+        def lock(*args, **kwargs):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        disk = Mock()
+        disk.directory = self.cache.directory
+        disk.load.return_value = None
+        def save(*args, **kwargs):
+            self.assertTrue(held)
+            self.assertEqual(kwargs['revision'], ('new',))
+        disk.save.side_effect = save
+        first, second = object(), object()
+        def make_session(name):
+            if revision[0] == 'old':
+                revision[0] = 'new'
+                return first
+            return second
+        factory = Mock(side_effect=make_session)
+        cutout = Image.new('RGBA', (10, 10), 'red')
+        extract = Mock(return_value=cutout)
+        with patch('cutout_service.model_revision', side_effect=lambda name: tuple(revision)), \
+             patch('cutout_service.process_lock', side_effect=lock):
+            result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
+                                 disk_cache=disk, memory=memory, sessions=sessions, decode=read_image,
+                                 extract=extract, session_factory=factory)
+        self.assertIs(result, cutout)
+        self.assertEqual(factory.call_count, 2)
+        self.assertIs(extract.call_args.args[1], second)
+        self.assertEqual(sessions[model], (('new',), second))
+        disk.save.assert_called_once()
+
+    def test_second_cache_hit_does_not_reencode_or_run_inference(self):
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        identity = source_identity(self.source)
+        model = 'birefnet-general'
+        image = Image.new('RGBA', (10, 10), 'red')
+        disk = Mock()
+        disk.directory = self.cache.directory
+        disk.load.side_effect = [None, image]
+        extract, factory = Mock(), Mock()
+        result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
+                             disk_cache=disk, memory={}, sessions={}, decode=read_image,
+                             extract=extract, session_factory=factory)
+        self.assertIs(result, image)
+        disk.save.assert_not_called()
+        extract.assert_not_called()
+        factory.assert_not_called()
 
     def test_snapshot_decodes_captured_bytes_even_if_path_is_replaced(self):
         from token_engine import source_identity, source_snapshot, read_image

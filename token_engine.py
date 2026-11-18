@@ -243,13 +243,24 @@ def decode_artwork(raw, *, force_alpha=False):
     from PIL import ImageCms
     artwork = ImageOps.exif_transpose(raw)
     has_alpha = 'A' in artwork.getbands() or 'transparency' in artwork.info
-    alpha = artwork.convert('RGBA').getchannel('A') if has_alpha and artwork.info.get('icc_profile') else None
+    grayscale16 = artwork.mode in ('I;16', 'I;16L', 'I;16B')
     profile = artwork.info.get('icc_profile')
+    alpha = None
+    if has_alpha and (profile or grayscale16):
+        transparent = artwork.info.get('transparency')
+        if grayscale16 and isinstance(transparent, int):
+            # Test the original sample, not its quantized RGB equivalent.
+            from PIL import ImageMath
+            alpha = ImageMath.lambda_eval(lambda args: args['samples'] != args['key'],
+                                          samples=artwork, key=transparent)
+            alpha = alpha.point(lambda value: value * 255).convert('L')
+        else:
+            alpha = artwork.convert('RGBA').getchannel('A')
     if profile:
         try:
             source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
             target = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
-            if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB'):
+            if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB', 'I;16', 'I;16L', 'I;16B'):
                 color = artwork
             elif artwork.mode == 'LA':
                 color = artwork.getchannel('L')
@@ -265,6 +276,14 @@ def decode_artwork(raw, *, force_alpha=False):
         except (OSError, ValueError, TypeError, ImageCms.PyCMSError) as exc:
             raise ValueError('Некорректный или неподдерживаемый цветовой профиль ICC. '
                              'Сохрани изображение в sRGB и повтори обработку.') from exc
+    # Pillow's ordinary 16-bit -> RGB conversion clips values above 255.
+    # Scale the sample range rather than saturating most grayscale pixels.
+    if grayscale16:
+        gray = artwork.convert('I').point(lambda value: (value + 128) / 257).convert('L')
+        result = gray.convert('RGBA' if has_alpha or force_alpha else 'RGB')
+        if alpha is not None:
+            result.putalpha(alpha)
+        return result
     return artwork.convert('RGBA' if has_alpha or force_alpha else 'RGB')
 
 
@@ -441,11 +460,14 @@ def _enclosed_shape(barrier: Image.Image) -> Image.Image:
 
 
 def load_frame(path: Path):
-    frame = read_image(path)
-    if frame.width != frame.height:
-        raise ValueError('PNG-кольцо должно быть квадратным.')
-    if frame.width > 4096:
-        raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+    if path.stat().st_size > MAX_ENCODED_BYTES:
+        raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+    with open_art(path) as raw:
+        if raw.width != raw.height:
+            raise ValueError('PNG-кольцо должно быть квадратным.')
+        if raw.width > 4096:
+            raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+        frame = decode_artwork(raw, force_alpha=True)
     return frame, frame_interior(frame)
 
 
@@ -755,7 +777,9 @@ def freshness_warnings(owner, identity, recipe=None):
     messages = []
     if owner[3] != identity[-1]:
         messages.append('Исходник изменился; готовый результат устарел.')
-    if recipe is not None and owner[4] != recipe:
+    if recipe is None:
+        messages.append('Не удалось проверить актуальность параметров генерации.')
+    elif owner[4] != recipe:
         messages.append('Параметры генерации изменились; готовый результат может быть устаревшим.')
     if messages:
         messages.append('Существующий файл оставлен без изменений.')
@@ -794,10 +818,10 @@ def _probe_owner(stream, *, require_pixels=False):
     """Discovery is not evidence that the pixels are decodable."""
     try:
         with Image.open(stream, formats=('PNG', 'WEBP')) as stored:
+            validate_art_dimensions(stored)
             owner = _parse_owner(stored.getexif().get(270))
             if owner and require_pixels:
                 try:
-                    validate_art_dimensions(stored)
                     stored.load()
                 except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
                     raise InvalidExportError('Готовое изображение повреждено.') from exc
@@ -815,6 +839,11 @@ def read_export_owner(destination: Path, *, identity=None, require_pixels=False)
     if identity is not None:
         with source_snapshot(destination, identity) as snapshot:
             return _probe_owner(snapshot, require_pixels=require_pixels)
+    try:
+        if destination.stat().st_size > MAX_ENCODED_BYTES:
+            return None
+    except OSError:
+        return None
     return _probe_owner(destination, require_pixels=require_pixels)
 
 
@@ -1222,7 +1251,9 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                         source, collision_index=folders, input_identity=identity, captured=captured,
                         approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
                     result.converted += int(bool(publication))
-                    result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
+                    copy_destination = original_webp_path(source)
+                    result.warnings.extend(f'{source.name}: {copy_destination.name}: {warning}'
+                                           for warning in publication.warnings)
                 except StaleApprovalError as exc:
                     result.record_error(source, 'преобразование оригинала', exc)
                     if on_progress:
@@ -1257,6 +1288,10 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     else:
                         cutout = loaded
                     image = renderer(cutout, source)
+                    # The renderer may have recovered from an unavailable frame.
+                    # Record the recipe of the actual successful render.
+                    if recipe is None and recipe_for is not None:
+                        recipe = recipe_for(source)
                     publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
                                                  approved_identity=approved,
                                                  input_identity=identity, collision_index=folders, recipe=recipe)
