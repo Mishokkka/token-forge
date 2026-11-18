@@ -24,7 +24,9 @@ if not exist ".venv\Scripts\python.exe" goto no_env
 ".venv\Scripts\python.exe" -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Python packages: OK')"
 if errorlevel 1 goto check_failed
 if not errorlevel 0 goto check_failed
-".venv\Scripts\python.exe" -m unittest discover -v
+if not exist "diagnostics_tests.py" goto tests_missing
+".venv\Scripts\python.exe" "diagnostics_tests.py"
+if errorlevel 2 goto tests_incomplete
 if errorlevel 1 goto check_failed
 if not errorlevel 0 goto check_failed
 echo.
@@ -32,6 +34,13 @@ echo SUCCESS: Python packages, image engine and CLI tests passed.
 echo.
 pause
 exit /b 0
+
+:tests_missing
+echo Python imports passed, but the diagnostics test runner is missing.
+:tests_incomplete
+echo Regression tests did not complete. Download the full source ZIP.
+pause
+exit /b 2
 
 :no_env
 echo ERROR: .venv was not created. Run install.bat.

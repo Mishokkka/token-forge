@@ -78,6 +78,7 @@ goto failed
 :venv_failed
 echo ERROR: Could not create the virtual environment.
 echo Check that Python is installed with pip and venv support.
+echo If a partial .venv directory was created, rename it before retrying install.bat.
 goto failed
 
 :install_packages

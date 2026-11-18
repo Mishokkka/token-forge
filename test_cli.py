@@ -289,11 +289,25 @@ class FakeRegistry:
 
     def SetValueEx(self, key, name, reserved, kind, value):
         assert key.hive == self.HKEY_CURRENT_USER
-        self.keys[key.path][name] = (value, kind)
+        values = self.keys[key.path]
+        actual = next((k for k in values if k.casefold() == name.casefold()), name)
+        values[actual] = (value, kind)
+
+    def QueryValueEx(self, key, name):
+        values = self._view(key.hive)[key.path]
+        for actual, value in values.items():
+            if actual.casefold() == name.casefold():
+                return value
+        raise FileNotFoundError(name)
 
     def DeleteValue(self, key, name):
         assert key.hive == self.HKEY_CURRENT_USER
-        del self.keys[key.path][name]
+        values = self.keys[key.path]
+        for actual in list(values):
+            if actual.casefold() == name.casefold():
+                del values[actual]
+                return
+        raise FileNotFoundError(name)
 
     def DeleteKey(self, hive, path):
         assert hive == self.HKEY_CURRENT_USER
@@ -309,6 +323,9 @@ class RegistryTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
+        lock_patch = patch.object(context_menu, 'MENU_LOCK', self.base / 'context-menu')
+        lock_patch.start()
+        self.addCleanup(lock_patch.stop)
         self.exe = self.base / '.venv' / 'Scripts' / 'pythonw.exe'
         self.exe.parent.mkdir(parents=True)
         self.exe.touch()
@@ -353,7 +370,7 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(context_menu._foreign_shell(reg), baseline)
             self.assertEqual(notify.call_count, 3)
 
-    def test_registry_conflict_rolls_back_without_losing_old_verbs(self):
+    def test_registry_preflight_refuses_without_losing_old_verbs(self):
         reg = FakeRegistry(shadow=True)
         old = self._legacy(reg)
         before = {key: dict(values) for key, values in reg.keys.items()}
@@ -375,6 +392,7 @@ class RegistryTests(unittest.TestCase):
         command = path + r'\command'
         with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
             reg.SetValueEx(key, '', 0, reg.REG_SZ, 'Old label')
+            reg.SetValueEx(key, 'ICON', 0, reg.REG_SZ, 'Old icon')
             reg.SetValueEx(key, 'Independent', 0, reg.REG_SZ, 'Preserve')
         with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, command, 0, reg.KEY_WRITE) as key:
             reg.SetValueEx(key, '', 0, reg.REG_SZ, 'old.exe "%1"')
@@ -399,6 +417,55 @@ class RegistryTests(unittest.TestCase):
                 context_menu.install(self.base)
         self.assertEqual(reg.keys, baseline)
         notify.assert_called_once()
+
+    def test_final_merged_view_mismatch_rolls_back_completed_writes(self):
+        reg = FakeRegistry()
+        path = context_menu.ROOT + r'\TokenForge.Create'
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
+            reg.SetValueEx(key, 'ICON', 0, reg.REG_SZ, 'old')
+        old = self._legacy(reg)
+        baseline = {key: dict(values) for key, values in reg.keys.items()}
+        merged = context_menu._foreign_shell(reg)
+
+        def changed_view(registry):
+            self.assertTrue(all(context_menu.ROOT + '\\' + name in registry.keys
+                                for name in context_menu.ACTION_NAMES))
+            return {}
+
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell') as notify, \
+             patch.object(context_menu, '_check_safe_registration', return_value=merged), \
+             patch.object(context_menu, '_foreign_shell', side_effect=changed_view):
+            with self.assertRaises(context_menu.RegistryConflictError):
+                context_menu.install(self.base)
+        self.assertEqual(reg.keys, baseline)
+        self.assertIn(old, reg.keys)
+        notify.assert_called_once()
+
+    def test_install_and_remove_use_same_lock(self):
+        from contextlib import contextmanager
+        calls = []
+        active = []
+        @contextmanager
+        def lock(path, timeout):
+            calls.append(path)
+            active.append(path)
+            try:
+                yield
+            finally:
+                active.pop()
+
+        def protected(*args):
+            self.assertEqual(active, [context_menu.MENU_LOCK])
+            return []
+
+        with patch.object(context_menu, 'process_lock', side_effect=lock), \
+             patch.object(context_menu, '_install', side_effect=protected), \
+             patch.object(context_menu, '_remove', side_effect=protected):
+            context_menu.install(self.base)
+            context_menu.remove()
+        self.assertEqual(calls, [context_menu.MENU_LOCK, context_menu.MENU_LOCK])
+        self.assertEqual(active, [])
 
     def test_legacy_cleanup_failure_is_warning_and_keeps_new_commands(self):
         reg = FakeRegistry()

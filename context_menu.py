@@ -5,8 +5,10 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from process_lock import process_lock
 
 BASE = Path(__file__).resolve().parent
+MENU_LOCK = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge' / 'context-menu'
 EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff')
 CLASSES = r'Software\Classes'
 ROOT = CLASSES + r'\*\shell'
@@ -102,6 +104,15 @@ def _key_values(reg, path):
 _MISSING = object()
 
 
+def _query_value(reg, path, name):
+    # QueryValueEx follows Windows' case-insensitive value-name semantics.
+    try:
+        with reg.OpenKey(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_READ) as key:
+            return reg.QueryValueEx(key, name)
+    except FileNotFoundError:
+        return _MISSING
+
+
 class RegistryEdits:
     """Journal successful writes to our private verb keys, not shared parents."""
     def __init__(self, reg):
@@ -117,7 +128,7 @@ class RegistryEdits:
                 self.created.append(path)
                 before = {}
             for name, value in values.items():
-                old = before.get(name, _MISSING)
+                old = _query_value(reg, path, name)
                 new = (value, reg.REG_SZ)
                 if old != new:
                     reg.SetValueEx(key, name, 0, reg.REG_SZ, value)
@@ -128,8 +139,7 @@ class RegistryEdits:
         reg = self.reg
         for path, name, old, new in reversed(self.changed):
             try:
-                values = _key_values(reg, path)
-                if values is None or values.get(name, _MISSING) != new:
+                if _query_value(reg, path, name) != new:
                     raise RegistryConflictError('Value changed during installation')
                 with reg.OpenKey(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
                     if old is _MISSING:
@@ -193,6 +203,11 @@ def _check_safe_registration(reg):
 
 
 def install(base: Path = BASE) -> list[str]:
+    with process_lock(MENU_LOCK, timeout=15):
+        return _install(base)
+
+
+def _install(base: Path) -> list[str]:
     reg = _registry()
     pythonw, entry = interpreter_and_entry(base)
     foreign_before = _check_safe_registration(reg)
@@ -225,6 +240,11 @@ def install(base: Path = BASE) -> list[str]:
 
 
 def remove() -> None:
+    with process_lock(MENU_LOCK, timeout=15):
+        _remove()
+
+
+def _remove() -> None:
     reg = _registry()
     try:
         errors = _remove_verbs(reg, ROOT) + _remove_legacy(reg)
