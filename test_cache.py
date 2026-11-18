@@ -357,7 +357,7 @@ class CacheTests(unittest.TestCase):
         import threading
         from unittest.mock import Mock
         app = self.make_mock_app()
-        app.root, app.status, app.file_list = Mock(), Mock(), Mock()
+        app.root, app.status, app.file_list, app.folder_label = Mock(), Mock(), Mock(), Mock()
         app._clear_selection = Mock()
         app.events = queue.Queue()
         app.cancel_event = threading.Event()

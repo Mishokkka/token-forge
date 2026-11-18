@@ -178,13 +178,12 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(action(self.photo)[0], 'skipped_with_warning')
 
     def test_context_command_quotes_file_paths_and_mode(self):
-        exe = self.base / '.venv' / 'Scripts' / 'pythonw.exe'
-        script = self.base / 'tokenforge.py'
-        cmd = context_menu.command_for(exe, script, '--open')
-        self.assertEqual(cmd, f'"{exe}" "{script}" --open "%1"')
-        self.assertNotIn('cmd.exe', cmd)
+        script = self.base / 'sendto_entry.py'
+        args = context_menu.shortcut_arguments(script, '--open')
+        self.assertEqual(args, f'"{script}" --open')
+        self.assertNotIn('cmd.exe', args)
         with self.assertRaises(ValueError):
-            context_menu.command_for(exe, script, '--erase')
+            context_menu.shortcut_arguments(script, '--erase')
 
     def test_gui_open_selects_user_target(self):
         instance = SimpleNamespace(run=lambda: None)
@@ -426,8 +425,12 @@ class RealShortcutTests(unittest.TestCase):
             entry = base / 'скрипт ! with spaces.py'
             entry.touch()
             context_menu._install_shortcuts(folder, target, entry)
-            for path in context_menu.shortcut_paths(folder):
+            for path, flag in context_menu.shortcut_paths(folder).items():
                 self.assertTrue(path.is_file())
+                info = context_menu._shortcut_metadata(path)
+                self.assertEqual(info['description'], context_menu.LINK_OWNER, repr(info))
+                self.assertEqual(Path(info['target']).resolve(), target.resolve())
+                self.assertEqual(info['arguments'], context_menu.shortcut_arguments(entry, flag))
                 self.assertTrue(context_menu._owned_shortcut(path))
             with patch.object(context_menu, '_sendto_folder', return_value=folder), \
                  patch.object(context_menu, 'MENU_LOCK', base / 'lock'), \

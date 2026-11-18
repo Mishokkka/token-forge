@@ -446,11 +446,14 @@ class TokenForge:
         self.folder_label.set(str(folder))
         self._set_file_list(files)
         self.status.set(f'Исходных артов: {len(files)}. Результаты сохраняются рядом с оригиналами.')
-        if select_path is not None and select_path not in files:
+        # Python's WindowsPath equality alone is case insensitive, even
+        # in directories where the OS permits distinct case variants.
+        selected_target = next((p for p in files if p.name == select_path.name), None) if select_path else None
+        if select_path is not None and selected_target is None:
             self._clear_selection()
             self.status.set(f'Не удалось открыть {select_path.name}: файл недоступен или исключён как рамка.')
         elif files:
-            selected_path = select_path if select_path is not None else files[0]
+            selected_path = selected_target if selected_target is not None else files[0]
             index = files.index(selected_path)
             self.file_list.selection_set(index)
             self.file_list.see(index)
@@ -923,7 +926,8 @@ class TokenForge:
             self._request_preview(cached_only=cached_only)
 
     def _cancel(self):
-        if self.scan_running:
+        if self.scan_running or self.pending_scan is not None:
+            self.scan_generation += 1
             self.pending_scan = None
             self.cancel_event.set()
             self.status.set('Остановка поиска…')

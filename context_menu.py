@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -50,10 +51,16 @@ def _powershell(script, **variables):
 
 
 def _sendto_folder():
-    folder = _powershell('[Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo)')
+    folder = _powershell("Write-Output ([Environment]::GetFolderPath([Environment+SpecialFolder]::SendTo))")
     if not folder or not Path(folder).is_dir():
         raise OSError('Не найдена папка Windows SendTo.')
     return Path(folder)
+
+
+def shortcut_arguments(entry, flag):
+    if flag not in {action for _, action in ACTION_NAMES.values()}:
+        raise ValueError('Unknown action')
+    return f'"{entry}" {flag}'
 
 
 def _write_shortcut(path, pythonw, entry, flag):
@@ -65,16 +72,31 @@ $l.Arguments = $env:TF_ARGS
 $l.WorkingDirectory = $env:TF_DIR
 $l.Description = $env:TF_OWNER
 $l.Save()
-""", LINK=path, TARGET=pythonw, ARGS=f'"{entry}" {flag}',
+""", LINK=path, TARGET=pythonw, ARGS=shortcut_arguments(entry, flag),
         DIR=entry.parent, OWNER=LINK_OWNER)
 
 
-def _owned_shortcut(path):
-    return _powershell(r"""
+def _shortcut_metadata(path):
+    # PowerShell object output, rather than Console.WriteLine overloads,
+    # is consistently captured by the host in CI and desktop sessions.
+    data = _powershell(r"""
 $s = New-Object -ComObject WScript.Shell
 $l = $s.CreateShortcut($env:TF_LINK)
-[Console]::WriteLine($l.Description)
-""", LINK=path) == LINK_OWNER
+[pscustomobject]@{
+    description = [string]$l.Description
+    target = [string]$l.TargetPath
+    arguments = [string]$l.Arguments
+} | ConvertTo-Json -Compress
+""", LINK=path)
+    return json.loads(data)
+
+
+def _owned_shortcut(path):
+    try:
+        info = _shortcut_metadata(path)
+    except (OSError, ValueError):
+        return False
+    return info.get('description') == LINK_OWNER
 
 
 def shortcut_paths(folder):
