@@ -14,7 +14,7 @@ from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache,
     export_batch, load_frame, list_source_images, read_image,
     remove_background, token_output_path, source_identity, read_export_owner,
-    LoadedCutout, excluded_file,
+    LoadedCutout, excluded_file, extraction_provenance,
 )
 from item_engine import item_output_path, export_items
 
@@ -82,7 +82,8 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
         cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
                             disk_cache=cache, memory=memory, sessions=sessions,
                             decode=decode, extract=remove_background, session_factory=new_local_session)
-        return LoadedCutout(cutout, identity)
+        return LoadedCutout(cutout.image, identity,
+                            extraction_provenance(model, keep_alpha, edge_mode, revision=cutout.revision))
 
     return get_cutout
 
@@ -111,7 +112,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
         out_size=size, format_name=ext,
         skip_exists=settings['skip_exists'],
         convert_original=settings['convert_original'],
-        extraction_recipe=(model, keep_alpha, edge_mode),
+        extraction_recipe=lambda: extraction_provenance(model, keep_alpha, edge_mode),
         captured_loader=lambda capture: get_cutout(capture.path, captured=capture),
     )
     for warning in result.warnings:
@@ -141,7 +142,7 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=settings['skip_exists'],
                           convert_original=settings['convert_original'],
-                          extraction_recipe=(model, keep_alpha, edge_mode),
+                          extraction_recipe=lambda: extraction_provenance(model, keep_alpha, edge_mode),
                           captured_loader=lambda capture: get_cutout(capture.path, captured=capture))
     for warning in result.warnings:
         write_log(warning)

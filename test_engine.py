@@ -737,6 +737,44 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(copy.read_bytes(), original_copy)
             self.assertTrue(result.warnings)
 
+    def test_both_exporters_record_actual_extraction_revision(self):
+        from token_engine import LoadedCutout, read_export_owner, source_identity, token_recipe, extraction_provenance
+        from item_engine import export_items, item_output_path, ItemAdjust, item_recipe
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            args = ('birefnet-general', False, 'Обычный')
+            old = extraction_provenance(*args, revision=('before-download',))
+            actual = extraction_provenance(*args, revision=('actual',))
+            changed = extraction_provenance(*args, revision=('changed',))
+            loader = Mock(return_value=LoadedCutout(self.figure, source_identity(source), actual))
+            current = Mock(return_value=old)
+            token_adjust, item_adjust = Adjust(), ItemAdjust()
+            def token():
+                return export_batch([source], loader, self.frame, self.mask,
+                                    {source: token_adjust}, convert_original=False,
+                                    extraction_recipe=current)
+            def item():
+                return export_items([source], loader, {source: item_adjust},
+                                    convert_original=False, extraction_recipe=current)
+            for run, destination, recipe in (
+                (token, token_output_path(source), token_recipe(self.frame, token_adjust, 256, 'webp', actual)),
+                (item, item_output_path(source), item_recipe(item_adjust, actual)),
+            ):
+                with self.subTest(destination=destination.name):
+                    current.return_value = old
+                    self.assertEqual(run().created, 1)
+                    self.assertEqual(read_export_owner(destination)[4], recipe)
+                    current.return_value = actual
+                    self.assertFalse(run().warnings)
+                    current.return_value = changed
+                    loader.reset_mock()
+                    report = run()
+                    self.assertEqual(report.skipped, 1)
+                    self.assertTrue(any('Параметры генерации' in w for w in report.warnings))
+                    loader.assert_not_called()
+
     def test_token_without_visible_subject_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'вне видимой области'):
             compose(self.figure, self.frame, self.mask, 256, Adjust(x=120))

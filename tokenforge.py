@@ -25,13 +25,13 @@ from token_engine import (
     export_batch, list_source_images, read_image, remove_background, token_output_path,
     source_identity, assert_source_identity, LoadedCutout, excluded_file, read_owned_export_image,
     file_stamp, EXPECTED_ABSENT, inspect_existing_export, load_frame,
-    freshness_warnings, token_recipe,
+    freshness_warnings, token_recipe, extraction_provenance,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path, item_recipe
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
                             override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES,
                             EDGE_MODES, decode_settings, recover_settings_file, BatchAdjustments)
-from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session
+from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session, model_revision
 from cutout_service import load_cutout
 from preview_renderer import PreviewJob, PreviewRenderer
 
@@ -789,7 +789,7 @@ class TokenForge:
             self._request_preview()
 
     def _cache_key(self, path, model, keep_alpha, edge_mode):
-        return (*source_identity(path), model, keep_alpha, edge_mode)
+        return (*source_identity(path), model, keep_alpha, edge_mode, model_revision(model))
 
     def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False,
                     captured=None):
@@ -798,11 +798,11 @@ class TokenForge:
         elif key is None:
             key = self._cache_key(path, model, keep_alpha, edge_mode)
         decode = (lambda path, *, identity: captured.decode()) if captured is not None else read_image
-        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
+        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key[:7],
                             disk_cache=self.disk_cache, memory=self.cache, sessions=self.sessions,
                             decode=decode, extract=remove_background, session_factory=new_local_session,
                             cached_only=cached_only)
-        return cutout, key
+        return cutout.image, (*key[:7], cutout.revision)
 
     def _preview_request(self):
         return (self.preview_generation, self.selected, self.model.get(),
@@ -849,7 +849,8 @@ class TokenForge:
             observed = file_stamp(path)
             checked_at = time.monotonic()
             if (verify and previous is not None and observed is not None
-                    and observed == previous_stamp and checked_at - last_full_check < 30):
+                    and observed == previous_stamp and checked_at - last_full_check < 30
+                    and previous[-1] == model_revision(model)):
                 self.events.put(('preview_unchanged', (request, previous_stamp, last_full_check)))
                 return
             key = self._cache_key(path, model, keep_alpha, edge_mode)
@@ -873,7 +874,7 @@ class TokenForge:
                 self.events.put(('preview_invalidated', request))
             notice = ()
             if saved is not None:
-                extraction = (model, keep_alpha, edge_mode)
+                extraction = extraction_provenance(model, keep_alpha, edge_mode, revision=key[-1])
                 recipe = (item_recipe(saved_adjustment, extraction) if saved_mode == 'item'
                           else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction)
                           if saved_frame is not None else None)
@@ -1095,7 +1096,8 @@ class TokenForge:
                 captured = BatchAdjustments(settings, mode, default_layout)
             def get_cutout(path, *, captured_source=None):
                 image, key = self._get_cutout(path, model, keep, edge_mode, captured=captured_source)
-                return LoadedCutout(image, key[:4])
+                return LoadedCutout(image, key[:4],
+                                    extraction_provenance(model, keep, edge_mode, revision=key[-1]))
 
             def load_captured(capture):
                 return get_cutout(capture.path, captured_source=capture)
@@ -1106,7 +1108,7 @@ class TokenForge:
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
                                       expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
-                                      extraction_recipe=(model, keep, edge_mode),
+                                      extraction_recipe=lambda: extraction_provenance(model, keep, edge_mode),
                                       captured_loader=load_captured)
             else:
                 result = export_batch(selected_files, get_cutout, frame, interior,
@@ -1115,7 +1117,7 @@ class TokenForge:
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
                                       expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
-                                      extraction_recipe=(model, keep, edge_mode),
+                                      extraction_recipe=lambda: extraction_provenance(model, keep, edge_mode),
                                       captured_loader=load_captured)
             self.events.put(('done', result))
         self._launch_worker(work, lambda exc: self.events.put(('batch_failure', traceback.format_exc())))

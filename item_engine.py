@@ -201,4 +201,6 @@ def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                          cancel_event=cancel_event, on_progress=on_progress,
                          approved_outputs=approved_outputs, expected_inputs=expected_inputs,
                          captured_loader=captured_loader,
-                         recipe_for=lambda source: item_recipe(adjustments[source], extraction_recipe))
+                         recipe_for=lambda source, actual=None: item_recipe(
+                             adjustments[source], actual if actual is not None else (
+                                 extraction_recipe() if callable(extraction_recipe) else extraction_recipe)))

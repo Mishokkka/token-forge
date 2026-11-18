@@ -15,7 +15,7 @@ from local_models import call_rembg, model_revision
 from process_lock import process_lock
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
-CUTOUT_CACHE_VERSION = 4
+CUTOUT_CACHE_VERSION = 5
 MAX_ENCODED_BYTES = 256 * 1024 * 1024
 MAX_IMAGE_PIXELS = 64 * 1024 * 1024
 MAX_IMAGE_SIDE = 16384
@@ -745,7 +745,14 @@ def recipe_digest(kind, **settings):
     return hashlib.sha256(payload.encode('ascii')).hexdigest()
 
 
-COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100, color='sRGB')
+COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100,
+                            color='sRGB', decoder=2)
+
+
+def extraction_provenance(model, keep_alpha, edge_mode, *, revision=None):
+    """Use the exact observed revision for rendered pixels, current one for freshness."""
+    return (model, keep_alpha, edge_mode, CUTOUT_CACHE_VERSION,
+            model_revision(model) if revision is None else revision)
 
 
 def token_recipe(frame, adjustment, size, format_name, extraction, *, frame_digest=None):
@@ -1189,6 +1196,7 @@ def list_source_images(folder: Path, exclude: Path | None = None, *, cancel_even
 class LoadedCutout:
     image: Image.Image
     identity: tuple
+    extraction: tuple | None = None
 
 
 @dataclass
@@ -1287,10 +1295,11 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     else:
                         cutout = loaded
                     image = renderer(cutout, source)
-                    # The renderer may have recovered from an unavailable frame.
-                    # Record the recipe of the actual successful render.
-                    if recipe is None and recipe_for is not None:
-                        recipe = recipe_for(source)
+                    # Use the revision that actually produced the pixels, not
+                    # an observation made before first download or model reload.
+                    actual = loaded.extraction if isinstance(loaded, LoadedCutout) else None
+                    if recipe_for is not None and (recipe is None or actual is not None):
+                        recipe = recipe_for(source, actual)
                     publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
                                                  approved_identity=approved,
                                                  input_identity=identity, collision_index=folders, recipe=recipe)
@@ -1320,7 +1329,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
         if frame is None and frame_loader is not None:
             frame, interior = frame_loader()
         return frame
-    def recipe_for(source):
+    def recipe_for(source, actual=None):
         nonlocal frame_digest
         try:
             if ensure_frame() is None:
@@ -1331,7 +1340,9 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
             return None
         if frame_digest is None:
             frame_digest = hashlib.sha256(frame.tobytes()).hexdigest()
-        return token_recipe(frame, adjustments[source], out_size, format_name, extraction_recipe,
+        extraction = actual if actual is not None else (
+            extraction_recipe() if callable(extraction_recipe) else extraction_recipe)
+        return token_recipe(frame, adjustments[source], out_size, format_name, extraction,
                             frame_digest=frame_digest)
     def render(cutout, source):
         ensure_frame()

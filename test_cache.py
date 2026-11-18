@@ -153,7 +153,8 @@ class CacheTests(unittest.TestCase):
             result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
                                  disk_cache=disk, memory=memory, sessions=sessions, decode=read_image,
                                  extract=extract, session_factory=factory)
-        self.assertIs(result, cutout)
+        self.assertIs(result.image, cutout)
+        self.assertEqual(result.revision, ('new',))
         self.assertEqual(factory.call_count, 2)
         self.assertIs(extract.call_args.args[1], second)
         self.assertEqual(sessions[model], (('new',), second))
@@ -173,7 +174,7 @@ class CacheTests(unittest.TestCase):
         result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
                              disk_cache=disk, memory={}, sessions={}, decode=read_image,
                              extract=extract, session_factory=factory)
-        self.assertIs(result, image)
+        self.assertIs(result.image, image)
         disk.save.assert_not_called()
         extract.assert_not_called()
         factory.assert_not_called()
@@ -302,7 +303,8 @@ class CacheTests(unittest.TestCase):
         app._adjust_for = lambda path: Adjust()
         app._get_cutout = lambda path, *args, captured=None: (
             captured.decode() if captured is not None else read_image(path),
-            (captured.identity if captured is not None else source_identity(path)) + args)
+            (captured.identity if captured is not None else source_identity(path)) + args
+            + (__import__('local_models').model_revision(args[0]),))
         destination = token_output_path(self.source)
         save_generated(Image.new('RGBA', (256, 256), 'red'), destination, self.source,
                        'token', skip_exists=False)
@@ -845,6 +847,35 @@ class CacheTests(unittest.TestCase):
             hash_source.assert_called_once()
             self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
 
+    def test_model_revision_invalidates_preview_even_when_source_unchanged(self):
+        import queue
+        import time
+        from unittest.mock import Mock
+        from token_engine import file_stamp
+        app = self.make_mock_app()
+        app.events, app.status = queue.Queue(), Mock()
+        app.selected = self.source
+        app.frame = object()
+        for name, value in {'work_mode': 'token', 'show_cutout': False,
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        with patch('tokenforge.model_revision', return_value=('old',)):
+            app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+        app.current_cutout = read_image(self.source)
+        app.preview_stamp = file_stamp(self.source)
+        app.last_full_check = time.monotonic()
+        with patch('tokenforge.model_revision', return_value=('new',)), \
+             patch('tokenforge.threading.Thread') as launch:
+            new_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+            app._get_cutout = Mock(return_value=(app.current_cutout, new_key))
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+        self.assertEqual(app.events.get_nowait()[0], 'preview_invalidated')
+        action, data = app.events.get_nowait()
+        self.assertEqual(action, 'preview')
+        self.assertEqual(data[2], new_key)
+        app._get_cutout.assert_called_once()
+
     def test_close_waits_for_export_worker_and_discards_queue(self):
         import queue
         import threading
@@ -1060,7 +1091,7 @@ class CacheTests(unittest.TestCase):
     def test_saved_only_view_rechecks_source_without_inference(self):
         import queue
         from unittest.mock import Mock
-        from token_engine import Adjust, source_identity, save_generated, token_recipe
+        from token_engine import Adjust, source_identity, save_generated, token_recipe, extraction_provenance
         app = self.make_mock_app()
         app.selected = self.source
         app.frame = read_image(Path(__file__).parent / 'RingT.png')
@@ -1072,7 +1103,8 @@ class CacheTests(unittest.TestCase):
             setattr(app, name, SimpleNamespace(get=lambda v=value: v))
         saved_path = token_output_path(self.source)
         ident = source_identity(self.source)
-        recipe = token_recipe(app.frame, Adjust(), 256, 'webp', ('birefnet-general', True, 'e'))
+        recipe = token_recipe(app.frame, Adjust(), 256, 'webp',
+                              extraction_provenance('birefnet-general', True, 'e'))
         save_generated(Image.new('RGBA', (256, 256), 'red'), saved_path, self.source, 'token',
                        skip_exists=False, input_identity=ident, recipe=recipe)
         app._get_cutout = Mock(return_value=(None, app._cache_key(self.source, 'birefnet-general', True, 'e')))

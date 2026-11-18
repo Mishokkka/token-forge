@@ -1,9 +1,17 @@
 """Shared extraction/cache policy for GUI and Explorer/CLI entry points."""
+from dataclasses import dataclass
+from PIL import Image
 from token_engine import already_transparent, assert_source_identity, validate_art_dimensions
 from local_models import require_local_model, model_revision
 from process_lock import process_lock
 
 MEMORY_LIMIT_BYTES = 256 * 1024**2
+
+
+@dataclass(frozen=True)
+class CutoutResult:
+    image: Image.Image | None
+    revision: tuple
 
 
 def remember(memory, key, image, *, count_limit=6, byte_limit=MEMORY_LIMIT_BYTES):
@@ -51,7 +59,8 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
     if cutout is None:
         if cached_only:
             check()
-            return None
+            verify_revision()
+            return CutoutResult(None, revision)
         original = decode(path, identity=identity)
         if keep_alpha and already_transparent(original):
             cutout = original
@@ -91,4 +100,4 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
     check()
     verify_revision()
     remember(memory, memory_key, cutout, count_limit=memory_limit)
-    return cutout
+    return CutoutResult(cutout, revision)
