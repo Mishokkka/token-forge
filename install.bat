@@ -19,7 +19,9 @@ goto install_packages
 
 :stale_env
 echo ERROR: Existing .venv cannot run or is incompatible.
-echo Use regular 64-bit CPython 3.11-3.13, not a free-threaded build.
+echo Use regular 64-bit CPython 3.11-3.13 with Tcl/Tk, not a free-threaded build.
+if exist ".venv\Scripts\python.exe" ".venv\Scripts\python.exe" "python_compat.py"
+echo If using Python 3.13.0, upgrade to 3.13.1 or later first.
 echo Rename or delete only the .venv folder, then run install.bat again.
 echo Your settings and cutouts are stored separately in LocalAppData.
 goto failed
@@ -71,7 +73,8 @@ if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :python_missing
-echo ERROR: Regular 64-bit CPython 3.11, 3.12 or 3.13 not found.
+echo ERROR: No compatible regular 64-bit CPython 3.11, 3.12 or 3.13 with Tcl/Tk found.
+echo Enable Tcl/Tk in your Python installation. Windows Python 3.13.0 must be upgraded to 3.13.1 or later.
 echo Install Python 3.12 64-bit from https://www.python.org/downloads/release/python-31210/
 echo During installation check Add python.exe to PATH, then reopen this file.
 goto failed
@@ -84,6 +87,9 @@ goto failed
 
 :install_packages
 if not exist ".venv\Scripts\python.exe" goto venv_failed
+".venv\Scripts\python.exe" "python_compat.py"
+if errorlevel 1 goto stale_env
+if not errorlevel 0 goto stale_env
 echo.
 echo Installing required Python packages (internet required)...
 echo.

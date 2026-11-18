@@ -21,6 +21,9 @@ echo Python launcher is not available, checking virtual environment.
 :env_check
 if not exist ".venv\Scripts\python.exe" goto no_env
 ".venv\Scripts\python.exe" --version
+".venv\Scripts\python.exe" "python_compat.py"
+if errorlevel 1 goto check_failed
+if not errorlevel 0 goto check_failed
 ".venv\Scripts\python.exe" -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Python packages: OK')"
 if errorlevel 1 goto check_failed
 if not errorlevel 0 goto check_failed

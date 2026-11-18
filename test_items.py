@@ -54,10 +54,28 @@ class ItemTests(unittest.TestCase):
         self.assertLess(min(black_x), min(red_x))
         self.assertEqual(min(red_x) - min(black_x), 3)
 
-    def test_position_zoom_rotate_adjust(self):
-        a = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[0]))
-        b = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[0], x=15, y=-20, zoom=130, rotation=24))
-        self.assertNotEqual(a.tobytes(), b.tobytes())
+    def test_zoom_control_independently_shrinks_subject(self):
+        a = compose_item(self.sword, ItemAdjust(zoom=100)).getchannel('A').getbbox()
+        b = compose_item(self.sword, ItemAdjust(zoom=50)).getchannel('A').getbbox()
+        self.assertLess(b[2] - b[0], a[2] - a[0])
+        self.assertLess(b[3] - b[1], a[3] - a[1])
+
+    def test_position_controls_move_independent_axes(self):
+        baseline = compose_item(self.sword, ItemAdjust(zoom=50)).getchannel('A').getbbox()
+        def center(box, axis):
+            return (box[axis] + box[axis + 2]) / 2
+        for axis, adjust in ((0, ItemAdjust(zoom=50, x=30)),
+                             (1, ItemAdjust(zoom=50, y=-30))):
+            moved = compose_item(self.sword, adjust).getchannel('A').getbbox()
+            direction = 1 if axis == 0 else -1
+            self.assertGreater((center(moved, axis) - center(baseline, axis)) * direction, 20)
+            self.assertAlmostEqual(center(moved, 1-axis), center(baseline, 1-axis), delta=3)
+
+    def test_rotation_control_changes_axis(self):
+        a = compose_item(self.sword, ItemAdjust(rotation=0), stroke_px=0)
+        b = compose_item(self.sword, ItemAdjust(rotation=24), stroke_px=0)
+        delta = abs((_major_axis_angle(b) - _major_axis_angle(a) + 90) % 180 - 90)
+        self.assertAlmostEqual(delta, 24, delta=5)
 
     def test_batch_and_no_reingestion(self):
         with tempfile.TemporaryDirectory() as tmp:
