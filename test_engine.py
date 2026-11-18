@@ -407,6 +407,42 @@ class EngineTests(unittest.TestCase):
                 save_generated(self.figure, dest, source, 'token', skip_exists=False)
             self.assertFalse(dest.exists())
 
+    def test_export_inspection_fingerprints_and_checks_owner_in_one_read(self):
+        from token_engine import save_generated, inspect_existing_export, source_identity
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source)
+            save_generated(self.figure, dest, source, 'token', skip_exists=False)
+            expected = source_identity(dest)
+            opened = []
+            original = Path.open
+            def track(path, *args, **kwargs):
+                if path == dest:
+                    opened.append(path)
+                return original(path, *args, **kwargs)
+            with patch.object(Path, 'open', track):
+                identity, owned = inspect_existing_export(dest, source, 'token')
+            self.assertEqual(opened, [dest])
+            self.assertTrue(owned)
+            self.assertEqual(identity, expected)
+
+    def test_manual_click_expected_absence_rejects_new_destination(self):
+        from token_engine import EXPECTED_ABSENT, save_generated
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source)
+            save_generated(self.figure, dest, source, 'token', skip_exists=False)
+            before = dest.read_bytes()
+            result = export_batch([source], read_image, self.frame, self.mask,
+                                  {source: Adjust()}, skip_exists=False,
+                                  approved_outputs={dest: EXPECTED_ABSENT})
+            self.assertEqual((result.created, result.converted), (0, 0))
+            self.assertTrue(result.errors)
+            self.assertEqual(dest.read_bytes(), before)
+            self.assertFalse(source.with_suffix('.webp').exists())
+
     def test_late_owned_export_collision_is_not_successful_skip(self):
         import token_engine
         from token_engine import save_generated, FolderIndex

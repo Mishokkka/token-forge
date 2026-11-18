@@ -195,11 +195,17 @@ class CacheTests(unittest.TestCase):
         destination = token_output_path(self.source)
         save_generated(Image.new('RGBA', (256, 256), 'red'), destination, self.source,
                        'token', skip_exists=False)
-        with patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
-            app._export_current()
+        with patch('tokenforge.threading.Thread') as launch:
+            with patch('tokenforge.source_identity', side_effect=AssertionError('hash on Tk')), \
+                 patch('tokenforge.inspect_existing_export', side_effect=AssertionError('read on Tk')):
+                app._export_current()
+            self.assertTrue(app.events.empty())
+            launch.call_args.kwargs['target']()
             action, data = app.events.get_nowait()
             self.assertEqual(action, 'export_preflight')
             app._handle_worker_event(action, data)
+            self.assertEqual(launch.call_count, 2)
+            launch.call_args.kwargs['target']()
         events = []
         while not app.events.empty():
             events.append(app.events.get_nowait())
@@ -308,13 +314,13 @@ class CacheTests(unittest.TestCase):
         app.work_mode = SimpleNamespace(get=lambda: 'token')
         displays = []
         app._show_token = displays.append
-        original = token_engine.source_identity
-        def race(path):
-            result = original(path)
-            if path == existing:
+        original = token_engine._fingerprint
+        def race(path, snapshot=None):
+            result = original(path, snapshot)
+            if path == existing and snapshot is not None:
                 Image.new('RGBA', (32, 32), 'blue').save(existing)
             return result
-        with patch('token_engine.source_identity', side_effect=race):
+        with patch('token_engine._fingerprint', side_effect=race):
             self.assertIsNone(app._load_saved_preview(self.source, 'token', 'webp'))
         self.assertEqual(displays, [])
 
@@ -482,6 +488,39 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(result.errors)
         self.assertEqual(dest.read_bytes(), before)
         self.assertFalse(self.source.with_suffix('.webp').exists())
+
+    def test_manual_preflight_rejects_source_changed_while_queued(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        from token_engine import file_stamp
+        app = self.make_mock_app()
+        app.events, app.cancel_event, app.status = queue.Queue(), threading.Event(), Mock()
+        dest = token_output_path(self.source)
+        stamp = file_stamp(self.source)
+        request = ([self.source], 'token') + (None,) * 13 + (
+            (self.source, dest, stamp, None, app.frame_path),)
+        with patch('tokenforge.threading.Thread') as launch:
+            app._run_preflight(request)
+            Image.new('RGBA', (30, 40), 'blue').save(self.source)
+            launch.call_args.kwargs['target']()
+        event, message = app.events.get_nowait()
+        self.assertEqual(event, 'preflight_failure')
+        self.assertIn('изменился', message)
+        self.assertFalse(dest.exists())
+
+    def test_cancelled_preflight_never_queues_export(self):
+        import threading
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.cancel_event = threading.Event()
+        app.cancel_event.set()
+        app.pending_export = None
+        app._run_export = Mock()
+        with patch('tokenforge.messagebox.askyesno', side_effect=AssertionError('dialog after cancel')):
+            app._handle_worker_event('export_preflight', (object(), self.source, True))
+        self.assertIsNone(app.pending_export)
+        app._run_export.assert_not_called()
 
     def test_worker_start_failure_posts_terminal_event(self):
         import queue

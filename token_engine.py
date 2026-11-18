@@ -39,13 +39,20 @@ def file_stamp(path: Path):
         return None
 
 
-def source_identity(source: Path) -> tuple:
+def _fingerprint(source: Path, snapshot=None) -> tuple:
     resolved = Path(source).resolve()
     signature = stat_signature
     path_before = resolved.stat()
     with resolved.open('rb') as stream:
         before = os.fstat(stream.fileno())
-        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if snapshot is None:
+            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        else:
+            hasher = hashlib.sha256()
+            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                hasher.update(chunk)
+                snapshot.write(chunk)
+            digest = hasher.hexdigest()
         after = os.fstat(stream.fileno())
         path_after = resolved.stat()
     # On Windows fstat and stat need not expose identical inode/device IDs.
@@ -54,7 +61,22 @@ def source_identity(source: Path) -> tuple:
             or signature(path_before) != signature(path_after)
             or (after.st_size, after.st_mtime_ns) != (path_after.st_size, path_after.st_mtime_ns)):
         raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+    if snapshot is not None and snapshot.tell() != path_after.st_size:
+        raise OSError(f'Размер исходного файла изменился: {source.name}')
     return str(resolved), path_after.st_size, path_after.st_mtime_ns, digest
+
+
+def source_identity(source: Path) -> tuple:
+    return _fingerprint(source)
+
+
+@contextmanager
+def fingerprinted_snapshot(path: Path):
+    """Capture the content and its fingerprint in a single source-file read."""
+    with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b') as snapshot:
+        identity = _fingerprint(path, snapshot)
+        snapshot.seek(0)
+        yield identity, snapshot
 
 
 def assert_source_identity(source: Path, identity: tuple) -> None:
@@ -424,8 +446,11 @@ def _replace_posix(temporary, destination, backup):
     os.rename(temporary, backup)
     try:
         _posix_exchange(backup, destination)
-    except BaseException:
-        backup.unlink(missing_ok=True)
+    except BaseException as exc:
+        try:
+            backup.unlink(missing_ok=True)
+        except OSError as cleanup:
+            exc.add_note(f'Не удалось удалить временный файл {backup}: {cleanup}')
         raise
 
 
@@ -599,10 +624,16 @@ def _owner_matches(owner, source, kind):
                    for p in live_stem_candidates(source.parent, {source.stem}))
 
 
+def inspect_existing_export(destination, source, kind):
+    """Return the destination's exact fingerprint and ownership from one read."""
+    with fingerprinted_snapshot(destination) as (identity, snapshot):
+        owner = _probe_owner(snapshot) if destination.suffix.lower() in ('.png', '.webp') else None
+        return identity, _owner_matches(owner, source, kind)
+
+
 def read_owned_export_image(destination, source, kind):
     """Decode only the same verified bytes whose ownership was inspected."""
-    identity = source_identity(destination)
-    with source_snapshot(destination, identity) as snapshot:
+    with fingerprinted_snapshot(destination) as (identity, snapshot):
         with Image.open(snapshot) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if not _owner_matches(owner, source, kind):

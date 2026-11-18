@@ -22,8 +22,8 @@ from PIL import Image, ImageDraw, ImageTk
 from token_engine import (
     Adjust, DiskCutoutCache, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
-    source_identity, assert_source_identity, is_owned_export, LoadedCutout, excluded_file, read_owned_export_image,
-    file_stamp, EXPECTED_ABSENT,
+    source_identity, assert_source_identity, LoadedCutout, excluded_file, read_owned_export_image,
+    file_stamp, EXPECTED_ABSENT, inspect_existing_export,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
@@ -933,8 +933,10 @@ class TokenForge:
             identity = source_identity(source)
             if expected_input is not None and expected_input != identity:
                 raise OSError(f'Исходный файл изменился: {source.name}')
-            prior = source_identity(destination) if destination_stamp is not None else EXPECTED_ABSENT
-            owned = prior is not EXPECTED_ABSENT and is_owned_export(destination, source, mode, identity=prior)
+            if destination_stamp is None:
+                prior, owned = EXPECTED_ABSENT, False
+            else:
+                prior, owned = inspect_existing_export(destination, source, mode)
             check_stamps()
             ready = request[:12] + ({destination: prior}, identity, request[14])
             self.events.put(('export_preflight', (ready, destination, prior is not EXPECTED_ABSENT and not owned)))
