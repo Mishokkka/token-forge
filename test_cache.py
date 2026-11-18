@@ -612,6 +612,37 @@ class CacheTests(unittest.TestCase):
         app._apply_folder_scan((3, self.directory, a, None, True, False), [a, b], False, None)
         app._select.assert_called_once_with(a)
 
+    def test_frame_refresh_does_not_scan_folder_on_tk(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.selected = self.source
+        app.frame_path = self.directory / 'Frame.png'
+        app.files = [self.source] + [self.directory / f'Art{i}.png' for i in range(1000)]
+        app._queue_scan, app._clear_selection, app._set_file_list = Mock(), Mock(), Mock()
+        with patch('tokenforge.excluded_file', return_value=False) as check:
+            app._refresh_frame_sources()
+            check.assert_called_once_with(self.source, app.frame_path)
+        app._clear_selection.assert_not_called()
+        app._set_file_list.assert_not_called()
+        app._queue_scan.assert_called_once_with(self.directory, persist=False, follow_selection=True)
+        app.file_list = Mock()
+        with patch('tokenforge.excluded_file', return_value=True) as check:
+            app._refresh_frame_sources()
+            check.assert_called_once_with(self.source, app.frame_path)
+        app._clear_selection.assert_called_once()
+
+    def test_stale_list_cannot_select_new_frame_alias(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.frame_path = self.source
+        app.file_list, app.status, app._clear_selection = Mock(), Mock(), Mock()
+        app._request_preview = Mock()
+        app._select(self.source)
+        app._clear_selection.assert_called_once()
+        app.file_list.selection_clear.assert_called_once()
+        app._request_preview.assert_not_called()
+
     def test_folder_export_builds_validated_adjustments_only_in_worker(self):
         import queue
         import threading

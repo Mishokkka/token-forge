@@ -26,7 +26,7 @@ from token_engine import (
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
-                            override_for, output_format, valid_layout)
+                            override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES)
 from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session
 from cutout_service import load_cutout
 
@@ -250,12 +250,13 @@ class TokenForge:
         self.token_controls = tk.Frame(settings_col, bg=PANEL)
         self.token_controls.pack(fill='x')
         fields = [
-            ('Масштаб, %', self.zoom, 5, 320),
-            ('Горизонталь, %', self.x, -120, 120),
-            ('Вертикаль, %', self.y, -120, 120),
-            ('Отступ над головой, %', self.gap, -20, 50),
+            ('zoom', 'Масштаб, %', self.zoom),
+            ('x', 'Горизонталь, %', self.x),
+            ('y', 'Вертикаль, %', self.y),
+            ('gap', 'Отступ над головой, %', self.gap),
         ]
-        for (title, var, low, high), name in zip(fields, ('zoom', 'x', 'y', 'gap')):
+        for name, title, var in fields:
+            low, high = TOKEN_RANGES[name]
             field = tk.Frame(self.token_controls, bg=PANEL)
             field.pack(fill='x', pady=(0, 1))
             tk.Label(field, text=title, bg=PANEL, fg=FG, font=('Segoe UI', 9),
@@ -298,12 +299,13 @@ class TokenForge:
                                    textvariable=self.default_item_layout, state='readonly', width=16)
         default_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
         default_box.bind('<<ComboboxSelected>>', lambda e: self._on_default_item_layout_change())
-        for name, title, var, low, high in [
-            ('zoom', 'Масштаб, %', self.item_zoom, 10, 100),
-            ('x', 'Горизонталь, %', self.item_x, -100, 100),
-            ('y', 'Вертикаль, %', self.item_y, -100, 100),
-            ('rotation', 'Поворот, °', self.item_rotation, -180, 180),
+        for name, title, var in [
+            ('zoom', 'Масштаб, %', self.item_zoom),
+            ('x', 'Горизонталь, %', self.item_x),
+            ('y', 'Вертикаль, %', self.item_y),
+            ('rotation', 'Поворот, °', self.item_rotation),
         ]:
+            low, high = ITEM_RANGES[name]
             row = tk.Frame(self.item_controls, bg=PANEL)
             row.pack(fill='x', pady=(0, 1))
             tk.Label(row, text=title, bg=PANEL, fg=FG, font=('Segoe UI', 9),
@@ -483,17 +485,12 @@ class TokenForge:
             self._schedule_save()
 
     def _refresh_frame_sources(self):
-        # Exclude the new frame immediately. Then refresh discovery, including
-        # the previous frame if it is now an eligible image.
-        selected = self.selected
-        filtered = [p for p in self.files if not excluded_file(p, self.frame_path)]
-        if len(filtered) != len(self.files):
-            self._set_file_list(filtered)
-            index = self._exact_row(filtered, selected)
-            if index is None:
-                self._clear_selection()
-            else:
-                self.file_list.selection_set(index)
+        # Checking every alias in a large or remote folder is filesystem
+        # work, so leave the last committed list visible until discovery ends.
+        # Immediately invalidate the selected art only if it is the new frame.
+        if self.selected is not None and excluded_file(self.selected, self.frame_path):
+            self.file_list.selection_clear(0, tk.END)
+            self._clear_selection()
         request = self.pending_scan or self.active_scan
         if request is not None:
             _, folder, target, _, persist, follow_selection = request
@@ -605,6 +602,13 @@ class TokenForge:
 
     def _select(self, path, *, force_preview=False):
         if self.closing:
+            return
+        # The old list can remain visible during an automatic frame refresh,
+        # after cancellation or if a remote folder is temporarily unavailable.
+        if excluded_file(path, self.frame_path):
+            self.file_list.selection_clear(0, tk.END)
+            self._clear_selection()
+            self.status.set('Выбранный файл используется как рамка, а не исходный арт.')
             return
         self.preview_generation += 1
         self.preview_retry = False

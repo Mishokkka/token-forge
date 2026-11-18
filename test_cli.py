@@ -269,6 +269,34 @@ class CliTests(unittest.TestCase):
             token_cli.automatic_token(self.photo)
         self.assertEqual(output_format('PNG'), 'png')
 
+    def test_automatic_corrupt_png_is_failure_not_successful_skip(self):
+        self.settings['ext'] = 'png'
+        self.settings['convert_original'] = False
+        self.save_settings()
+        state, output = token_cli.automatic_token(self.photo)
+        self.assertEqual(state, 'created')
+        data = output.read_bytes()
+        import struct
+        pos = 8
+        while data[pos+4:pos+8] != b'IDAT':
+            pos += 12 + struct.unpack('>I', data[pos:pos+4])[0]
+        output.write_bytes(data[:pos+9])
+        damaged = output.read_bytes()
+        from token_engine import read_export_owner
+        self.assertIsNotNone(read_export_owner(output))
+        with self.assertRaisesRegex(RuntimeError, 'повреждено'):
+            token_cli.automatic_token(self.photo)
+        with patch.object(token_cli, 'notify_user') as notify:
+            self.assertEqual(token_cli.run_auto(self.photo), 1)
+            notify.assert_called_once()
+            self.assertTrue(notify.call_args.kwargs['error'])
+        self.assertEqual(output.read_bytes(), damaged)
+        self.settings['skip_exists'] = False
+        self.save_settings()
+        self.assertEqual(token_cli.automatic_token(self.photo), ('created', output))
+        with Image.open(output) as image:
+            image.load()
+
     def test_conversion_warning_preserves_success(self):
         with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')):
             for action in (token_cli.automatic_token, token_cli.automatic_item):
