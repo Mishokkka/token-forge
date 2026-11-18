@@ -111,6 +111,74 @@ class CacheTests(unittest.TestCase):
         app._export_current()
         self.assertEqual(captured, [True])
 
+    def test_item_layout_default_is_independent_of_selected_override(self):
+        from item_engine import ITEM_MODES
+        app = self.make_mock_app()
+        app.settings = {'item_overrides': {str(self.source.resolve()): {'layout': ITEM_MODES[1]}}}
+        app.default_item_layout = SimpleNamespace(get=lambda: ITEM_MODES[0])
+        app.item_layout = SimpleNamespace(get=lambda: ITEM_MODES[1])
+        self.assertEqual(app._item_adjust_for(self.source).layout, ITEM_MODES[1])
+        self.assertEqual(app._item_adjust_for(self.directory / 'Another.png').layout, ITEM_MODES[0])
+
+    def test_queued_export_keeps_settings_and_pending_preview(self):
+        from token_engine import Adjust
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.running_batch = False
+        app.busy = True
+        app.preview_pending = True
+        app.pending_export = None
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        def control(value):
+            return SimpleNamespace(get=lambda: value)
+        app.work_mode = control('token')
+        app.model = control('model')
+        app.keep_alpha = control(True)
+        app.edge_mode = control('Обычный')
+        app.ext = control('webp')
+        app.size = control('256')
+        app.skip_exists = control(True)
+        app.convert_original = control(False)
+        app.status = Mock()
+        app._adjust_for = lambda path: Adjust(zoom=70)
+        app._run_export = Mock()
+        app._start_export([self.source])
+        app.ext, app.size = control('png'), control('1024')
+        app._adjust_for = lambda path: Adjust(zoom=160)
+        app._after_preview()
+        request = app._run_export.call_args.args[0]
+        self.assertEqual(request[5:7], ('webp', 256))
+        self.assertEqual(request[11][self.source].zoom, 70)
+        self.assertTrue(app.preview_pending)
+        self.assertIsNone(app.pending_export)
+        app._request_preview = Mock()
+        app._after_preview()
+        app._request_preview.assert_called_once()
+
+    def test_deleted_preview_source_does_not_stop_event_polling(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        app.root = Mock()
+        app.selected = self.source
+        app.status = Mock()
+        app.pending_export = None
+        app.preview_pending = False
+        app.busy = True
+        app.model = SimpleNamespace(get=lambda: 'm')
+        app.keep_alpha = SimpleNamespace(get=lambda: False)
+        app.edge_mode = SimpleNamespace(get=lambda: 'e')
+        key = app._cache_key(self.source, 'm', False, 'e')
+        self.source.unlink()
+        app.events.put(('preview', (self.source, Image.new('RGBA', (1, 1)), key)))
+        app._poll()
+        self.assertFalse(app.busy)
+        self.assertFalse(app.preview_pending)
+        app.root.after.assert_called_once_with(120, app._poll)
+
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)
         Image.new('RGBA', (256, 256), (31, 41, 51, 255)).save(existing, 'WEBP', lossless=True)

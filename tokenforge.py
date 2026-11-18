@@ -273,7 +273,7 @@ class TokenForge:
         default_box = ttk.Combobox(default_row, values=list(ITEM_MODES),
                                    textvariable=self.default_item_layout, state='readonly', width=16)
         default_box.pack(side='left', fill='x', expand=True, padx=(8, 0))
-        default_box.bind('<<ComboboxSelected>>', lambda e: self._schedule_save())
+        default_box.bind('<<ComboboxSelected>>', lambda e: self._on_default_item_layout_change())
         for title, var, low, high in [
             ('Масштаб, %', self.item_zoom, 10, 100),
             ('Горизонталь, %', self.item_x, -100, 100),
@@ -444,6 +444,18 @@ class TokenForge:
                          if key in stored})
         return ItemAdjust(**defaults)
 
+    def _on_default_item_layout_change(self):
+        # A new default applies to uncustomized items, not to explicit per-item
+        # overrides. Keep the preview and the next batch in agreement.
+        if self.selected is None or str(self.selected.resolve()) not in self.settings.get('item_overrides', {}):
+            self.item_layout.set(self.default_item_layout.get())
+            if self.selected is not None:
+                if self.current_cutout is not None:
+                    self._render()
+                else:
+                    self._request_preview()
+        self._schedule_save()
+
     def _current_item_adjust(self):
         return ItemAdjust(layout=self.item_layout.get(), zoom=self.item_zoom.get(),
                           x=self.item_x.get(), y=self.item_y.get(),
@@ -492,9 +504,13 @@ class TokenForge:
         has_token = self._show_saved_token(path)
         model, edge = self.model.get(), self.edge_mode.get()
         keep = self.keep_alpha.get()
-        key = self._cache_key(path, model, keep, edge)
-        has_cached_cutout = (key in self.cache or
-                             self.disk_cache.path_for(path, model, keep, edge).is_file())
+        try:
+            key = self._cache_key(path, model, keep, edge)
+            has_cached_cutout = (key in self.cache or
+                                 self.disk_cache.path_for(path, model, keep, edge, identity=key[:3]).is_file())
+        except OSError:
+            self.status.set(f'Исходный файл недоступен: {path.name}')
+            return
         # Navigating existing tokens should not waste time running the AI.
         # Extract only when the user begins editing or requests the raw cutout.
         if not has_token or has_cached_cutout:

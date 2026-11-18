@@ -18,7 +18,7 @@ class CliTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='TokenForge test кириллица ')
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.art_folder = self.root / 'My Portraits' / 'Персонажи'
         self.art_folder.mkdir(parents=True)
         self.base = self.root / 'Program Files' / 'TokenForge'
@@ -130,6 +130,18 @@ class CliTests(unittest.TestCase):
         Image.new('RGB', (10, 10)).save(cat)
         self.assertIn(cat, __import__('token_engine').list_source_images(self.art_folder))
         self.assertEqual(token_cli.resolve_context_source(cat), cat)
+        copy = cat.with_suffix('.webp')
+        Image.new('RGB', (10, 10)).save(copy)
+        self.assertEqual(token_cli.resolve_context_source(copy), cat)
+
+    def test_token_does_not_claim_another_sources_webp_copy(self):
+        ca = self.art_folder / 'Ca.png'
+        cat = self.art_folder / 'Cat.jpg'
+        Image.open(self.photo).save(ca)
+        Image.new('RGB', (10, 10)).save(cat)
+        with self.assertRaisesRegex(RuntimeError, 'конфликтует'):
+            token_cli.automatic_token(ca)
+        self.assertFalse(cat.with_suffix('.webp').exists())
 
     def test_conversion_warning_preserves_success(self):
         with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')), \

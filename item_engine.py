@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, save_original_webp, save_generated
+from token_engine import BatchResult, save_original_webp, save_generated, ensure_no_source_collision
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -198,6 +198,7 @@ def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                 result.record_error(source, 'преобразование оригинала', exc)
         destination = item_output_path(source)
         try:
+            ensure_no_source_collision(destination, source, 'item')
             if skip_exists and destination.exists():
                 result.skipped += 1
             else:

@@ -283,12 +283,36 @@ def export_owner(source: Path, kind: str) -> str:
     return 'TokenForge/1:' + json.dumps([kind, source.stem.casefold()], ensure_ascii=True)
 
 
-def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
+def read_export_owner(destination: Path) -> str | None:
     try:
         with Image.open(destination) as stored:
-            return stored.getexif().get(270) == export_owner(source, kind)
+            owner = stored.getexif().get(270)
+            if isinstance(owner, str) and owner.startswith('TokenForge/1:'):
+                return owner
     except (OSError, ValueError, SyntaxError):
-        return False
+        pass
+    return None
+
+
+def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
+    return read_export_owner(destination) == export_owner(source, kind)
+
+
+def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> None:
+    # Do not reserve the WebP-copy name of a different original, e.g.
+    # Ca.png would otherwise generate Cat.webp beside an actual Cat.jpg.
+    if destination.suffix.lower() != '.webp':
+        return
+    for candidate in destination.parent.iterdir():
+        if (candidate.suffix.lower() not in IMAGE_EXTS
+                or candidate.suffix.lower() == '.webp'
+                or candidate.stem.casefold() != destination.stem.casefold()
+                or not candidate.is_file()):
+            continue
+        if is_owned_export(candidate, source, kind):
+            continue
+        raise FileExistsError(f'Имя {destination.name} конфликтует с исходником {candidate.name}. '
+                              'Переименуй один из исходников.')
 
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
@@ -344,6 +368,8 @@ def save_original_webp(source: Path) -> bool:
         return False
     destination = original_webp_path(source)
     if destination.exists():
+        if read_export_owner(destination) is not None:
+            raise FileExistsError(f'Имя WebP-копии {destination.name} занято результатом TokenForge.')
         return False
     with Image.open(source) as raw:
         artwork = ImageOps.exif_transpose(raw)
@@ -428,6 +454,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image,
                 result.record_error(source, 'конвертация оригинала', exc)
         destination = token_output_path(source, format_name)
         try:
+            ensure_no_source_collision(destination, source, 'token')
             if skip_exists and destination.exists():
                 result.skipped += 1
             else:

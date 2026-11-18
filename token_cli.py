@@ -10,7 +10,7 @@ from pathlib import Path
 from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache, already_transparent,
     export_batch, frame_interior, list_source_images, read_image,
-    remove_background, token_output_path, source_identity, assert_source_identity,
+    remove_background, token_output_path, source_identity, assert_source_identity, read_export_owner,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -43,6 +43,11 @@ def resolve_context_source(filename: str | Path) -> Path:
     by_stem = {p.stem.casefold(): p for p in candidates}
     if path in candidates:
         return path
+    # A same-stem non-WebP original wins over the legacy suffix heuristic
+    # unless the selected file is explicitly marked as a generated result.
+    same_stem = by_stem.get(path.stem.casefold())
+    if same_stem is not None and read_export_owner(path) is None:
+        return same_stem
     # User clicked a generated token, e.g. "Maget.webp": redirect to "Mage.png".
     if path.suffix.lower() in ('.png', '.webp') and path.stem.casefold().endswith('t'):
         original = by_stem.get(path.stem[:-1].casefold())
