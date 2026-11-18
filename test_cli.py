@@ -210,6 +210,7 @@ class CliTests(unittest.TestCase):
 class FakeRegistry:
     HKEY_CURRENT_USER = 1234
     HKEY_CLASSES_ROOT = 5678
+    HKEY_LOCAL_MACHINE = 7890
     KEY_WRITE = 1
     KEY_READ = 2
     REG_SZ = 1
@@ -237,6 +238,8 @@ class FakeRegistry:
     def _view(self, hive):
         if hive == self.HKEY_CURRENT_USER:
             return self.keys
+        if hive == self.HKEY_LOCAL_MACHINE:
+            return {'Software\\Classes\\' + p: v for p, v in self.machine.items()}
         assert hive == self.HKEY_CLASSES_ROOT
         prefix = 'Software\\Classes\\'
         user = {p[len(prefix):]: values for p, values in self.keys.items()
@@ -279,6 +282,10 @@ class FakeRegistry:
         assert key.hive == self.HKEY_CURRENT_USER
         self.keys[key.path][name] = (value, kind)
 
+    def DeleteValue(self, key, name):
+        assert key.hive == self.HKEY_CURRENT_USER
+        del self.keys[key.path][name]
+
     def DeleteKey(self, hive, path):
         assert hive == self.HKEY_CURRENT_USER
         if path not in self.keys:
@@ -306,6 +313,9 @@ class RegistryTests(unittest.TestCase):
 
     def test_install_and_remove_scoped_verbs(self):
         reg = FakeRegistry()
+        # Existing shared parent: registration must preserve it and foreign verbs.
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, context_menu.ROOT, 0, reg.KEY_WRITE):
+            pass
         old = self._legacy(reg)
         foreign = self._legacy(reg, name='ThirdParty', ext='.jpg')
         baseline = context_menu._foreign_shell(reg)
@@ -329,6 +339,7 @@ class RegistryTests(unittest.TestCase):
             context_menu.remove()
             context_menu.remove()  # uninstall is idempotent
             self.assertFalse(any(p.startswith(context_menu.ROOT + '\\') for p in reg.keys))
+            self.assertIn(context_menu.ROOT, reg.keys)
             self.assertIn(foreign, reg.keys)
             self.assertEqual(context_menu._foreign_shell(reg), baseline)
             self.assertEqual(notify.call_count, 3)
@@ -346,7 +357,72 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(reg.keys, before)
             self.assertEqual(context_menu._foreign_shell(reg), baseline)
             context_menu.remove()
-            self.assertNotIn(context_menu.LEGACY_ROOT, reg.keys)
+            self.assertIn(context_menu.LEGACY_ROOT, reg.keys)
+            self.assertNotIn(old, reg.keys)
+
+    def test_rollback_restores_existing_values_without_deleting_keys(self):
+        reg = FakeRegistry()
+        path = context_menu.ROOT + r'\TokenForge.Create'
+        command = path + r'\command'
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
+            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'Old label')
+            reg.SetValueEx(key, 'Independent', 0, reg.REG_SZ, 'Preserve')
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, command, 0, reg.KEY_WRITE) as key:
+            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'old.exe "%1"')
+        baseline = {name: dict(values) for name, values in reg.keys.items()}
+        original_set, original_delete = reg.SetValueEx, reg.DeleteKey
+
+        def fail_later(key, name, reserved, kind, value):
+            if key.path.endswith('TokenForge.Open') and name == 'Icon':
+                raise PermissionError('Cannot update Open icon')
+            original_set(key, name, reserved, kind, value)
+
+        def deny_existing_delete(hive, key):
+            if key in baseline:
+                raise PermissionError('Existing key cannot be deleted')
+            original_delete(hive, key)
+
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell') as notify, \
+             patch.object(reg, 'SetValueEx', side_effect=fail_later), \
+             patch.object(reg, 'DeleteKey', side_effect=deny_existing_delete):
+            with self.assertRaisesRegex(PermissionError, 'Cannot update Open icon'):
+                context_menu.install(self.base)
+        self.assertEqual(reg.keys, baseline)
+        notify.assert_called_once()
+
+    def test_legacy_cleanup_failure_is_warning_and_keeps_new_commands(self):
+        reg = FakeRegistry()
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, context_menu.ROOT, 0, reg.KEY_WRITE):
+            pass
+        old = self._legacy(reg)
+        original = reg.DeleteKey
+
+        def deny_legacy(hive, key):
+            if key == old + r'\command':
+                raise PermissionError('Legacy command protected')
+            original(hive, key)
+
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell') as notify, \
+             patch.object(reg, 'DeleteKey', side_effect=deny_legacy):
+            warnings = context_menu.install(self.base)
+        self.assertTrue(any('Legacy command protected' in warning for warning in warnings))
+        self.assertIn(old, reg.keys)
+        self.assertIn(context_menu.ROOT + r'\TokenForge.Create', reg.keys)
+        notify.assert_called_once()
+
+    def test_remove_leaves_preexisting_empty_shared_keys(self):
+        reg = FakeRegistry()
+        paths = [context_menu.ROOT, context_menu.LEGACY_ROOT + r'\.png\shell']
+        for path in paths:
+            with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE):
+                pass
+        baseline = dict(reg.keys)
+        with patch.object(context_menu, '_registry', return_value=reg), \
+             patch.object(context_menu, '_notify_shell'):
+            context_menu.remove()
+        self.assertEqual(reg.keys, baseline)
 
     @unittest.skipUnless(
         __import__('os').name == 'nt'
@@ -356,18 +432,27 @@ class RegistryTests(unittest.TestCase):
     def test_real_windows_registry_preserves_foreign_verbs(self):
         reg = context_menu._registry()
         baseline = context_menu._foreign_shell(reg)
+        owned_paths = [context_menu.ROOT + '\\' + name for name in context_menu.ACTION_NAMES]
+        owned_paths += [context_menu.LEGACY_ROOT + '\\' + ext + '\\shell\\' + name
+                        for ext in context_menu.EXTENSIONS for name in context_menu.ACTION_NAMES]
+        if any(context_menu._snapshot_tree(reg, reg.HKEY_CURRENT_USER, path) for path in owned_paths):
+            self.skipTest('Real registry fixture already has TokenForge registrations')
+        installed = False
         try:
             try:
-                context_menu.install(self.base)
+                warnings = context_menu.install(self.base)
+                installed = True
             except context_menu.RegistryConflictError:
                 self.assertEqual(context_menu._foreign_shell(reg), baseline)
-                self.skipTest('This Windows configuration cannot safely register per-user static verbs')
+                self.skipTest('Per-user static registration would shadow machine data')
+            self.assertEqual(warnings, [])
             for name in context_menu.ACTION_NAMES:
                 with reg.OpenKey(reg.HKEY_CURRENT_USER,
                                  context_menu.ROOT + '\\' + name) as key:
                     self.assertEqual(reg.QueryValueEx(key, 'AppliesTo')[0], context_menu.APPLIES_TO)
         finally:
-            context_menu.remove()
+            if installed:
+                context_menu.remove()
         after = context_menu._foreign_shell(reg)
         self.assertTrue(all(after.get(path) == values for path, values in baseline.items()))
 

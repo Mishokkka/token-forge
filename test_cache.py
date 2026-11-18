@@ -126,6 +126,43 @@ class CacheTests(unittest.TestCase):
         app._export_current()
         self.assertEqual(captured, [True])
 
+    def test_real_selected_export_replaces_owned_file_with_global_skip_enabled(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        from token_engine import Adjust, save_generated, source_identity
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.selected = self.source
+        app.running_batch = app.busy = False
+        app.pending_export = None
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.status = Mock()
+        app.progress = {}
+        app.events = queue.Queue()
+        app.cancel_event = threading.Event()
+        def control(value):
+            return SimpleNamespace(get=lambda: value)
+        for name, value in {'work_mode': 'token', 'model': 'm', 'keep_alpha': True,
+                            'edge_mode': 'Обычный', 'ext': 'webp', 'size': '512',
+                            'skip_exists': True, 'convert_original': False}.items():
+            setattr(app, name, control(value))
+        app._adjust_for = lambda path: Adjust()
+        app._get_cutout = lambda path, *args: (read_image(path), source_identity(path) + args)
+        destination = token_output_path(self.source)
+        save_generated(Image.new('RGBA', (256, 256), 'red'), destination, self.source,
+                       'token', skip_exists=False)
+        with patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
+            app._export_current()
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get())
+        self.assertEqual(events[-1][0], 'done')
+        self.assertEqual(events[-1][1].created, 1)
+        with Image.open(destination) as result:
+            self.assertEqual(result.size, (512, 512))
+
     def test_item_layout_default_is_independent_of_selected_override(self):
         from item_engine import ITEM_MODES
         app = self.make_mock_app()

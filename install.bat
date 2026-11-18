@@ -1,11 +1,8 @@
 @echo off
 setlocal EnableExtensions
 cd /d "%~dp0"
-if %errorlevel% neq 0 (
-    echo ERROR: Could not enter the program directory.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto bad_directory
+if not errorlevel 0 goto bad_directory
 title TokenForge - Setup
 
 echo =========================================================
@@ -16,7 +13,8 @@ echo.
 if not exist ".venv" goto find_python
 if not exist ".venv\Scripts\python.exe" goto stale_env
 ".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
-if %errorlevel% neq 0 goto stale_env
+if errorlevel 1 goto stale_env
+if not errorlevel 0 goto stale_env
 goto install_packages
 
 :stale_env
@@ -28,41 +26,47 @@ goto failed
 :find_python
 
 where py >nul 2>&1
-if %errorlevel% neq 0 goto try_python_cmd
+if errorlevel 1 goto try_python_cmd
+if not errorlevel 0 goto try_python_cmd
 
 py -3.12 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
-if %errorlevel% equ 0 goto make_312
+if not errorlevel 1 if errorlevel 0 goto make_312
 py -3.13 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
-if %errorlevel% equ 0 goto make_313
+if not errorlevel 1 if errorlevel 0 goto make_313
 py -3.11 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
-if %errorlevel% equ 0 goto make_311
+if not errorlevel 1 if errorlevel 0 goto make_311
 
 goto try_python_cmd
 
 :make_312
 echo Found Python 3.12.
 py -3.12 -m venv ".venv"
-if %errorlevel% neq 0 goto venv_failed
+if errorlevel 1 goto venv_failed
+if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :make_313
 echo Found Python 3.13.
 py -3.13 -m venv ".venv"
-if %errorlevel% neq 0 goto venv_failed
+if errorlevel 1 goto venv_failed
+if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :make_311
 echo Found Python 3.11.
 py -3.11 -m venv ".venv"
-if %errorlevel% neq 0 goto venv_failed
+if errorlevel 1 goto venv_failed
+if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :try_python_cmd
 python -c "import sys; exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
-if %errorlevel% neq 0 goto python_missing
+if errorlevel 1 goto python_missing
+if not errorlevel 0 goto python_missing
 echo Found compatible 64-bit Python.
 python -m venv ".venv"
-if %errorlevel% neq 0 goto venv_failed
+if errorlevel 1 goto venv_failed
+if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :python_missing
@@ -82,16 +86,28 @@ echo.
 echo Installing required Python packages (internet required)...
 echo.
 ".venv\Scripts\python.exe" -m pip --version
-if %errorlevel% neq 0 goto pip_missing
+if not errorlevel 1 if errorlevel 0 goto pip_ready
+echo Bootstrapping pip in the existing virtual environment...
+".venv\Scripts\python.exe" -m ensurepip --upgrade
+if errorlevel 1 goto pip_missing
+if not errorlevel 0 goto pip_missing
+".venv\Scripts\python.exe" -m pip --version
+if errorlevel 1 goto pip_missing
+if not errorlevel 0 goto pip_missing
+
+:pip_ready
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
-if %errorlevel% neq 0 goto failed
+if errorlevel 1 goto failed
+if not errorlevel 0 goto failed
 ".venv\Scripts\python.exe" -m pip install -r "requirements.txt"
-if %errorlevel% neq 0 goto failed
+if errorlevel 1 goto failed
+if not errorlevel 0 goto failed
 
 echo.
 echo Verifying installed packages...
 ".venv\Scripts\python.exe" -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Imports: OK')"
-if %errorlevel% neq 0 goto import_failed
+if errorlevel 1 goto import_failed
+if not errorlevel 0 goto import_failed
 
 echo.
 echo SUCCESS! Installation completed.
@@ -109,12 +125,18 @@ goto failed
 
 :pip_missing
 echo ERROR: pip was not found in the virtual environment.
-echo Try installing Python 3.12 with pip enabled.
+echo Rename only the .venv folder and run install.bat again.
+echo Your settings and cutouts are stored separately in LocalAppData.
 goto failed
 
 :failed
 echo.
 echo ERROR: Installation failed. See error details above.
 echo Send a screenshot of the FIRST error message, not just the last line.
+pause
+exit /b 1
+
+:bad_directory
+echo ERROR: Could not enter the program directory.
 pause
 exit /b 1

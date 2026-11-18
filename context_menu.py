@@ -89,34 +89,86 @@ def _delete_tree(reg, path):
             pass
 
 
-def _restore_tree(reg, path, tree):
-    for relative, values in tree.items():
-        full = path + '\\' + relative if relative else path
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, full, 0, reg.KEY_WRITE) as key:
-            for name, (value, kind) in values.items():
-                reg.SetValueEx(key, name, 0, kind, value)
-
-
-def _prune_empty(reg, path):
-    """Leave any ancestor containing other registrations or values untouched."""
+def _key_values(reg, path):
     try:
         with reg.OpenKey(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_READ) as key:
-            children, values, _ = reg.QueryInfoKey(key)
-        if children == 0 and values == 0:
-            reg.DeleteKey(reg.HKEY_CURRENT_USER, path)
+            count = reg.QueryInfoKey(key)[1]
+            return {name: (value, kind) for name, value, kind in
+                    (reg.EnumValue(key, i) for i in range(count))}
     except FileNotFoundError:
-        pass
+        return None
+
+
+_MISSING = object()
+
+
+class RegistryEdits:
+    """Journal successful writes to our private verb keys, not shared parents."""
+    def __init__(self, reg):
+        self.reg = reg
+        self.created = []
+        self.changed = []
+
+    def write(self, path, values):
+        reg = self.reg
+        before = _key_values(reg, path)
+        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
+            if before is None:
+                self.created.append(path)
+                before = {}
+            for name, value in values.items():
+                old = before.get(name, _MISSING)
+                new = (value, reg.REG_SZ)
+                if old != new:
+                    reg.SetValueEx(key, name, 0, reg.REG_SZ, value)
+                    self.changed.append((path, name, old, new))
+
+    def rollback(self):
+        errors = []
+        reg = self.reg
+        for path, name, old, new in reversed(self.changed):
+            try:
+                values = _key_values(reg, path)
+                if values is None or values.get(name, _MISSING) != new:
+                    raise RegistryConflictError('Value changed during installation')
+                with reg.OpenKey(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
+                    if old is _MISSING:
+                        reg.DeleteValue(key, name)
+                    else:
+                        reg.SetValueEx(key, name, 0, old[1], old[0])
+            except Exception as exc:
+                errors.append(f'{path} [{name}]: {exc}')
+        for path in reversed(self.created):
+            try:
+                # Never remove an existing key or a shared shell/extension key.
+                with reg.OpenKey(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_READ) as key:
+                    children, values, _ = reg.QueryInfoKey(key)
+                if children or values:
+                    raise RegistryConflictError('New verb key contains unexpected entries')
+                reg.DeleteKey(reg.HKEY_CURRENT_USER, path)
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                errors.append(f'{path}: {exc}')
+        return errors
+
+
+def _remove_verbs(reg, root):
+    errors = []
+    for name in ACTION_NAMES:
+        path = root + '\\' + name
+        try:
+            _delete_tree(reg, path)
+        except Exception as exc:
+            errors.append(f'{path}: {exc}')
+    return errors
 
 
 def _remove_legacy(reg):
+    errors = []
     for suffix in EXTENSIONS:
-        ext = LEGACY_ROOT + '\\' + suffix
-        shell = ext + r'\shell'
-        for name in ACTION_NAMES:
-            _delete_tree(reg, shell + '\\' + name)
-        _prune_empty(reg, shell)
-        _prune_empty(reg, ext)
-    _prune_empty(reg, LEGACY_ROOT)
+        errors.extend(_remove_verbs(reg, LEGACY_ROOT + '\\' + suffix + r'\shell'))
+    return errors
 
 
 def _foreign_shell(reg):
@@ -125,59 +177,64 @@ def _foreign_shell(reg):
                           exclude=ACTION_NAMES)
 
 
-def install(base: Path = BASE) -> None:
+def _check_safe_registration(reg):
+    # Microsoft documents that a per-user *\shell can shadow its machine
+    # counterpart. Do not create that shared parent if foreign machine data
+    # could be hidden. There is no atomic "delete only if empty" operation
+    # for shared registry parents we could safely use to undo its creation.
+    before = _foreign_shell(reg)
+    if _key_values(reg, ROOT) is None:
+        machine = _snapshot_tree(reg, reg.HKEY_LOCAL_MACHINE, ROOT)
+        if any(relative or values for relative, values in machine.items()):
+            raise RegistryConflictError(
+                'Per-user registration could hide existing machine-wide shell commands. '
+                'No registry changes were made. Existing menu entries remain.')
+    return before
+
+
+def install(base: Path = BASE) -> list[str]:
     reg = _registry()
     pythonw, entry = interpreter_and_entry(base)
-    foreign_before = _foreign_shell(reg)
-    previous = {name: _snapshot_tree(reg, reg.HKEY_CURRENT_USER, ROOT + '\\' + name)
-                for name in ACTION_NAMES}
-    had_shell = bool(_snapshot_tree(reg, reg.HKEY_CURRENT_USER, ROOT))
-    star = CLASSES + r'\*'
-    had_star = bool(_snapshot_tree(reg, reg.HKEY_CURRENT_USER, star))
-
+    foreign_before = _check_safe_registration(reg)
+    edits = RegistryEdits(reg)
     try:
         for name, (label, action) in ACTION_NAMES.items():
             item = ROOT + '\\' + name
-            with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, item, 0, reg.KEY_WRITE) as key:
-                reg.SetValueEx(key, '', 0, reg.REG_SZ, label)
-                reg.SetValueEx(key, 'MultiSelectModel', 0, reg.REG_SZ, 'Single')
-                reg.SetValueEx(key, 'Icon', 0, reg.REG_SZ, str(pythonw))
-                reg.SetValueEx(key, 'AppliesTo', 0, reg.REG_SZ, APPLIES_TO)
-                reg.SetValueEx(key, 'NeverDefault', 0, reg.REG_SZ, '')
-            with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, item + r'\command', 0, reg.KEY_WRITE) as key:
-                reg.SetValueEx(key, '', 0, reg.REG_SZ, command_for(pythonw, entry, action))
-
+            edits.write(item, {'': label, 'MultiSelectModel': 'Single',
+                               'Icon': str(pythonw), 'AppliesTo': APPLIES_TO,
+                               'NeverDefault': ''})
+            edits.write(item + r'\command', {'': command_for(pythonw, entry, action)})
         after = _foreign_shell(reg)
-        if any(relative not in after or after[relative] != values
-               for relative, values in foreign_before.items()):
-            raise RegistryConflictError(
-                'Windows would hide existing context-menu commands. '
-                'Registration was rolled back; existing menu entries were preserved.')
-    except Exception:
-        for name, tree in previous.items():
-            item = ROOT + '\\' + name
-            _delete_tree(reg, item)
-            _restore_tree(reg, item, tree)
-        if not had_shell:
-            _prune_empty(reg, ROOT)
-        if not had_star:
-            _prune_empty(reg, star)
+        # A newly created empty shared shell key is not itself a foreign verb.
+        if any(after.get(relative) != values for relative, values in foreign_before.items()):
+            raise RegistryConflictError('Windows would hide or change existing context-menu commands.')
+    except Exception as original:
+        errors = edits.rollback()
         _notify_shell()
+        if errors:
+            raise RuntimeError(f'{original}\nRollback was incomplete:\n' +
+                               '\n'.join(errors)) from original
         raise
 
-    # Only migrate old registrations once the safer new registration succeeds.
-    _remove_legacy(reg)
-    _notify_shell()
+    # Registration is already committed. A legacy cleanup failure is a
+    # warning, not an install failure; retrying installation retries cleanup.
+    try:
+        return _remove_legacy(reg)
+    finally:
+        _notify_shell()
 
 
 def remove() -> None:
     reg = _registry()
-    for name in ACTION_NAMES:
-        _delete_tree(reg, ROOT + '\\' + name)
-    _prune_empty(reg, ROOT)
-    _prune_empty(reg, CLASSES + r'\*')
-    _remove_legacy(reg)
-    _notify_shell()
+    try:
+        errors = _remove_verbs(reg, ROOT) + _remove_legacy(reg)
+        if errors:
+            raise RuntimeError('Some TokenForge entries could not be removed:\n' +
+                               '\n'.join(errors))
+        # Shared parents may belong to Windows or another app, including
+        # empty keys. Never prune them based on a non-atomic count.
+    finally:
+        _notify_shell()
 
 
 def main(argv=None) -> int:
@@ -188,8 +245,13 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.install:
-            install()
+            warnings = install()
             print('OK: Context menu installed for current Windows user.')
+            if warnings:
+                print('WARNING: Some old TokenForge entries could not be removed. '
+                      'Rerun setup to retry cleanup.', file=sys.stderr)
+                for warning in warnings:
+                    print(warning, file=sys.stderr)
             print('Windows 11: items may be under "Show more options" (Shift+F10).')
         else:
             remove()
