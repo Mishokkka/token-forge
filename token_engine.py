@@ -449,7 +449,7 @@ def read_export_owner(destination: Path) -> tuple | None:
                 and values[0] in ('token', 'item', 'copy')
                 and isinstance(values[1], str) and values[1]
                 and '/' not in values[1] and '\\' not in values[1]
-                and values[1] not in ('.', '..')):
+                and ':' not in values[1] and values[1] not in ('.', '..')):
             return version, values[0], values[1]
     except (OSError, ValueError, SyntaxError, TypeError, Image.DecompressionBombError):
         pass

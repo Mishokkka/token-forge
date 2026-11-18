@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableExtensions
+setlocal EnableExtensions DisableDelayedExpansion
 cd /d "%~dp0"
 if errorlevel 1 goto bad_directory
 if not errorlevel 0 goto bad_directory
@@ -12,13 +12,14 @@ echo.
 
 if not exist ".venv" goto find_python
 if not exist ".venv\Scripts\python.exe" goto stale_env
-".venv\Scripts\python.exe" -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
+".venv\Scripts\python.exe" "python_compat.py" >nul 2>&1
 if errorlevel 1 goto stale_env
 if not errorlevel 0 goto stale_env
 goto install_packages
 
 :stale_env
 echo ERROR: Existing .venv cannot run or is incompatible.
+echo Use regular 64-bit CPython 3.11-3.13, not a free-threaded build.
 echo Rename or delete only the .venv folder, then run install.bat again.
 echo Your settings and cutouts are stored separately in LocalAppData.
 goto failed
@@ -29,11 +30,11 @@ where py >nul 2>&1
 if errorlevel 1 goto try_python_cmd
 if not errorlevel 0 goto try_python_cmd
 
-py -3.12 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
+py -3.12 "python_compat.py" >nul 2>&1
 if not errorlevel 1 if errorlevel 0 goto make_312
-py -3.13 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
+py -3.13 "python_compat.py" >nul 2>&1
 if not errorlevel 1 if errorlevel 0 goto make_313
-py -3.11 -c "import sys; sys.exit(0 if (3,11) <= sys.version_info[:2] <= (3,13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
+py -3.11 "python_compat.py" >nul 2>&1
 if not errorlevel 1 if errorlevel 0 goto make_311
 
 goto try_python_cmd
@@ -60,7 +61,7 @@ if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :try_python_cmd
-python -c "import sys; exit(0 if (3, 11) <= sys.version_info[:2] <= (3, 13) and sys.maxsize > 2**32 else 1)" >nul 2>&1
+python "python_compat.py" >nul 2>&1
 if errorlevel 1 goto python_missing
 if not errorlevel 0 goto python_missing
 echo Found compatible 64-bit Python.
@@ -70,7 +71,7 @@ if not errorlevel 0 goto venv_failed
 goto install_packages
 
 :python_missing
-echo ERROR: Python 3.11, 3.12 or 3.13 (64-bit) not found.
+echo ERROR: Regular 64-bit CPython 3.11, 3.12 or 3.13 not found.
 echo Install Python 3.12 64-bit from https://www.python.org/downloads/release/python-31210/
 echo During installation check Add python.exe to PATH, then reopen this file.
 goto failed

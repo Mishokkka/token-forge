@@ -170,20 +170,18 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     py = max(inset, min(int(round(cy - new_height / 2)), size - inset - new_height))
     canvas = Image.new('RGBA', (size, size), (0, 0, 0, 0))
     canvas.alpha_composite(placed, dest=(px, py))
-    if stroke_px:
-        alpha = canvas.getchannel('A')
-        # All retained nonzero-alpha regions belong to the silhouette.
-        contour = alpha.point(lambda a: 255 if a else 0)
-        dilated = contour.filter(ImageFilter.MaxFilter(2 * stroke_px + 1))
-        # An outline must not contribute opacity or black to any visible
-        # subject pixel, including translucent interiors and feathered edges.
-        occupied = alpha.point(lambda a: 255 if a else 0)
-        border_alpha = ImageChops.subtract(dilated, occupied)
-        border = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
-        border.putalpha(border_alpha)
-        border.alpha_composite(canvas)
-        return border
-    return canvas
+    return outline_subject(canvas, stroke_px) if stroke_px else canvas
+
+
+def outline_subject(canvas, stroke_px):
+    # The outlined silhouette is the support of the final alpha mask.
+    # Preserve every original subject pixel, regardless of opacity.
+    occupied = canvas.getchannel('A').point(lambda a: 255 if a else 0)
+    dilated = occupied.filter(ImageFilter.MaxFilter(2 * stroke_px + 1))
+    border = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
+    border.putalpha(ImageChops.subtract(dilated, occupied))
+    border.alpha_composite(canvas)
+    return border
 
 
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],

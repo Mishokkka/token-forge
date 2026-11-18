@@ -405,6 +405,7 @@ class TokenForge:
         self.folder = None
         self.files = []
         self.file_list.delete(0, tk.END)
+        self.folder_label.set(f'Поиск: {folder}')
         self.status.set(f'Поиск исходных артов: {folder.name}')
         request = (self.scan_generation, folder, select_path, self.frame_path)
         if self.busy:

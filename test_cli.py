@@ -326,219 +326,114 @@ class FakeRegistry:
         del self.keys[path]
 
 
-class RegistryTests(unittest.TestCase):
+class SendToTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.base = Path(self.temp.name)
-        lock_patch = patch.object(context_menu, 'MENU_LOCK', self.base / 'context-menu')
-        lock_patch.start()
-        self.addCleanup(lock_patch.stop)
+        self.base = Path(self.temp.name).resolve()
+        self.folder = self.base / 'SendTo'
+        self.folder.mkdir()
         self.exe = self.base / '.venv' / 'Scripts' / 'pythonw.exe'
         self.exe.parent.mkdir(parents=True)
         self.exe.touch()
         (self.base / 'tokenforge.py').touch()
+        (self.base / 'sendto_entry.py').touch()
+        self.reg = FakeRegistry(shadow=True)
+        # Start with a clean machine branch, then introduce a foreign verb
+        # before or after TokenForge setup.
+        self.reg.machine = {'*': {}}
+        for patcher in (
+            patch.object(context_menu, 'MENU_LOCK', self.base / 'context-menu'),
+            patch.object(context_menu, '_sendto_folder', return_value=self.folder),
+            patch.object(context_menu, '_registry', return_value=self.reg),
+            patch.object(context_menu, '_write_shortcut', side_effect=self.write_link),
+            patch.object(context_menu, '_owned_shortcut', side_effect=self.owned_link),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
-    def _legacy(self, reg, name='TokenForge.Create', ext='.png'):
-        path = context_menu.LEGACY_ROOT + '\\' + ext + '\\shell\\' + name
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path + r'\command', 0, reg.KEY_WRITE) as key:
-            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'legacy.exe "%1"')
-        return path
+    @staticmethod
+    def write_link(path, target, entry, flag):
+        path.write_text(json.dumps({'owner': context_menu.LINK_OWNER, 'target': str(target),
+                                    'args': f'"{entry}" {flag}'}, ensure_ascii=False), encoding='utf-8')
 
-    def test_install_and_remove_scoped_verbs(self):
-        reg = FakeRegistry()
-        # Existing shared parent: registration must preserve it and foreign verbs.
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, context_menu.ROOT, 0, reg.KEY_WRITE):
-            pass
-        old = self._legacy(reg)
-        foreign = self._legacy(reg, name='ThirdParty', ext='.jpg')
-        baseline = context_menu._foreign_shell(reg)
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell') as notify:
-            context_menu.install(self.base)
-            expected = {'TokenForge.Create': '--auto', 'TokenForge.Open': '--open',
-                        'TokenForge.CreateItem': '--auto-item', 'TokenForge.OpenItem': '--open-item'}
-            for verb, flag in expected.items():
-                key = context_menu.ROOT + '\\' + verb
-                expected_cmd = f'"{self.exe}" "{self.base / "tokenforge.py"}" {flag} "%1"'
-                self.assertEqual(reg.keys[key + r'\command'][''][0], expected_cmd)
-                self.assertEqual(reg.keys[key]['AppliesTo'][0],
-                                 'System.FileExtension:=.png OR System.FileExtension:=.jpg OR '
-                                 'System.FileExtension:=.jpeg OR System.FileExtension:=.webp OR '
-                                 'System.FileExtension:=.bmp OR System.FileExtension:=.tif OR '
-                                 'System.FileExtension:=.tiff')
-            self.assertNotIn(old, reg.keys)
-            self.assertIn(foreign, reg.keys)
-            self.assertEqual(context_menu._foreign_shell(reg), baseline)
-            context_menu.remove()
-            context_menu.remove()  # uninstall is idempotent
-            self.assertFalse(any(p.startswith(context_menu.ROOT + '\\') for p in reg.keys))
-            self.assertIn(context_menu.ROOT, reg.keys)
-            self.assertIn(foreign, reg.keys)
-            self.assertEqual(context_menu._foreign_shell(reg), baseline)
-            self.assertEqual(notify.call_count, 3)
-
-    def test_registry_preflight_refuses_without_losing_old_verbs(self):
-        reg = FakeRegistry(shadow=True)
-        old = self._legacy(reg)
-        before = {key: dict(values) for key, values in reg.keys.items()}
-        baseline = context_menu._foreign_shell(reg)
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell'):
-            with self.assertRaises(context_menu.RegistryConflictError):
-                context_menu.install(self.base)
-            self.assertIn(old, reg.keys)
-            self.assertEqual(reg.keys, before)
-            self.assertEqual(context_menu._foreign_shell(reg), baseline)
-            context_menu.remove()
-            self.assertIn(context_menu.LEGACY_ROOT, reg.keys)
-            self.assertNotIn(old, reg.keys)
-
-    def test_rollback_restores_existing_values_without_deleting_keys(self):
-        reg = FakeRegistry()
-        path = context_menu.ROOT + r'\TokenForge.Create'
-        command = path + r'\command'
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
-            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'Old label')
-            reg.SetValueEx(key, 'ICON', 0, reg.REG_SZ, 'Old icon')
-            reg.SetValueEx(key, 'Independent', 0, reg.REG_SZ, 'Preserve')
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, command, 0, reg.KEY_WRITE) as key:
-            reg.SetValueEx(key, '', 0, reg.REG_SZ, 'old.exe "%1"')
-        baseline = {name: dict(values) for name, values in reg.keys.items()}
-        original_set, original_delete = reg.SetValueEx, reg.DeleteKey
-
-        def fail_later(key, name, reserved, kind, value):
-            if key.path.endswith('TokenForge.Open') and name == 'Icon':
-                raise PermissionError('Cannot update Open icon')
-            original_set(key, name, reserved, kind, value)
-
-        def deny_existing_delete(hive, key):
-            if key in baseline:
-                raise PermissionError('Existing key cannot be deleted')
-            original_delete(hive, key)
-
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell') as notify, \
-             patch.object(reg, 'SetValueEx', side_effect=fail_later), \
-             patch.object(reg, 'DeleteKey', side_effect=deny_existing_delete):
-            with self.assertRaisesRegex(PermissionError, 'Cannot update Open icon'):
-                context_menu.install(self.base)
-        self.assertEqual(reg.keys, baseline)
-        notify.assert_called_once()
-
-    def test_final_merged_view_mismatch_rolls_back_completed_writes(self):
-        reg = FakeRegistry()
-        path = context_menu.ROOT + r'\TokenForge.Create'
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE) as key:
-            reg.SetValueEx(key, 'ICON', 0, reg.REG_SZ, 'old')
-        old = self._legacy(reg)
-        baseline = {key: dict(values) for key, values in reg.keys.items()}
-        merged = context_menu._foreign_shell(reg)
-
-        def changed_view(registry):
-            self.assertTrue(all(context_menu.ROOT + '\\' + name in registry.keys
-                                for name in context_menu.ACTION_NAMES))
-            return {}
-
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell') as notify, \
-             patch.object(context_menu, '_check_safe_registration', return_value=merged), \
-             patch.object(context_menu, '_foreign_shell', side_effect=changed_view):
-            with self.assertRaises(context_menu.RegistryConflictError):
-                context_menu.install(self.base)
-        self.assertEqual(reg.keys, baseline)
-        self.assertIn(old, reg.keys)
-        notify.assert_called_once()
-
-    def test_install_and_remove_use_same_lock(self):
-        from contextlib import contextmanager
-        calls = []
-        active = []
-        @contextmanager
-        def lock(path, timeout):
-            calls.append(path)
-            active.append(path)
-            try:
-                yield
-            finally:
-                active.pop()
-
-        def protected(*args):
-            self.assertEqual(active, [context_menu.MENU_LOCK])
-            return []
-
-        with patch.object(context_menu, 'process_lock', side_effect=lock), \
-             patch.object(context_menu, '_install', side_effect=protected), \
-             patch.object(context_menu, '_remove', side_effect=protected):
-            context_menu.install(self.base)
-            context_menu.remove()
-        self.assertEqual(calls, [context_menu.MENU_LOCK, context_menu.MENU_LOCK])
-        self.assertEqual(active, [])
-
-    def test_legacy_cleanup_failure_is_warning_and_keeps_new_commands(self):
-        reg = FakeRegistry()
-        with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, context_menu.ROOT, 0, reg.KEY_WRITE):
-            pass
-        old = self._legacy(reg)
-        original = reg.DeleteKey
-
-        def deny_legacy(hive, key):
-            if key == old + r'\command':
-                raise PermissionError('Legacy command protected')
-            original(hive, key)
-
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell') as notify, \
-             patch.object(reg, 'DeleteKey', side_effect=deny_legacy):
-            warnings = context_menu.install(self.base)
-        self.assertTrue(any('Legacy command protected' in warning for warning in warnings))
-        self.assertIn(old, reg.keys)
-        self.assertIn(context_menu.ROOT + r'\TokenForge.Create', reg.keys)
-        notify.assert_called_once()
-
-    def test_remove_leaves_preexisting_empty_shared_keys(self):
-        reg = FakeRegistry()
-        paths = [context_menu.ROOT, context_menu.LEGACY_ROOT + r'\.png\shell']
-        for path in paths:
-            with reg.CreateKeyEx(reg.HKEY_CURRENT_USER, path, 0, reg.KEY_WRITE):
-                pass
-        baseline = dict(reg.keys)
-        with patch.object(context_menu, '_registry', return_value=reg), \
-             patch.object(context_menu, '_notify_shell'):
-            context_menu.remove()
-        self.assertEqual(reg.keys, baseline)
-
-    @unittest.skipUnless(
-        __import__('os').name == 'nt'
-        and __import__('os').environ.get('GITHUB_ACTIONS') == 'true'
-        and __import__('os').environ.get('TOKENFORGE_TEST_REAL_REGISTRY') == '1',
-        'Real registry smoke test is opt-in on the disposable Windows CI runner')
-    def test_real_windows_registry_preserves_foreign_verbs(self):
-        reg = context_menu._registry()
-        baseline = context_menu._foreign_shell(reg)
-        owned_paths = [context_menu.ROOT + '\\' + name for name in context_menu.ACTION_NAMES]
-        owned_paths += [context_menu.LEGACY_ROOT + '\\' + ext + '\\shell\\' + name
-                        for ext in context_menu.EXTENSIONS for name in context_menu.ACTION_NAMES]
-        if any(context_menu._snapshot_tree(reg, reg.HKEY_CURRENT_USER, path) for path in owned_paths):
-            self.skipTest('Real registry fixture already has TokenForge registrations')
-        installed = False
+    @staticmethod
+    def owned_link(path):
         try:
-            try:
-                warnings = context_menu.install(self.base)
-                installed = True
-            except context_menu.RegistryConflictError:
-                self.assertEqual(context_menu._foreign_shell(reg), baseline)
-                self.skipTest('Per-user static registration would shadow machine data')
-            self.assertEqual(warnings, [])
-            for name in context_menu.ACTION_NAMES:
-                with reg.OpenKey(reg.HKEY_CURRENT_USER,
-                                 context_menu.ROOT + '\\' + name) as key:
-                    self.assertEqual(reg.QueryValueEx(key, 'AppliesTo')[0], context_menu.APPLIES_TO)
-        finally:
-            if installed:
+            return json.loads(path.read_text(encoding='utf-8')).get('owner') == context_menu.LINK_OWNER
+        except (OSError, ValueError):
+            return False
+
+    def add_other_app(self):
+        self.reg.machine[r'*\shell'] = {}
+        self.reg.machine[r'*\shell\OtherApp'] = {'': ('Other application', self.reg.REG_SZ)}
+
+    def test_other_app_installed_before_and_after_tokenforge(self):
+        for foreign_first in (True, False):
+            with self.subTest(foreign_first=foreign_first):
+                self.reg.machine = {'*': {}}
+                if foreign_first:
+                    self.add_other_app()
+                self.assertEqual(context_menu.install(self.base), [])
+                for path, flag in context_menu.shortcut_paths(self.folder).items():
+                    data = json.loads(path.read_text(encoding='utf-8'))
+                    self.assertEqual(data['target'], str(self.exe))
+                    self.assertEqual(data['args'], f'"{self.base / "sendto_entry.py"}" {flag}')
+                if not foreign_first:
+                    self.add_other_app()
+                self.assertIn(r'*\shell\OtherApp', self.reg._view(self.reg.HKEY_CLASSES_ROOT))
                 context_menu.remove()
-        after = context_menu._foreign_shell(reg)
-        self.assertTrue(all(after.get(path) == values for path, values in baseline.items()))
+                self.assertIn(r'*\shell\OtherApp', self.reg._view(self.reg.HKEY_CLASSES_ROOT))
+                self.assertEqual(self.reg.keys, {})
+                self.assertEqual(list(self.folder.iterdir()), [])
+
+    def test_unrelated_shortcut_is_never_replaced_or_removed(self):
+        path = next(iter(context_menu.shortcut_paths(self.folder)))
+        path.write_bytes(b'foreign')
+        with self.assertRaises(FileExistsError):
+            context_menu.install(self.base)
+        context_menu.remove()
+        self.assertEqual(path.read_bytes(), b'foreign')
+
+    def test_legacy_migration_removes_only_named_verbs(self):
+        legacy = context_menu.ROOT + r'\TokenForge.Create\command'
+        foreign = context_menu.ROOT + r'\OtherApp\command'
+        for path in (legacy, foreign):
+            with self.reg.CreateKeyEx(self.reg.HKEY_CURRENT_USER, path, 0, self.reg.KEY_WRITE):
+                pass
+        context_menu.install(self.base)
+        self.assertNotIn(legacy, self.reg.keys)
+        self.assertIn(foreign, self.reg.keys)
+        context_menu.remove()
+        self.assertIn(foreign, self.reg.keys)
+
+    def test_sendto_rejects_multiple_arguments(self):
+        import sendto_entry
+        with patch('token_cli.notify_user') as notify, patch('tokenforge.main') as app:
+            self.assertEqual(sendto_entry.main(['--auto', 'a.png', 'b.png']), 2)
+            notify.assert_called_once()
+            app.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'Windows shortcut API')
+class RealShortcutTests(unittest.TestCase):
+    def test_create_read_and_remove_real_shortcuts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            base = Path(temp).resolve()
+            folder = base / 'SendTo'
+            folder.mkdir()
+            target = Path(sys.executable)
+            entry = base / 'скрипт ! with spaces.py'
+            entry.touch()
+            context_menu._install_shortcuts(folder, target, entry)
+            for path in context_menu.shortcut_paths(folder):
+                self.assertTrue(path.is_file())
+                self.assertTrue(context_menu._owned_shortcut(path))
+            with patch.object(context_menu, '_sendto_folder', return_value=folder), \
+                 patch.object(context_menu, 'MENU_LOCK', base / 'lock'), \
+                 patch.object(context_menu, '_cleanup_previous', return_value=[]):
+                context_menu.remove()
+            self.assertEqual(list(folder.iterdir()), [])
 
 
 if __name__ == '__main__':
