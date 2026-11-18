@@ -41,7 +41,9 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
         raise ValueError(f'Неподдерживаемый формат: {path.suffix}')
     # Use configured frame for every entry point, not just GUI discovery.
     if frame_path is None:
-        frame_path = Path(read_settings().get('ring') or BASE / 'RingT.png')
+        # GUI open must remain usable for recovery from an invalid settings
+        # file. Automatic commands pass their strictly read frame explicitly.
+        frame_path = Path(read_settings_file(PREFS_FILE).get('ring') or BASE / 'RingT.png')
     if excluded_file(path, frame_path):
         raise ValueError('Выбранный файл используется как рамка, а не исходный арт.')
     owner = read_export_owner(path)
@@ -95,8 +97,8 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
     """
     settings = read_settings()
-    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
     frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    source = resolve_context_source(filename, frame_path=frame_path)
     def load_frame():
         frame = read_image(frame_path)
         if frame.width != frame.height:

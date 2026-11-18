@@ -91,6 +91,12 @@ class CliTests(unittest.TestCase):
             self.assertIn('rembg/onnxruntime', token_cli.LOG_FILE.read_text(encoding='utf-8'))
         self.assertFalse((self.photo.parent / (self.photo.stem + 't.webp')).exists())
 
+    def test_gui_open_source_survives_invalid_settings(self):
+        token_cli.PREFS_FILE.write_text('{broken JSON', encoding='utf-8')
+        self.assertEqual(token_cli.resolve_context_source(self.photo), self.photo)
+        with self.assertRaises(ValueError):
+            token_cli.automatic_token(self.photo)
+
     def test_configured_frame_cannot_be_used_as_art(self):
         self.settings['ring'] = str(self.photo)
         self.save_settings()
@@ -489,6 +495,40 @@ class SendToTests(unittest.TestCase):
             self.assertEqual(sendto_entry.main(['--auto', 'a.png', 'b.png']), 2)
             notify.assert_called_once()
             app.assert_not_called()
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'Windows batch launcher')
+class RealLauncherTests(unittest.TestCase):
+    def test_run_bat_preserves_caller_working_directory(self):
+        import os
+        import shutil
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            program = root / 'Token Forge !'
+            art = root / 'Art Folder'
+            program.mkdir()
+            art.mkdir()
+            shutil.copy2(Path(__file__).parent / 'run.bat', program / 'run.bat')
+            subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(program / '.venv')],
+                           check=True, capture_output=True, timeout=45)
+            (program / 'tokenforge.py').write_text(
+                'import json, pathlib, sys\n'
+                'print(json.dumps([str(pathlib.Path.cwd()), *sys.argv[1:]]))\n',
+                encoding='utf-8')
+            (art / 'hero one.png').touch()
+            absolute = art / 'hero one.png'
+            batch = program / 'run.bat'
+            comspec = os.environ['COMSPEC']
+            for args, expected in (('--open "hero one.png"', ['--open', 'hero one.png']),
+                                   (f'--auto "{absolute}"', ['--auto', str(absolute)]),
+                                   ('', [])):
+                command = f'"{comspec}" /d /s /c ""{batch}" {args}"'
+                result = subprocess.run(command, cwd=art, capture_output=True,
+                                        text=True, timeout=30, check=True)
+                actual = json.loads(result.stdout.splitlines()[-1])
+                self.assertEqual(Path(actual[0]), art)
+                self.assertEqual(actual[1:], expected)
 
 
 @unittest.skipUnless(sys.platform == 'win32', 'Windows shortcut API')

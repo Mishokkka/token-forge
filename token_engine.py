@@ -537,6 +537,10 @@ def recorded_source_matches(source: Path, filename: str) -> bool:
 def is_owned_export(destination: Path, source: Path, kind: str, *, identity=None,
                     require_pixels=False) -> bool:
     owner = read_export_owner(destination, identity=identity, require_pixels=require_pixels)
+    return _owner_matches(owner, source, kind)
+
+
+def _owner_matches(owner, source, kind):
     if not owner or owner[1] != kind:
         return False
     if owner[0] == 2:
@@ -547,6 +551,19 @@ def is_owned_export(destination: Path, source: Path, kind: str, *, identity=None
     return not any(p.name != source.name and not recorded_source_matches(source, p.name)
                    and read_export_owner(p) is None
                    for p in live_stem_candidates(source.parent, {source.stem}))
+
+
+def read_owned_export_image(destination, source, kind):
+    """Decode only the same verified bytes whose ownership was inspected."""
+    identity = source_identity(destination)
+    with source_snapshot(destination, identity) as snapshot:
+        with Image.open(snapshot) as stored:
+            owner = _parse_owner(stored.getexif().get(270))
+            if not _owner_matches(owner, source, kind):
+                return None
+            image = stored.convert('RGBA')
+    assert_source_identity(destination, identity)
+    return image
 
 
 def _windows_stem_names(folder, stem):
@@ -664,7 +681,8 @@ def validate_skip(destination, source, kind, *, identity=None):
                 if kind == 'copy' else 'Отключи пропуск готовых изображений и повтори обработку.')
         raise InvalidExportError(f'{destination.name}: {exc} {hint}') from exc
     if not owned:
-        raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')
+        hint = ' Перемести или переименуй существующий файл и повтори обработку.' if kind == 'copy' else ''
+        raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.{hint}')
     assert_source_identity(destination, identity)
 
 
@@ -674,6 +692,8 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
+    if approved_identity is not None and prior != approved_identity:
+        raise FileExistsError(f'Файл {destination.name} изменился после подтверждения замены. Подтверди заново.')
     if prior is not None:
         owned = is_owned_export(destination, source, kind, identity=prior)
         if skip_exists and owned:
@@ -832,12 +852,17 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             break
         if on_progress:
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
+        destination = output_path(source)
+        approved = (approved_outputs or {}).get(destination)
         try:
             identity = (expected_inputs or {}).get(str(source))
             if identity is None:
                 identity = source_identity(source)
             else:
                 assert_source_identity(source, identity)
+            # A stale approval must not trigger either of this job's writes.
+            if approved is not None:
+                assert_source_identity(destination, approved)
         except Exception as exc:
             result.record_error(source, stage, exc)
             if on_progress:
@@ -850,7 +875,6 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
             except Exception as exc:
                 result.record_error(source, 'преобразование оригинала', exc)
-        destination = output_path(source)
         try:
             assert_source_identity(source, identity)
             ensure_no_source_collision(destination, source, kind, folders)
@@ -871,7 +895,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 assert_source_identity(source, identity)
                 image = renderer(cutout, source)
                 publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
-                                             approved_identity=(approved_outputs or {}).get(destination),
+                                             approved_identity=approved,
                                              input_identity=identity, collision_index=folders)
                 if publication:
                     result.created += 1

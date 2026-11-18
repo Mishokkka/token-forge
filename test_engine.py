@@ -334,6 +334,38 @@ class EngineTests(unittest.TestCase):
                                   format_name='png', convert_original=False, skip_exists=False)
             self.assertEqual(result.created, 1)
 
+    def test_manual_approval_cannot_authorize_another_file_version(self):
+        from token_engine import save_generated, source_identity
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source)
+            Image.new('RGBA', (30, 30), 'blue').save(dest)
+            identity = source_identity(dest)
+            # The replacement is marked as owned, but it isn't the file
+            # the user actually approved for overwrite.
+            exif = Image.Exif()
+            from token_engine import export_owner
+            exif[270] = export_owner(source, 'token')
+            Image.new('RGBA', (20, 20), 'red').save(dest, exif=exif)
+            before = dest.read_bytes()
+            with self.assertRaises(FileExistsError):
+                save_generated(self.figure, dest, source, 'token',
+                               skip_exists=False, approved_identity=identity)
+            self.assertEqual(dest.read_bytes(), before)
+            result = export_batch([source], read_image, self.frame, self.mask,
+                                  {source: Adjust()}, skip_exists=False,
+                                  approved_outputs={dest: identity})
+            self.assertEqual((result.created, result.converted), (0, 0))
+            self.assertTrue(result.errors)
+            self.assertEqual(dest.read_bytes(), before)
+            self.assertFalse(source.with_suffix('.webp').exists())
+            dest.unlink()
+            with self.assertRaises(FileExistsError):
+                save_generated(self.figure, dest, source, 'token',
+                               skip_exists=False, approved_identity=identity)
+            self.assertFalse(dest.exists())
+
     def test_late_corrupt_export_is_not_a_successful_skip(self):
         from token_engine import save_generated, export_owner, InvalidExportError
         import token_engine

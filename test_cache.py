@@ -293,6 +293,27 @@ class CacheTests(unittest.TestCase):
         self.assertFalse(app._show_saved_token(self.source))
         self.assertEqual(images, [None])
 
+    def test_saved_preview_cannot_display_a_replaced_foreign_file(self):
+        import token_engine
+        from token_engine import save_generated
+        existing = token_output_path(self.source)
+        save_generated(Image.new('RGBA', (256, 256), 'red'), existing, self.source,
+                       'token', skip_exists=False)
+        app = self.make_mock_app()
+        app.ext = SimpleNamespace(get=lambda: 'webp')
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        displays = []
+        app._show_token = displays.append
+        original = token_engine.source_identity
+        def race(path):
+            result = original(path)
+            if path == existing:
+                Image.new('RGBA', (32, 32), 'blue').save(existing)
+            return result
+        with patch('token_engine.source_identity', side_effect=race):
+            self.assertFalse(app._show_saved_token(self.source))
+        self.assertEqual(displays, [None])
+
     def test_raw_preview_handles_extremely_thin_art(self):
         img = Image.new('RGBA', (1200, 1), 'red')
         result = TokenForge._make_cutout_preview(img, 512)

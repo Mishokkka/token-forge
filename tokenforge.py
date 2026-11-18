@@ -22,7 +22,7 @@ from PIL import Image, ImageDraw, ImageTk
 from token_engine import (
     Adjust, DiskCutoutCache, compose, frame_interior,
     export_batch, list_source_images, read_image, remove_background, token_output_path,
-    source_identity, assert_source_identity, is_owned_export, LoadedCutout, excluded_file,
+    source_identity, assert_source_identity, is_owned_export, LoadedCutout, excluded_file, read_owned_export_image,
 )
 from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item_output_path
 from settings_store import read_settings_file, save_settings_delta
@@ -652,13 +652,13 @@ class TokenForge:
             candidates = [token_output_path(source, ext)
                           for ext in dict.fromkeys([self.ext.get(), 'webp', 'png'])]
         for token in candidates:
-            if token.is_file() and is_owned_export(token, source, self.work_mode.get()):
+            if token.is_file():
                 try:
-                    with Image.open(token) as existing:
-                        existing.load()
-                        self._show_token(existing.convert('RGBA'))
-                    return True
-                except (OSError, ValueError, Image.DecompressionBombError):
+                    existing = read_owned_export_image(token, source, self.work_mode.get())
+                    if existing is not None:
+                        self._show_token(existing)
+                        return True
+                except (OSError, ValueError, SyntaxError, TypeError, RecursionError, Image.DecompressionBombError):
                     pass
         self._show_token(None)
         return False
