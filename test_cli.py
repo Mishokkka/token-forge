@@ -374,6 +374,9 @@ class SendToTests(unittest.TestCase):
                 if foreign_first:
                     self.add_other_app()
                 self.assertEqual(context_menu.install(self.base), [])
+                installed = [json.loads(p.read_text(encoding='utf-8')) for p in self.folder.glob('*.lnk')]
+                self.assertCountEqual([x['args'].split()[-1] for x in installed],
+                                      ['--auto', '--open', '--auto-item', '--open-item'])
                 for path, flag in context_menu.shortcut_paths(self.folder).items():
                     data = json.loads(path.read_text(encoding='utf-8'))
                     self.assertEqual(data['target'], str(self.exe))
@@ -402,9 +405,49 @@ class SendToTests(unittest.TestCase):
                 pass
         context_menu.install(self.base)
         self.assertNotIn(legacy, self.reg.keys)
+        self.assertNotIn(legacy.rsplit('\\', 1)[0], self.reg.keys)
         self.assertIn(foreign, self.reg.keys)
+        self.assertIn(foreign.rsplit('\\', 1)[0], self.reg.keys)
         context_menu.remove()
         self.assertIn(foreign, self.reg.keys)
+
+    def test_removal_preserves_replaced_shortcut(self):
+        context_menu.install(self.base)
+        path = next(iter(context_menu.shortcut_paths(self.folder)))
+        original = context_menu._detach_expected
+        def race(target, content, recovery):
+            if target == path:
+                target.write_bytes(b'foreign replacement')
+            return original(target, content, recovery)
+        with patch.object(context_menu, '_detach_expected', side_effect=race):
+            with self.assertRaisesRegex(RuntimeError, 'изменился'):
+                context_menu.remove()
+        self.assertEqual(path.read_bytes(), b'foreign replacement')
+        self.assertEqual(list(self.folder.iterdir()), [path])
+
+    def test_reinstall_preserves_replaced_shortcut_and_rolls_back(self):
+        context_menu.install(self.base)
+        paths = list(context_menu.shortcut_paths(self.folder))
+        originals = {p: p.read_bytes() for p in paths}
+        original = context_menu._detach_expected
+        def race(target, content, recovery):
+            if target == paths[1] and content == originals[target]:
+                target.write_bytes(b'foreign replacement')
+            return original(target, content, recovery)
+        with patch.object(context_menu, '_detach_expected', side_effect=race):
+            with self.assertRaisesRegex(OSError, 'изменился'):
+                context_menu.install(self.base)
+        self.assertEqual(paths[1].read_bytes(), b'foreign replacement')
+        for path in (paths[0], *paths[2:]):
+            self.assertEqual(path.read_bytes(), originals[path])
+
+    def test_removal_continues_after_inspection_failure(self):
+        context_menu.install(self.base)
+        path = next(iter(context_menu.shortcut_paths(self.folder)))
+        with patch.object(context_menu, '_owned_shortcut', side_effect=[OSError('timeout'), True, True, True]):
+            with self.assertRaisesRegex(RuntimeError, 'timeout'):
+                context_menu.remove()
+        self.assertEqual(list(self.folder.iterdir()), [path])
 
     def test_sendto_rejects_multiple_arguments(self):
         import sendto_entry
@@ -425,6 +468,9 @@ class RealShortcutTests(unittest.TestCase):
             entry = base / 'скрипт ! with spaces.py'
             entry.touch()
             context_menu._install_shortcuts(folder, target, entry)
+            installed = [context_menu._shortcut_metadata(p) for p in folder.glob('*.lnk')]
+            self.assertCountEqual([x['arguments'].split()[-1] for x in installed],
+                                  ['--auto', '--open', '--auto-item', '--open-item'])
             for path, flag in context_menu.shortcut_paths(folder).items():
                 self.assertTrue(path.is_file())
                 info = context_menu._shortcut_metadata(path)

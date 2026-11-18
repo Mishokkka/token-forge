@@ -9,11 +9,12 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from app_paths import preferences_dir
 
 from process_lock import process_lock
 
 BASE = Path(__file__).resolve().parent
-MENU_LOCK = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge' / 'context-menu'
+MENU_LOCK = preferences_dir() / 'context-menu'
 EXTENSIONS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff')
 CLASSES = r'Software\Classes'
 ROOT = CLASSES + r'\*\shell'
@@ -42,9 +43,12 @@ def _powershell(script, **variables):
     prefix = "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); "
     encoded = base64.b64encode((prefix + script).encode('utf-16-le')).decode('ascii')
     executable = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'WindowsPowerShell' / 'v1.0' / 'powershell.exe'
-    result = subprocess.run([str(executable), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
-                            env={**os.environ, **{f'TF_{k}': str(v) for k, v in variables.items()}},
-                            capture_output=True, timeout=30, check=False)
+    try:
+        result = subprocess.run([str(executable), '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded],
+                                env={**os.environ, **{f'TF_{k}': str(v) for k, v in variables.items()}},
+                                capture_output=True, timeout=30, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError('Истекло время ожидания Windows PowerShell.') from exc
     if result.returncode:
         raise OSError(result.stderr.decode('utf-8', errors='replace').strip() or 'PowerShell shortcut operation failed')
     return result.stdout.decode('utf-8-sig').rstrip('\r\n')
@@ -153,15 +157,17 @@ $result = [TokenForgeShellLink]::Read($env:TF_LINK)
     arguments = $result[2]
 } | ConvertTo-Json -Compress
 """, LINK=path)
-    return json.loads(data)
+    try:
+        info = json.loads(data)
+        if not isinstance(info, dict) or not isinstance(info.get('description'), str):
+            raise ValueError('Invalid shortcut metadata')
+        return info
+    except ValueError as exc:
+        raise OSError(f'Не удалось прочитать ярлык: {path}') from exc
 
 
 def _owned_shortcut(path):
-    try:
-        info = _shortcut_metadata(path)
-    except (OSError, ValueError):
-        return False
-    return info.get('description') == LINK_OWNER
+    return _shortcut_metadata(path).get('description') == LINK_OWNER
 
 
 def shortcut_paths(folder):
@@ -169,56 +175,133 @@ def shortcut_paths(folder):
             for label, flag in ACTION_NAMES.values()}
 
 
+def _read_owned_bytes(path, stage):
+    """Inspect immutable captured bytes, not a second read of a mutable name."""
+    if path.is_symlink():
+        raise FileExistsError(f'Ярлык является символической ссылкой: {path}')
+    content = path.read_bytes()
+    snapshot = stage / 'inspect.lnk'
+    snapshot.write_bytes(content)
+    return content if _owned_shortcut(snapshot) else None
+
+
+def _publish_no_clobber(source, destination):
+    if os.name == 'nt':
+        source.rename(destination)
+    else:
+        os.link(source, destination, follow_symlinks=False)
+        source.unlink()
+
+
+def _restore_detached(backup, destination):
+    try:
+        _publish_no_clobber(backup, destination)
+    except OSError as exc:
+        raise OSError(f'Не удалось восстановить {destination}. Сохранён файл: {backup}: {exc}') from exc
+
+
+def _detach_expected(path, content, recovery):
+    """Inspect the file actually displaced, and never delete a foreign replacement."""
+    import uuid
+    backup = recovery / (uuid.uuid4().hex + '.lnk')
+    path.rename(backup)
+    try:
+        matches = not backup.is_symlink() and backup.is_file() and backup.read_bytes() == content
+    except OSError as exc:
+        _restore_detached(backup, path)
+        raise OSError(f'Не удалось проверить перемещённый ярлык: {path}') from exc
+    if not matches:
+        _restore_detached(backup, path)
+        raise FileExistsError(f'Ярлык изменился во время операции и восстановлен: {path}')
+    return backup
+
+
+def _discard_detached(backup):
+    # Only private, verified displaced copies reach this function.
+    if backup is not None:
+        backup.unlink()
+
+
+def _recovery_dir(folder):
+    # Sibling of SendTo, not inside its visible menu. Preserve any nonempty
+    # directory on error instead of deleting unknown displaced data.
+    return Path(tempfile.mkdtemp(prefix='.tokenforge-recovery-', dir=folder.parent))
+
+
+def _remove_empty_recovery(recovery):
+    try:
+        recovery.rmdir()
+    except OSError:
+        pass
+
+
 def _install_shortcuts(folder, pythonw, entry):
-    # Stage all links before replacing any. Existing unrelated shortcuts
-    # with these names are a conflict, not permission to overwrite.
     paths = shortcut_paths(folder)
-    prior = {}
-    for path in paths:
-        if path.exists():
-            if not _owned_shortcut(path):
-                raise FileExistsError(f'Имя ярлыка уже занято: {path}')
-            prior[path] = path.read_bytes()
-        else:
-            prior[path] = None
-    committed = []
-    with tempfile.TemporaryDirectory(prefix='.tokenforge-', dir=folder) as temporary:
+    with tempfile.TemporaryDirectory(prefix='tokenforge-stage-') as temporary:
         stage = Path(temporary)
-        for number, (path, flag) in enumerate(paths.items()):
-            _write_shortcut(stage / f'{number}.lnk', pythonw, entry, flag)
+        prior = {}
+        # Snapshot ownership of all destinations before touching any of them.
+        for path in paths:
+            if os.path.lexists(path):
+                content = _read_owned_bytes(path, stage)
+                if content is None:
+                    raise FileExistsError(f'Имя ярлыка уже занято: {path}')
+                prior[path] = content
+            else:
+                prior[path] = None
+        recovery = _recovery_dir(folder)
+        committed = []
         try:
-            for number, path in enumerate(paths):
-                staged = stage / f'{number}.lnk'
+            # Stage on the destination volume for no-clobber rename.
+            staged_links = {}
+            for number, (path, flag) in enumerate(paths.items()):
+                staged = recovery / f'new-{number}.lnk'
+                _write_shortcut(staged, pythonw, entry, flag)
+                staged_links[path] = staged
+            for path, staged in staged_links.items():
                 content = staged.read_bytes()
                 previous = prior[path]
-                if previous is None:
-                    # Windows rename is no-clobber. The tests also exercise POSIX.
-                    if os.name == 'nt':
-                        staged.rename(path)
-                    else:
-                        os.link(staged, path)
-                else:
-                    if path.read_bytes() != previous:
-                        raise FileExistsError(f'Ярлык изменился во время установки: {path}')
-                    os.replace(staged, path)
-                committed.append((path, content))
+                backup = _detach_expected(path, previous, recovery) if previous is not None else None
+                try:
+                    _publish_no_clobber(staged, path)
+                except OSError:
+                    if backup is not None:
+                        _restore_detached(backup, path)
+                    raise
+                committed.append((path, content, backup))
         except Exception as original:
             errors = []
-            for path, content in reversed(committed):
+            for path, content, backup in reversed(committed):
                 try:
-                    if path.read_bytes() != content:
-                        raise FileExistsError(f'Ярлык изменился: {path}')
-                    if prior[path] is None:
-                        path.unlink()
-                    else:
-                        restore = stage / 'restore.lnk'
-                        restore.write_bytes(prior[path])
-                        os.replace(restore, path)
+                    installed = _detach_expected(path, content, recovery)
+                    try:
+                        if backup is not None:
+                            _restore_detached(backup, path)
+                    finally:
+                        _discard_detached(installed)
                 except OSError as exc:
                     errors.append(str(exc))
             if errors:
-                raise RuntimeError(f'{original}\nRollback was incomplete:\n' + '\n'.join(errors)) from original
+                raise RuntimeError(f'{original}\nRollback was incomplete:\n' +
+                                   '\n'.join(errors) + f'\nRecovery: {recovery}') from original
+            # Keep any displaced backup that could not be restored.
             raise
+        else:
+            warnings = []
+            for _, _, backup in committed:
+                try:
+                    _discard_detached(backup)
+                except OSError as exc:
+                    warnings.append(f'Не удалось удалить резервный ярлык {backup}: {exc}')
+            return warnings
+        finally:
+            # Only known staged new files are disposable, never remaining backups.
+            for staged in recovery.glob('new-*.lnk'):
+                try:
+                    staged.unlink()
+                except OSError:
+                    pass
+            _remove_empty_recovery(recovery)
 
 
 def _registry():
@@ -284,20 +367,30 @@ def _cleanup_previous():
 def install(base: Path = BASE) -> list[str]:
     with process_lock(MENU_LOCK, timeout=30):
         pythonw, entry = interpreter_and_entry(base)
-        _install_shortcuts(_sendto_folder(), pythonw, entry)
-        return _cleanup_previous()
+        warnings = _install_shortcuts(_sendto_folder(), pythonw, entry)
+        return warnings + _cleanup_previous()
 
 
 def remove() -> None:
     with process_lock(MENU_LOCK, timeout=30):
         errors = []
         try:
-            for path in shortcut_paths(_sendto_folder()):
+            folder = _sendto_folder()
+            with tempfile.TemporaryDirectory(prefix='tokenforge-inspect-') as temporary:
+                stage = Path(temporary)
+                recovery = _recovery_dir(folder)
                 try:
-                    if path.exists() and _owned_shortcut(path):
-                        path.unlink()
-                except OSError as exc:
-                    errors.append(f'{path}: {exc}')
+                    for path in shortcut_paths(folder):
+                        try:
+                            if not os.path.lexists(path):
+                                continue
+                            content = _read_owned_bytes(path, stage)
+                            if content is not None:
+                                _discard_detached(_detach_expected(path, content, recovery))
+                        except OSError as exc:
+                            errors.append(f'{path}: {exc}')
+                finally:
+                    _remove_empty_recovery(recovery)
         except OSError as exc:
             errors.append(str(exc))
         errors.extend(_cleanup_previous())
@@ -316,7 +409,7 @@ def main(argv=None) -> int:
             warnings = install()
             print('OK: TokenForge actions installed in Explorer Send to.')
             for warning in warnings:
-                print(f'WARNING: Old registration cleanup: {warning}', file=sys.stderr)
+                print(f'WARNING: {warning}', file=sys.stderr)
             print('Windows 11: Show more options (Shift+F10) > Send to.')
         else:
             remove()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from app_paths import preferences_dir
 
 
 def initialize_missing_streams(log_path: Path | None = None) -> None:
@@ -13,12 +14,12 @@ def initialize_missing_streams(log_path: Path | None = None) -> None:
     open for the lifetime of the process, including third-party exit handlers.
     """
     if sys.stdout is None or sys.stderr is None:
-        if log_path is None:
-            log_path = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge' / 'context_runtime.log'
         try:
+            if log_path is None:
+                log_path = preferences_dir() / 'context_runtime.log'
             log_path.parent.mkdir(parents=True, exist_ok=True)
             output = log_path.open('a', encoding='utf-8', errors='backslashreplace', buffering=1)
-        except OSError:
+        except (OSError, RuntimeError):
             output = open(os.devnull, 'w', encoding='utf-8', errors='backslashreplace', buffering=1)
         if sys.stdout is None:
             sys.stdout = output

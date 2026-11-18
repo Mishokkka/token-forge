@@ -9,7 +9,9 @@ def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
     from token_cli import notify_user
     if (len(args) != 2 or args[0] not in ('--auto', '--open', '--auto-item', '--open-item')):
-        notify_user('TokenForge', 'Выбери один файл изображения для обработки.', error=True)
+        message = 'Выбери один файл изображения для обработки.'
+        print(message, file=sys.stderr)
+        notify_user('TokenForge', message, error=True)
         return 2
     from tokenforge import main as application
     return application(args)

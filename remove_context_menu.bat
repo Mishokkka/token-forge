@@ -51,7 +51,9 @@ echo Context menu entries removed.
 pause
 exit /b 0
 :missing
-echo ERROR: Python missing. Install Python or use regedit to remove entries.
+echo ERROR: Python missing. Press Win+R, enter shell:sendto and press Enter.
+echo Delete only the four shortcuts whose names begin with TokenForge -.
+echo Older registry entries need separate cleanup; reinstall Python to run this script.
 :failed
 echo ERROR: Could not remove context menu entries.
 pause

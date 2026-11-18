@@ -14,6 +14,7 @@ import queue
 import threading
 import traceback
 from pathlib import Path
+from app_paths import preferences_dir
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageDraw, ImageTk
@@ -36,7 +37,7 @@ except ImportError:
     RootClass = tk.Tk
 
 BASE = Path(__file__).resolve().parent
-PREFS_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge'
+PREFS_DIR = preferences_dir()
 PREFS_FILE = PREFS_DIR / 'settings.json'
 
 BG = '#17191e'

@@ -1,6 +1,7 @@
 """Dependency-free interprocess lock for settings and Windows setup."""
 from contextlib import contextmanager
 import os
+import errno
 from pathlib import Path
 import time
 
@@ -24,7 +25,11 @@ def process_lock(path: Path, timeout=3.0):
                     import fcntl
                     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 break
-            except OSError:
+            except OSError as exc:
+                contention = ((errno.EACCES, errno.EAGAIN) if os.name == 'nt'
+                              else (errno.EAGAIN, errno.EWOULDBLOCK))
+                if exc.errno not in contention:
+                    raise
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Ресурс занят другим экземпляром TokenForge.')
                 time.sleep(.05)

@@ -8,6 +8,7 @@ import os
 import traceback
 from datetime import datetime
 from pathlib import Path
+from app_paths import preferences_dir
 
 from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache,
@@ -18,7 +19,7 @@ from token_engine import (
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
 BASE = Path(__file__).resolve().parent
-PREFS_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home() / '.config')) / 'TokenForge'
+PREFS_DIR = preferences_dir()
 PREFS_FILE = PREFS_DIR / 'settings.json'
 LOG_FILE = PREFS_DIR / 'context_actions.log'
 
