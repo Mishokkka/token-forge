@@ -593,6 +593,31 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(token.getpixel((0, 0))[3], 0)
         self.assertGreater(token.getpixel((128, 128))[3], 0)
 
+    def test_copy_and_extraction_share_one_lazy_snapshot(self):
+        import token_engine
+        from token_engine import LoadedCutout
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            original_snapshot = token_engine.source_snapshot
+            opened = []
+            def count(path, identity):
+                if path.samefile(source):
+                    opened.append(path)
+                return original_snapshot(path, identity)
+            def extract(capture):
+                first = capture.decode()
+                second = capture.decode()
+                self.assertEqual(first.tobytes(), second.tobytes())
+                return LoadedCutout(first, capture.identity)
+            with patch('token_engine.source_snapshot', side_effect=count):
+                result = export_batch([source], lambda p: self.fail('legacy loader invoked'),
+                                      self.frame, self.mask, {source: Adjust()},
+                                      captured_loader=extract)
+            self.assertEqual((result.created, result.converted), (1, 1))
+            self.assertFalse(result.errors)
+            self.assertEqual(len(opened), 1)
+
     def test_stale_source_and_recipe_warn_without_overwriting(self):
         from token_engine import read_export_owner
         with tempfile.TemporaryDirectory() as d:

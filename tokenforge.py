@@ -748,11 +748,16 @@ class TokenForge:
     def _cache_key(self, path, model, keep_alpha, edge_mode):
         return (*source_identity(path), model, keep_alpha, edge_mode)
 
-    def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False):
-        key = key if key is not None else self._cache_key(path, model, keep_alpha, edge_mode)
+    def _get_cutout(self, path, model, keep_alpha, edge_mode, *, key=None, cached_only=False,
+                    captured=None):
+        if captured is not None:
+            key = (*captured.identity, model, keep_alpha, edge_mode)
+        elif key is None:
+            key = self._cache_key(path, model, keep_alpha, edge_mode)
+        decode = (lambda path, *, identity: captured.decode()) if captured is not None else read_image
         cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
                             disk_cache=self.disk_cache, memory=self.cache, sessions=self.sessions,
-                            decode=read_image, extract=remove_background, session_factory=new_local_session,
+                            decode=decode, extract=remove_background, session_factory=new_local_session,
                             cached_only=cached_only)
         return cutout, key
 
@@ -996,13 +1001,12 @@ class TokenForge:
                         self.events.put(('done', BatchResult(errors=[], cancelled=True, total=len(selected_files))))
                         return
                     captured[path] = adjustment_for(settings, path, mode, default_layout)
-            def get_cutout(path):
-                if expected_input is not None:
-                    assert_source_identity(path, expected_input)
-                image, key = self._get_cutout(path, model, keep, edge_mode)
-                if expected_input is not None and key[:4] != expected_input:
-                    raise OSError(f'Исходный файл изменился во время обработки: {path.name}')
+            def get_cutout(path, *, captured_source=None):
+                image, key = self._get_cutout(path, model, keep, edge_mode, captured=captured_source)
                 return LoadedCutout(image, key[:4])
+
+            def load_captured(capture):
+                return get_cutout(capture.path, captured_source=capture)
             progress = lambda i, n, msg: self.events.put(('progress', (i, n, msg)))
             if mode == 'item':
                 result = export_items(selected_files, get_cutout, captured,
@@ -1010,7 +1014,8 @@ class TokenForge:
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
                                       expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
-                                      extraction_recipe=(model, keep, edge_mode))
+                                      extraction_recipe=(model, keep, edge_mode),
+                                      captured_loader=load_captured)
             else:
                 result = export_batch(selected_files, get_cutout, frame, interior,
                                       captured, out_size=size, format_name=ext,
@@ -1018,7 +1023,8 @@ class TokenForge:
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
                                       expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
-                                      extraction_recipe=(model, keep, edge_mode))
+                                      extraction_recipe=(model, keep, edge_mode),
+                                      captured_loader=load_captured)
             self.events.put(('done', result))
         self._launch_worker(work, lambda exc: self.events.put(('batch_failure', traceback.format_exc())))
 

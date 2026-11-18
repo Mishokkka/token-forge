@@ -225,7 +225,9 @@ class CacheTests(unittest.TestCase):
                             'skip_exists': True, 'convert_original': False}.items():
             setattr(app, name, control(value))
         app._adjust_for = lambda path: Adjust()
-        app._get_cutout = lambda path, *args: (read_image(path), source_identity(path) + args)
+        app._get_cutout = lambda path, *args, captured=None: (
+            captured.decode() if captured is not None else read_image(path),
+            (captured.identity if captured is not None else source_identity(path)) + args)
         destination = token_output_path(self.source)
         save_generated(Image.new('RGBA', (256, 256), 'red'), destination, self.source,
                        'token', skip_exists=False)

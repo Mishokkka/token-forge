@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack, nullcontext
 import hashlib
 import json
 import os
@@ -231,6 +231,50 @@ def source_snapshot(path: Path, identity: tuple):
             raise OSError(f'Исходный файл изменился во время чтения: {path.name}')
         snapshot.seek(0)
         yield snapshot
+
+
+class BorrowedStream:
+    """File API proxy with a borrowed (not transferred) lifetime."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def close(self):
+        pass
+
+
+class CapturedArtwork:
+    """One lazily materialized, digest-verified byte snapshot per export.
+
+    Skip-only jobs do not spool the source. Copy and extraction decode the
+    same immutable bytes. Publication guards still hash the live source.
+    """
+    def __init__(self, path: Path, identity: tuple):
+        self.path = path
+        self.identity = identity
+        self._stack = ExitStack()
+        self._stream = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)
+
+    @contextmanager
+    def open(self):
+        if self._stream is None:
+            self._stream = self._stack.enter_context(source_snapshot(self.path, self.identity))
+        self._stream.seek(0)
+        # Pillow must not acquire ownership of the shared file object.
+        with open_art(BorrowedStream(self._stream)) as image:
+            yield image
+
+    def decode(self):
+        with self.open() as image:
+            return ImageOps.exif_transpose(image).convert('RGBA')
 
 
 def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
@@ -989,14 +1033,15 @@ def assert_approval(destination, approved):
 
 
 def save_original_webp(source: Path, *, collision_index=None, input_identity=None,
-                       approval_guard=None) -> Publication:
+                       approval_guard=None, captured=None) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
     WebP (which might be a hand-edited asset).
     """
     identity = input_identity if input_identity is not None else source_identity(source)
-    assert_source_identity(source, identity)
+    if captured is not None and (captured.path != source or captured.identity != identity):
+        raise ValueError('Снимок не соответствует исходнику.')
     if approval_guard is not None:
         approval_guard()
     if source.suffix.lower() == '.webp':
@@ -1016,7 +1061,8 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         assert_source_identity(source, identity)
         if approval_guard is not None:
             approval_guard()
-    with source_snapshot(source, identity) as snapshot, open_art(snapshot) as raw:
+    capture_context = CapturedArtwork(source, identity) if captured is None else nullcontext(captured)
+    with capture_context as capture, capture.open() as raw:
         artwork = ImageOps.exif_transpose(raw)
         # Preserve true transparency without accidentally adding an opaque alpha.
         if 'A' in artwork.getbands() or 'transparency' in artwork.info:
@@ -1091,7 +1137,7 @@ class BatchResult:
 def export_images(files, get_cutout, output_path, renderer, *, kind,
                   skip_exists=True, convert_original=True, cancel_event=None,
                   on_progress=None, approved_outputs=None, expected_inputs=None,
-                  recipe_for=None) -> BatchResult:
+                  recipe_for=None, captured_loader=None) -> BatchResult:
     """One export pipeline for both composition modes.
 
     Capture the source version before invoking the loader and carry it
@@ -1106,14 +1152,13 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             break
         if on_progress:
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
-        destination = output_path(source)
-        approved = (approved_outputs or {}).get(destination)
         try:
-            identity = (expected_inputs or {}).get(str(source))
-            if identity is None:
-                identity = source_identity(source)
-            else:
-                assert_source_identity(source, identity)
+            destination = output_path(source)
+            approved = (approved_outputs or {}).get(destination)
+            identity = source_identity(source)
+            expected = (expected_inputs or {}).get(str(source))
+            if expected is not None and expected != identity:
+                raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
             # A stale approval must not trigger either of this job's writes.
             assert_approval(destination, approved)
         except Exception as exc:
@@ -1121,54 +1166,59 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             if on_progress:
                 on_progress(index+1, len(files), f'Выполнено: {index + 1}/{len(files)}')
             continue
-        if convert_original:
+        with CapturedArtwork(source, identity) as captured:
+            if convert_original:
+                try:
+                    publication = save_original_webp(
+                        source, collision_index=folders, input_identity=identity, captured=captured,
+                        approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
+                    result.converted += int(bool(publication))
+                    result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
+                except StaleApprovalError as exc:
+                    result.record_error(source, 'преобразование оригинала', exc)
+                    if on_progress:
+                        on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
+                    continue
+                except Exception as exc:
+                    result.record_error(source, 'преобразование оригинала', exc)
             try:
-                publication = save_original_webp(
-                    source, collision_index=folders, input_identity=identity,
-                    approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
-                result.converted += int(bool(publication))
-                result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
-            except StaleApprovalError as exc:
-                result.record_error(source, 'преобразование оригинала', exc)
-                if on_progress:
-                    on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
-                continue
-            except Exception as exc:
-                result.record_error(source, 'преобразование оригинала', exc)
-        try:
-            assert_approval(destination, approved)
-            assert_source_identity(source, identity)
-            ensure_no_source_collision(destination, source, kind, folders)
-            recipe = recipe_for(source) if recipe_for is not None else None
-            if skip_exists and destination.exists():
-                ensure_no_source_collision(destination, source, kind, folders, live=True)
-                owner = validate_skip(destination, source, kind)
-                assert_source_identity(source, identity)
-                result.warnings.extend(f'{source.name}: {destination.name}: {w}'
-                                       for w in freshness_warnings(owner, identity, recipe))
-                result.skipped += 1
-            else:
-                loaded = get_cutout(source)
-                if isinstance(loaded, LoadedCutout):
-                    if loaded.identity != identity:
-                        raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
-                    cutout = loaded.image
-                    identity = loaded.identity
-                else:
-                    cutout = loaded
-                assert_source_identity(source, identity)
-                image = renderer(cutout, source)
-                publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
-                                             approved_identity=approved,
-                                             input_identity=identity, collision_index=folders, recipe=recipe)
-                result.warnings.extend(f'{source.name}: {destination.name}: {warning}' for warning in publication.warnings)
-                if publication:
-                    result.created += 1
-                    result.outputs.append(destination)
-                else:
+                assert_approval(destination, approved)
+                ensure_no_source_collision(destination, source, kind, folders)
+                recipe = recipe_for(source) if recipe_for is not None else None
+                if skip_exists and destination.exists():
+                    ensure_no_source_collision(destination, source, kind, folders, live=True)
+                    owner = validate_skip(destination, source, kind)
+                    assert_source_identity(source, identity)
+                    result.warnings.extend(f'{source.name}: {destination.name}: {w}'
+                                           for w in freshness_warnings(owner, identity, recipe))
                     result.skipped += 1
-        except Exception as exc:
-            result.record_error(source, stage, exc)
+                else:
+                    if captured_loader is None:
+                        # Legacy injectable loader contract retains the old guard.
+                        assert_source_identity(source, identity)
+                        loaded = get_cutout(source)
+                        assert_source_identity(source, identity)
+                    else:
+                        loaded = captured_loader(captured)
+                    if isinstance(loaded, LoadedCutout):
+                        if loaded.identity != identity:
+                            raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+                        cutout = loaded.image
+                        identity = loaded.identity
+                    else:
+                        cutout = loaded
+                    image = renderer(cutout, source)
+                    publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
+                                                 approved_identity=approved,
+                                                 input_identity=identity, collision_index=folders, recipe=recipe)
+                    result.warnings.extend(f'{source.name}: {destination.name}: {warning}' for warning in publication.warnings)
+                    if publication:
+                        result.created += 1
+                        result.outputs.append(destination)
+                    else:
+                        result.skipped += 1
+            except Exception as exc:
+                result.record_error(source, stage, exc)
         if on_progress:
             on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
     return result
@@ -1179,7 +1229,8 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  out_size: int = 256, format_name: str = 'webp',
                  skip_exists: bool = True, convert_original: bool = True,
                  cancel_event=None, on_progress=None, approved_outputs=None,
-                 frame_loader=None, expected_inputs=None, extraction_recipe=None) -> BatchResult:
+                 frame_loader=None, expected_inputs=None, extraction_recipe=None,
+                 captured_loader=None) -> BatchResult:
     frame_digest = None
     def ensure_frame():
         nonlocal frame, interior
@@ -1207,4 +1258,4 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                          render, kind='token', skip_exists=skip_exists,
                          convert_original=convert_original, cancel_event=cancel_event,
                          on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs,
-                         recipe_for=recipe_for)
+                         recipe_for=recipe_for, captured_loader=captured_loader)

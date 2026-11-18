@@ -75,12 +75,13 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
     require_local_model(model)
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     memory, sessions = {}, {}
-    def get_cutout(path: Path):
-        identity = source_identity(path)
+    def get_cutout(path: Path, *, captured=None):
+        identity = captured.identity if captured is not None else source_identity(path)
         key = (*identity, model, keep_alpha, edge_mode)
+        decode = (lambda path, *, identity: captured.decode()) if captured is not None else read_image
         cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
                             disk_cache=cache, memory=memory, sessions=sessions,
-                            decode=read_image, extract=remove_background, session_factory=new_local_session)
+                            decode=decode, extract=remove_background, session_factory=new_local_session)
         return LoadedCutout(cutout, identity)
 
     return get_cutout
@@ -115,6 +116,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
         skip_exists=settings['skip_exists'],
         convert_original=settings['convert_original'],
         extraction_recipe=(model, keep_alpha, edge_mode),
+        captured_loader=lambda capture: get_cutout(capture.path, captured=capture),
     )
     for warning in result.warnings:
         write_log(warning)
@@ -143,7 +145,8 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=settings['skip_exists'],
                           convert_original=settings['convert_original'],
-                          extraction_recipe=(model, keep_alpha, edge_mode))
+                          extraction_recipe=(model, keep_alpha, edge_mode),
+                          captured_loader=lambda capture: get_cutout(capture.path, captured=capture))
     for warning in result.warnings:
         write_log(warning)
     if result.errors:
