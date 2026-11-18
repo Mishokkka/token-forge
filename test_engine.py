@@ -520,7 +520,7 @@ class EngineTests(unittest.TestCase):
             self.figure.save(source)
             dest = source.with_suffix('.webp')
             save_original_webp(source)
-            with patch('token_engine.is_owned_export', side_effect=InvalidExportError('Готовое изображение повреждено.')):
+            with patch('token_engine.read_export_owner', side_effect=InvalidExportError('Готовое изображение повреждено.')):
                 with self.assertRaisesRegex(InvalidExportError, 'Перемести или удали повреждённую WebP-копию'):
                     validate_skip(dest, source, 'copy')
 
@@ -576,6 +576,37 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(token.size, (256, 256))
         self.assertEqual(token.getpixel((0, 0))[3], 0)
         self.assertGreater(token.getpixel((128, 128))[3], 0)
+
+    def test_stale_source_and_recipe_warn_without_overwriting(self):
+        from token_engine import read_export_owner
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            def run(zoom=100, skip=True):
+                return export_batch([source], read_image, self.frame, self.mask,
+                                    {source: Adjust(zoom=zoom)}, skip_exists=skip)
+            self.assertEqual(run().created, 1)
+            token, copy = token_output_path(source), source.with_suffix('.webp')
+            marker = read_export_owner(token)
+            self.assertEqual(marker[:3], (3, 'token', 'Hero.png'))
+            self.assertEqual(len(marker[3]), 64)
+            self.assertEqual(len(marker[4]), 64)
+            self.assertFalse(run().warnings)
+            original_token, original_copy = token.read_bytes(), copy.read_bytes()
+            result = run(zoom=125)
+            self.assertEqual(result.skipped, 1)
+            self.assertTrue(any('Параметры генерации' in w for w in result.warnings))
+            Image.new('RGBA', (320, 500), 'green').save(source)
+            result = run()
+            self.assertEqual(result.skipped, 1)
+            self.assertTrue(any('Исходник изменился' in w for w in result.warnings))
+            self.assertEqual(token.read_bytes(), original_token)
+            self.assertEqual(copy.read_bytes(), original_copy)
+            result = run(skip=False)
+            self.assertEqual(result.created, 1)
+            self.assertNotEqual(token.read_bytes(), original_token)
+            self.assertEqual(copy.read_bytes(), original_copy)
+            self.assertTrue(result.warnings)
 
     def test_token_without_visible_subject_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'вне видимой области'):

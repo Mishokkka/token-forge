@@ -55,6 +55,14 @@ class CliTests(unittest.TestCase):
     def save_settings(self):
         (self.pref / 'settings.json').write_text(json.dumps(self.settings, ensure_ascii=False), encoding='utf-8')
 
+    def test_legacy_boolean_string_is_not_truthy_in_auto(self):
+        self.settings['convert_original'] = 'false'
+        self.settings['skip_exists'] = '0'
+        self.save_settings()
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'created')
+        self.assertFalse(self.photo.with_suffix('.webp').exists())
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'created')
+
     def test_context_auto_creates_art_and_token(self):
         with patch.object(token_cli, 'remove_background', side_effect=AssertionError('AI invoked')):
             state, token = token_cli.automatic_token(self.photo)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, export_images
+from token_engine import BatchResult, export_images, recipe_digest, canonical_placement
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -188,9 +188,12 @@ def outline_subject(canvas, stroke_px):
 
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
-                 on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
+                 on_progress=None, approved_outputs=None, expected_inputs=None, extraction_recipe=None) -> BatchResult:
     return export_images(files, get_cutout, item_output_path,
                          lambda image, source: compose_item(image, adjustments[source]),
                          kind='item', skip_exists=skip_exists, convert_original=convert_original,
                          cancel_event=cancel_event, on_progress=on_progress,
-                         approved_outputs=approved_outputs, expected_inputs=expected_inputs)
+                         approved_outputs=approved_outputs, expected_inputs=expected_inputs,
+                         recipe_for=lambda source: recipe_digest(
+                             'item', size=ITEM_SIZE, stroke=ITEM_STROKE,
+                             placement=canonical_placement(adjustments[source]), extraction=extraction_recipe))

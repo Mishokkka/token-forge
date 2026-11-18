@@ -68,7 +68,7 @@ def settings_read():
     except OSError as exc:
         raw = {}
         messagebox.showerror('Не удалось прочитать настройки', str(exc))
-    return decode_settings(raw, default_frame=BASE / 'RingT.png')
+    return raw
 
 
 def checkerboard(size: int) -> Image.Image:
@@ -101,7 +101,8 @@ class TokenForge:
                        selectbackground=[('readonly', INPUT)], selectforeground=[('readonly', FG)])
         self.style.configure('Horizontal.TProgressbar', troughcolor=INPUT, background=BLUE)
 
-        self.settings = settings_read()
+        persisted = settings_read()
+        self.settings = decode_settings(persisted, default_frame=BASE / 'RingT.png')
         for name in ('overrides', 'item_overrides'):
             if not isinstance(self.settings.get(name), dict):
                 self.settings[name] = {}
@@ -183,7 +184,6 @@ class TokenForge:
         self._settings_baseline = self._settings_snapshot()
         # Preserve the actual persisted baseline for fields that were repaired
         # by the decoder, so the normal delta save writes these repairs.
-        persisted = read_settings_file(PREFS_FILE)
         for name in ('ring', 'model', 'edge_mode', 'size', 'ext', 'keep_alpha',
                      'skip_exists', 'convert_original', 'item_layout', 'folder',
                      'overrides', 'item_overrides'):
@@ -1009,14 +1009,16 @@ class TokenForge:
                                       skip_exists=skip, convert_original=convert,
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
-                                      expected_inputs={str(files[0]): expected_input} if expected_input is not None else None)
+                                      expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
+                                      extraction_recipe=(model, keep, edge_mode))
             else:
                 result = export_batch(selected_files, get_cutout, frame, interior,
                                       captured, out_size=size, format_name=ext,
                                       skip_exists=skip, convert_original=convert,
                                       cancel_event=self.cancel_event, on_progress=progress,
                                       approved_outputs=approved_outputs,
-                                      expected_inputs={str(files[0]): expected_input} if expected_input is not None else None)
+                                      expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
+                                      extraction_recipe=(model, keep, edge_mode))
             self.events.put(('done', result))
         self._launch_worker(work, lambda exc: self.events.put(('batch_failure', traceback.format_exc())))
 

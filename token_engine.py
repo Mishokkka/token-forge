@@ -1,7 +1,7 @@
 """TokenForge image pipeline. Tk-independent so composition can be tested offline."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from contextlib import contextmanager
 import hashlib
 import json
@@ -542,8 +542,46 @@ def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
                              replace=replace))
 
 
-def export_owner(source: Path, kind: str) -> str:
-    return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
+def canonical_placement(adjustment):
+    return {name: float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+            for name, value in asdict(adjustment).items()}
+
+
+def recipe_digest(kind, **settings):
+    payload = json.dumps({'kind': kind, 'algorithm': 1, **settings}, sort_keys=True,
+                         ensure_ascii=True, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(payload.encode('ascii')).hexdigest()
+
+
+COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100)
+
+
+def _valid_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+
+
+def export_owner(source: Path, kind: str, *, source_digest=None, recipe=None) -> str:
+    if source_digest is None:
+        return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
+    if not _valid_digest(source_digest) or (recipe is not None and not _valid_digest(recipe)):
+        raise ValueError('Invalid export provenance')
+    return 'TokenForge/3:' + json.dumps([kind, source.name, source_digest, recipe], ensure_ascii=True)
+
+
+def freshness_warnings(owner, identity, recipe=None):
+    """Ownership authorizes replacement; freshness never grants permission."""
+    if identity is None:
+        return ()
+    if owner[0] < 3:
+        return ('Актуальность старого результата не подтверждена; при необходимости создай его заново.',)
+    messages = []
+    if owner[3] != identity[-1]:
+        messages.append('Исходник изменился; готовый результат устарел.')
+    if recipe is not None and owner[4] != recipe:
+        messages.append('Параметры генерации изменились; готовый результат может быть устаревшим.')
+    if messages:
+        messages.append('Существующий файл оставлен без изменений.')
+    return tuple(messages)
 
 
 class InvalidExportError(OSError):
@@ -554,18 +592,22 @@ def _parse_owner(owner):
     if not isinstance(owner, str) or len(owner) > 4096:
         return None
     prefix, separator, payload = owner.partition(':')
-    version = {'TokenForge/1': 1, 'TokenForge/2': 2}.get(prefix)
+    version = {'TokenForge/1': 1, 'TokenForge/2': 2, 'TokenForge/3': 3}.get(prefix)
     if not separator or version is None:
         return None
     try:
         values = json.loads(payload)
     except (ValueError, RecursionError):
         return None
-    if (isinstance(values, list) and len(values) == 2
+    if (isinstance(values, list) and len(values) == (4 if version == 3 else 2)
             and values[0] in ('token', 'item', 'copy')
             and isinstance(values[1], str) and values[1]
             and not any(c in values[1] for c in ('/', '\\', ':', '\0'))
             and values[1] not in ('.', '..')):
+        if version == 3:
+            if not _valid_digest(values[2]) or (values[3] is not None and not _valid_digest(values[3])):
+                return None
+            return version, *values
         return version, values[0], values[1]
     return None
 
@@ -619,7 +661,7 @@ def is_owned_export(destination: Path, source: Path, kind: str, *, identity=None
 def _owner_matches(owner, source, kind):
     if not owner or owner[1] != kind:
         return False
-    if owner[0] == 2:
+    if owner[0] >= 2:
         return recorded_source_matches(source, owner[2])
     if owner[2].casefold() != source.stem.casefold():
         return False
@@ -757,7 +799,8 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
 def validate_skip(destination, source, kind, *, identity=None):
     identity = identity if identity is not None else source_identity(destination)
     try:
-        owned = is_owned_export(destination, source, kind, identity=identity, require_pixels=True)
+        owner = read_export_owner(destination, identity=identity, require_pixels=True)
+        owned = _owner_matches(owner, source, kind)
     except InvalidExportError as exc:
         hint = ('Перемести или удали повреждённую WebP-копию и повтори обработку.'
                 if kind == 'copy' else 'Отключи пропуск готовых изображений и повтори обработку.')
@@ -766,11 +809,12 @@ def validate_skip(destination, source, kind, *, identity=None):
         hint = ' Перемести или переименуй существующий файл и повтори обработку.' if kind == 'copy' else ''
         raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.{hint}')
     assert_source_identity(destination, identity)
+    return owner
 
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
-                   input_identity: tuple | None = None, collision_index=None) -> Publication:
+                   input_identity: tuple | None = None, collision_index=None, recipe=None) -> Publication:
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
@@ -783,15 +827,17 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
         if skip_exists and owned:
             if collision_index is not None:
                 ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-            validate_skip(destination, source, kind, identity=prior)
+            owner = validate_skip(destination, source, kind, identity=prior)
             if input_identity is not None:
                 assert_source_identity(source, input_identity)
-            return Publication(False)
+            return Publication(False, freshness_warnings(owner, input_identity, recipe))
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
     exif = Image.Exif()
-    exif[270] = export_owner(source, kind)
+    exif[270] = export_owner(source, kind,
+                             source_digest=input_identity[-1] if input_identity is not None else None,
+                             recipe=recipe)
     if destination.suffix.lower() not in ('.png', '.webp'):
         raise ValueError('Результат TokenForge должен иметь расширение PNG или WebP.')
     fmt = 'PNG' if destination.suffix.lower() == '.png' else 'WEBP'
@@ -815,8 +861,9 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
             raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
         if collision_index is not None:
             ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-        validate_skip(destination, source, kind)
+        owner = validate_skip(destination, source, kind)
         check_input()
+        return Publication(False, freshness_warnings(owner, input_identity, recipe))
     return published
 
 
@@ -872,8 +919,11 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         return Publication(False)
     destination = original_webp_path(source)
     if destination.exists():
-        validate_skip(destination, source, 'copy')
-        return Publication(False)
+        if collision_index is not None:
+            ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
+        owner = validate_skip(destination, source, 'copy')
+        assert_source_identity(source, identity)
+        return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
     if collision_index is not None:
         ensure_no_source_collision(destination, source, 'copy', collision_index)
     def guard():
@@ -890,7 +940,7 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         else:
             artwork = artwork.convert('RGB')
         exif = Image.Exif()
-        exif[270] = export_owner(source, 'copy')
+        exif[270] = export_owner(source, 'copy', source_digest=identity[-1], recipe=COPY_RECIPE)
         created = atomic_write(destination,
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
                                                        method=6, alpha_quality=100, exif=exif),
@@ -898,8 +948,11 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
         if not created:
-            validate_skip(destination, source, 'copy')
+            if collision_index is not None:
+                ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
+            owner = validate_skip(destination, source, 'copy')
             assert_source_identity(source, identity)
+            return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
         return created
 
 
@@ -953,7 +1006,8 @@ class BatchResult:
 
 def export_images(files, get_cutout, output_path, renderer, *, kind,
                   skip_exists=True, convert_original=True, cancel_event=None,
-                  on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
+                  on_progress=None, approved_outputs=None, expected_inputs=None,
+                  recipe_for=None) -> BatchResult:
     """One export pipeline for both composition modes.
 
     Capture the source version before invoking the loader and carry it
@@ -1001,10 +1055,13 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             assert_approval(destination, approved)
             assert_source_identity(source, identity)
             ensure_no_source_collision(destination, source, kind, folders)
+            recipe = recipe_for(source) if recipe_for is not None else None
             if skip_exists and destination.exists():
                 ensure_no_source_collision(destination, source, kind, folders, live=True)
-                validate_skip(destination, source, kind)
+                owner = validate_skip(destination, source, kind)
                 assert_source_identity(source, identity)
+                result.warnings.extend(f'{source.name}: {destination.name}: {w}'
+                                       for w in freshness_warnings(owner, identity, recipe))
                 result.skipped += 1
             else:
                 loaded = get_cutout(source)
@@ -1019,11 +1076,11 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 image = renderer(cutout, source)
                 publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
                                              approved_identity=approved,
-                                             input_identity=identity, collision_index=folders)
+                                             input_identity=identity, collision_index=folders, recipe=recipe)
+                result.warnings.extend(f'{source.name}: {destination.name}: {warning}' for warning in publication.warnings)
                 if publication:
                     result.created += 1
                     result.outputs.append(destination)
-                    result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
                 else:
                     result.skipped += 1
         except Exception as exc:
@@ -1038,13 +1095,32 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  out_size: int = 256, format_name: str = 'webp',
                  skip_exists: bool = True, convert_original: bool = True,
                  cancel_event=None, on_progress=None, approved_outputs=None,
-                 frame_loader=None, expected_inputs=None) -> BatchResult:
-    def render(cutout, source):
+                 frame_loader=None, expected_inputs=None, extraction_recipe=None) -> BatchResult:
+    frame_digest = None
+    def ensure_frame():
         nonlocal frame, interior
         if frame is None and frame_loader is not None:
             frame, interior = frame_loader()
+        return frame
+    def recipe_for(source):
+        nonlocal frame_digest
+        try:
+            if ensure_frame() is None:
+                return None
+        except (OSError, ValueError, Image.DecompressionBombError):
+            # Preserve the ability to skip existing valid pixels without an
+            # available frame; rendering a new result still requires it.
+            return None
+        if frame_digest is None:
+            frame_digest = hashlib.sha256(frame.tobytes()).hexdigest()
+        return recipe_digest('token', frame=frame_digest, frame_size=frame.size,
+                             size=out_size, format=format_name.lower(),
+                             placement=canonical_placement(adjustments[source]), extraction=extraction_recipe)
+    def render(cutout, source):
+        ensure_frame()
         return compose(cutout, frame, interior, out_size, adjustments[source])
     return export_images(files, get_cutout, lambda p: token_output_path(p, format_name),
                          render, kind='token', skip_exists=skip_exists,
                          convert_original=convert_original, cancel_event=cancel_event,
-                         on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs)
+                         on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs,
+                         recipe_for=recipe_for)

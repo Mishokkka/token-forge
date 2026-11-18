@@ -52,7 +52,7 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     owner = read_export_owner(path)
     if owner is None:
         return path
-    if owner[0] == 2:
+    if owner[0] >= 2:
         candidate = path.with_name(owner[2])
         if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
                 and not excluded_file(candidate, path) and read_export_owner(candidate) is None
@@ -114,6 +114,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
         out_size=size, format_name=ext,
         skip_exists=settings['skip_exists'],
         convert_original=settings['convert_original'],
+        extraction_recipe=(model, keep_alpha, edge_mode),
     )
     for warning in result.warnings:
         write_log(warning)
@@ -141,7 +142,8 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=settings['skip_exists'],
-                          convert_original=settings['convert_original'])
+                          convert_original=settings['convert_original'],
+                          extraction_recipe=(model, keep_alpha, edge_mode))
     for warning in result.warnings:
         write_log(warning)
     if result.errors:
