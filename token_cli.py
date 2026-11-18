@@ -39,60 +39,29 @@ def resolve_context_source(filename: str | Path) -> Path:
         raise FileNotFoundError(f'Файл не найден: {path}')
     if path.suffix.lower() not in IMAGE_EXTS:
         raise ValueError(f'Неподдерживаемый формат: {path.suffix}')
-    candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
-    by_stem = {p.stem.casefold(): p for p in candidates}
-    if path in candidates:
+    owner = read_export_owner(path)
+    if owner is None:
         return path
-    # A same-stem non-WebP original wins over the legacy suffix heuristic
-    # unless the selected file is explicitly marked as a generated result.
-    same_stem = by_stem.get(path.stem.casefold())
-    if same_stem is not None and read_export_owner(path) is None:
-        return same_stem
-    # User clicked a generated token, e.g. "Maget.webp": redirect to "Mage.png".
-    if path.suffix.lower() in ('.png', '.webp') and path.stem.casefold().endswith('t'):
-        original = by_stem.get(path.stem[:-1].casefold())
-        if original is not None:
-            return original
-    # User clicked 'Sword_item.webp': redirect to 'Sword.png' when available.
-    if path.suffix.lower() == '.webp' and path.stem.casefold().endswith('_item'):
-        original = by_stem.get(path.stem[:-5].casefold())
-        if original is not None:
-            return original
-    # User clicked an exported webp copy, e.g. 'Mage.webp': use 'Mage.png'.
-    return by_stem.get(path.stem.casefold(), path)
+    candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
+    matches = [p for p in candidates
+               if (p.name if owner[0] == 2 else p.stem).casefold() == owner[2].casefold()]
+    if len(matches) != 1:
+        raise ValueError(f'Не удалось однозначно найти исходный арт для {path.name}.')
+    return matches[0]
+
+
+def override_for(settings, name, source):
+    mapping = settings.get(name)
+    stored = mapping.get(str(source.resolve()), {}) if isinstance(mapping, dict) else {}
+    return stored if isinstance(stored, dict) else {}
 
 
 def _adjust_for(settings: dict, source: Path) -> Adjust:
-    stored = settings.get('overrides', {}).get(str(source.resolve()), {})
-    if not isinstance(stored, dict):
-        stored = {}
+    stored = override_for(settings, 'overrides', source)
     return Adjust(**{key: stored[key] for key in ('zoom', 'x', 'y', 'gap') if key in stored})
 
 
-def automatic_token(filename: str | Path) -> tuple[str, Path]:
-    """Create a single token with the saved settings and disk extraction cache.
-
-    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
-    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
-    """
-    source = resolve_context_source(filename)
-    settings = read_settings()
-    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
-    frame = read_image(frame_path)
-    if frame.width != frame.height:
-        raise ValueError('PNG-кольцо должно быть квадратным.')
-    interior = frame_interior(frame)
-
-    model = settings.get('model', 'birefnet-general')
-    edge_mode = settings.get('edge_mode', 'Очистка краёв')
-    keep_alpha = bool(settings.get('keep_alpha', True))
-    ext = str(settings.get('ext', 'webp')).lower()
-    if ext not in ('webp', 'png'):
-        raise ValueError('Неподдерживаемый формат токена в настройках.')
-    size = int(settings.get('size', 256))
-    if size not in (256, 512, 1024):
-        raise ValueError('Неподдерживаемый размер токена в настройках.')
-
+def make_cutout_loader(model, keep_alpha, edge_mode):
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     def get_cutout(path: Path):
         identity = source_identity(path)
@@ -114,8 +83,38 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
         assert_source_identity(path, identity)
         return cutout
 
+    return get_cutout
+
+
+def automatic_token(filename: str | Path) -> tuple[str, Path]:
+    """Create a single token with the saved settings and disk extraction cache.
+
+    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
+    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
+    """
+    source = resolve_context_source(filename)
+    settings = read_settings()
+    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    def load_frame():
+        frame = read_image(frame_path)
+        if frame.width != frame.height:
+            raise ValueError('PNG-кольцо должно быть квадратным.')
+        return frame, frame_interior(frame)
+
+    model = settings.get('model', 'birefnet-general')
+    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    keep_alpha = bool(settings.get('keep_alpha', True))
+    ext = str(settings.get('ext', 'webp')).lower()
+    if ext not in ('webp', 'png'):
+        raise ValueError('Неподдерживаемый формат токена в настройках.')
+    size = int(settings.get('size', 256))
+    if size not in (256, 512, 1024):
+        raise ValueError('Неподдерживаемый размер токена в настройках.')
+
+    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_batch(
-        [source], get_cutout, frame, interior, {source: _adjust_for(settings, source)},
+        [source], get_cutout, None, None, {source: _adjust_for(settings, source)},
+        frame_loader=load_frame,
         out_size=size, format_name=ext,
         skip_exists=bool(settings.get('skip_exists', True)),
         convert_original=bool(settings.get('convert_original', True)),
@@ -140,35 +139,95 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     model = settings.get('model', 'birefnet-general')
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
-    stored = settings.get('item_overrides', {}).get(str(source.resolve()), {})
-    if not isinstance(stored, dict):
-        stored = {}
+    stored = override_for(settings, 'item_overrides', source)
     layout = stored.get('layout', settings.get('item_layout', ITEM_MODES[0]))
     if layout not in ITEM_MODES:
         layout = ITEM_MODES[0]
     adj = ItemAdjust(layout=layout,
                      **{key: stored[key] for key in ('zoom', 'x', 'y', 'rotation', 'flip_horizontal', 'flip_vertical', 'clean_noise')
                         if key in stored})
-    cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
-    def get_cutout(path: Path):
-        identity = source_identity(path)
-        cutout = cache.load(path, model, keep_alpha, edge_mode, identity=identity)
-        if cutout is not None:
-            assert_source_identity(path, identity)
-            return cutout
-        original = read_image(path)
-        assert_source_identity(path, identity)
-        if keep_alpha and already_transparent(original):
-            cutout = original
+    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
+    result = export_items([source], get_cutout, {source: adj},
+                          skip_exists=bool(settings.get('skip_exists', True)),
+                          convert_original=bool(settings.get('convert_original', True)))
+    if result.errors:
+        for detail in result.error_details:
+            write_log(detail)
+        if not (result.created or result.skipped):
+            raise RuntimeError('\n'.join(result.errors))
+    destination = item_output_path(source)
+    if result.created:
+        return ('created_with_warning' if result.errors else 'created'), destination
+    if result.skipped and destination.is_file():
+        return ('skipped_with_warning' if result.errors else 'skipped'), destination
+    raise RuntimeError('Предмет не был создан.')
+
+
+def write_log(message: str, exception: BaseException | None = None) -> None:
+    try:
+        PREFS_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open('a', encoding='utf-8') as fp:
+            fp.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
+            if exception is not None:
+                fp.write(''.join(traceback.format_exception(exception)))
+    except OSError:
+        pass
+
+
+def notify_user(title: str, message: str, *, error: bool = False):
+    """Brief unobtrusive notification; display a persistent dialog on errors."""
+    import tkinter as tk
+    from tkinter import messagebox
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        if error:
+            messagebox.showerror(title, message, parent=root)
         else:
-            from rembg import new_session
-            cutout = remove_background(original, new_session(model), edge_mode)
-        try:
-            cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
-        except OSError:
-            pass
-        assert_source_identity(path, identity)
-        return cutout
+            toast = tk.Toplevel(root)
+            toast.overrideredirect(True)
+            toast.attributes('-topmost', True)
+            panel = tk.Frame(toast, bg='#242932', padx=17, pady=13,
+                             highlightbackground='#6689c7', highlightthickness=1)
+            panel.pack(fill='both', expand=True)
+            tk.Label(panel, text=title, fg='white', bg='#242932',
+                     font=('Segoe UI Semibold', 11)).pack(anchor='w')
+            tk.Label(panel, text=message, fg='#e3e7ed', bg='#242932',
+                     font=('Segoe UI', 10), wraplength=350, justify='left').pack(anchor='w', pady=(4, 0))
+            toast.update_idletasks()
+            w, h = toast.winfo_reqwidth(), toast.winfo_reqheight()
+            x = max(0, toast.winfo_screenwidth() - w - 24)
+            y = max(0, toast.winfo_screenheight() - h - 78)
+            toast.geometry(f'{w}x{h}+{x}+{y}')
+            toast.after(3200, root.destroy)
+            root.mainloop()
+        if error:
+            root.destroy()
+    except Exception:
+        # Logging is the fallback if GUI notification cannot be displayed.
+        pass
+
+
+def run_auto(filename: str | Path, *, item: bool = False) -> int:
+    from runtime_streams import initialize_missing_streams
+    initialize_missing_streams()
+    try:
+        status, destination = (automatic_item(filename) if item else automatic_token(filename))
+        if status.endswith('_with_warning'):
+            write_log(f'Результат доступен, но преобразование оригинала не удалось: {destination}')
+            notify_user('TokenForge: предупреждение',
+                        f'Результат: {destination.name}. Не удалось преобразовать оригинал. Подробности: {LOG_FILE}')
+        elif status == 'created':
+            write_log(f'Создан: {destination}')
+            notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')
+        else:
+            write_log(f'Пропущен (уже существует): {destination}')
+            notify_user('TokenForge', f'Файл уже существует: {destination.name}')
+        return 0
+    except Exception as exc:
+        write_log(f'ОШИБКА для {filename}: {exc}', exc)
+        notify_user('Ошибка TokenForge', f'{exc}\n\nПодробности: {LOG_FILE}', error=True)
+        return 1    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
 
     result = export_items([source], get_cutout, {source: adj},
                           skip_exists=bool(settings.get('skip_exists', True)),

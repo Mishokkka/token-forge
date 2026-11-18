@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, save_original_webp, save_generated, ensure_no_source_collision
+from token_engine import BatchResult, export_images
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -69,6 +69,7 @@ def _major_axis_angle(image: Image.Image) -> float:
     mask.thumbnail((180, 180), Image.Resampling.BILINEAR)
     width, height = mask.size
     data = mask.tobytes()
+    cutoff = 55 if max(data, default=0) >= 55 else 1
     total = sx = sy = sxx = syy = sxy = 0.0
     for row in range(height):
         offset = row * width
@@ -76,7 +77,7 @@ def _major_axis_angle(image: Image.Image) -> float:
         for col in range(width):
             a = data[offset + col]
             # Ignore transparent feathering that would tilt the main axis.
-            if a < 55:
+            if a < cutoff:
                 continue
             weight = a / 255.0
             x = float(col)
@@ -171,7 +172,9 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     canvas.alpha_composite(placed, dest=(px, py))
     if stroke_px:
         alpha = canvas.getchannel('A')
-        contour = alpha.point(lambda a: 255 if a >= 128 else 0)
+        peak = alpha.getextrema()[1]
+        cutoff = 128 if peak >= 128 else max(1, (peak + 1) // 2)
+        contour = alpha.point(lambda a: 255 if a >= cutoff else 0)
         dilated = contour.filter(ImageFilter.MaxFilter(2 * stroke_px + 1))
         border_alpha = ImageChops.subtract(dilated, alpha)
         border = Image.new('RGBA', canvas.size, (0, 0, 0, 0))
@@ -184,34 +187,8 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
                  on_progress=None, approved_outputs=None) -> BatchResult:
-    result = BatchResult(errors=[], total=len(files))
-    for index, source in enumerate(files):
-        if cancel_event is not None and cancel_event.is_set():
-            result.cancelled = True
-            break
-        if on_progress:
-            on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
-        if convert_original:
-            try:
-                result.converted += int(save_original_webp(source))
-            except Exception as exc:
-                result.record_error(source, 'преобразование оригинала', exc)
-        destination = item_output_path(source)
-        try:
-            ensure_no_source_collision(destination, source, 'item')
-            if skip_exists and destination.exists():
-                result.skipped += 1
-            else:
-                cutout = get_cutout(source)
-                image = compose_item(cutout, adjustments[source])
-                # Lossless for crisp 3px outlines and correct alpha.
-                if save_generated(image, destination, source, 'item', skip_exists=skip_exists,
-                                  approved_identity=(approved_outputs or {}).get(destination)):
-                    result.created += 1
-                else:
-                    result.skipped += 1
-        except Exception as exc:
-            result.record_error(source, 'генерация предмета', exc)
-        if on_progress:
-            on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
-    return result
+    return export_images(files, get_cutout, item_output_path,
+                         lambda image, source: compose_item(image, adjustments[source]),
+                         kind='item', skip_exists=skip_exists, convert_original=convert_original,
+                         cancel_event=cancel_event, on_progress=on_progress,
+                         approved_outputs=approved_outputs)

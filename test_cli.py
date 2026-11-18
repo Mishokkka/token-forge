@@ -29,6 +29,7 @@ class CliTests(unittest.TestCase):
         self.patchers = [
             patch.object(token_cli, 'PREFS_DIR', self.pref),
             patch.object(token_cli, 'PREFS_FILE', self.pref / 'settings.json'),
+            patch.object(token_cli, 'LOG_FILE', self.pref / 'context_actions.log'),
             patch.object(token_cli, 'BASE', self.base),
             patch.dict(sys.modules, {'rembg': SimpleNamespace(
                 new_session=lambda *a, **k: self.fail('AI session invoked in offline test'))}),
@@ -132,7 +133,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(token_cli.resolve_context_source(cat), cat)
         copy = cat.with_suffix('.webp')
         Image.new('RGB', (10, 10)).save(copy)
-        self.assertEqual(token_cli.resolve_context_source(copy), cat)
+        self.assertEqual(token_cli.resolve_context_source(copy), copy)
 
     def test_token_does_not_claim_another_sources_webp_copy(self):
         ca = self.art_folder / 'Ca.png'
@@ -143,9 +144,33 @@ class CliTests(unittest.TestCase):
             token_cli.automatic_token(ca)
         self.assertFalse(cat.with_suffix('.webp').exists())
 
+    def test_independent_names_and_orphaned_marked_outputs(self):
+        from token_engine import list_source_images
+        ca = self.art_folder / 'Ca.png'
+        cat = self.art_folder / 'Cat.png'
+        item = self.art_folder / 'Ca_item.webp'
+        for p in (ca, cat, item):
+            Image.new('RGBA', (10, 10), 'red').save(p)
+        for p in (ca, cat, item):
+            self.assertIn(p, list_source_images(self.art_folder))
+            self.assertEqual(token_cli.resolve_context_source(p), p)
+        _, token = token_cli.automatic_token(self.photo)
+        self.photo.unlink()
+        self.assertNotIn(token, list_source_images(self.art_folder))
+        with self.assertRaises(ValueError):
+            token_cli.resolve_context_source(token)
+
+    def test_missing_frame_does_not_block_skip_and_invalid_overrides(self):
+        token_cli.automatic_token(self.photo)
+        self.settings['ring'] = str(self.base / 'missing.png')
+        self.settings['overrides'] = None
+        self.settings['item_overrides'] = None
+        self.save_settings()
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped')
+        self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
+
     def test_conversion_warning_preserves_success(self):
-        with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')), \
-             patch('item_engine.save_original_webp', side_effect=OSError('conversion failed')):
+        with patch('token_engine.save_original_webp', side_effect=OSError('conversion failed')):
             for action in (token_cli.automatic_token, token_cli.automatic_item):
                 state, dest = action(self.photo)
                 self.assertEqual(state, 'created_with_warning')

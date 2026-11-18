@@ -105,6 +105,15 @@ class ItemTests(unittest.TestCase):
             result = export_items(*args, skip_exists=False, convert_original=False)
             self.assertEqual(result.created, 1)
 
+    def test_translucent_item_diagonal_and_outline(self):
+        item = Image.new('RGBA', (60, 300))
+        ImageDraw.Draw(item).rectangle((25, 10, 34, 289), fill=(220, 50, 20, 50))
+        for mode, angle in ((ITEM_MODES[1], 45), (ITEM_MODES[2], -45)):
+            image = compose_item(item, ItemAdjust(layout=mode), stroke_px=0)
+            self.assertLess(abs(_major_axis_angle(image) - angle), 7)
+        outlined = compose_item(item, ItemAdjust())
+        self.assertGreater(outlined.getchannel('A').getextrema()[1], 128)
+
     def test_invalid_layout_and_blank_alpha(self):
         with self.assertRaises(ValueError):
             compose_item(self.sword,ItemAdjust(layout='not-valid'))

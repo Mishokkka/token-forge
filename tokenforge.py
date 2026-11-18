@@ -507,7 +507,7 @@ class TokenForge:
         try:
             key = self._cache_key(path, model, keep, edge)
             has_cached_cutout = (key in self.cache or
-                                 self.disk_cache.path_for(path, model, keep, edge, identity=key[:3]).is_file())
+                                 self.disk_cache.path_for(path, model, keep, edge, identity=key[:4]).is_file())
         except OSError:
             self.status.set(f'Исходный файл недоступен: {path.name}')
             return
@@ -580,7 +580,7 @@ class TokenForge:
 
     def _get_cutout(self, path, model, keep_alpha, edge_mode):
         key = self._cache_key(path, model, keep_alpha, edge_mode)
-        identity = key[:3]
+        identity = key[:4]
         if key in self.cache:
             assert_source_identity(path, identity)
             return self.cache[key], key
@@ -596,10 +596,10 @@ class TokenForge:
                     from rembg import new_session
                     self.sessions[model] = new_session(model)
                 cutout = remove_background(original, self.sessions[model], edge_mode)
-                try:
-                    self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
-                except OSError:
-                    pass  # Unwritable cache must not prevent creating tokens.
+            try:
+                self.disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
+            except OSError:
+                pass  # Unwritable cache must not prevent creating tokens.
         assert_source_identity(path, identity)
         self.cache[key] = cutout
         if len(self.cache) > 6:

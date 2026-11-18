@@ -36,6 +36,20 @@ class CacheTests(unittest.TestCase):
         Image.new('RGB', (171, 220), (60, 50, 40)).save(self.source)
         self.assertNotEqual(baseline, self.cache.path_for(self.source, 'm', False, 'e'))
 
+    def test_same_size_same_mtime_replacement_invalidates_content_cache(self):
+        import os
+        from token_engine import source_identity
+        bmp = self.directory / 'source.bmp'
+        Image.new('RGB', (40, 20), 'red').save(bmp)
+        info = bmp.stat()
+        identity = source_identity(bmp)
+        self.cache.save(bmp, 'm', False, 'e', Image.new('RGBA', (40, 20), 'red'))
+        Image.new('RGB', (40, 20), 'blue').save(bmp)
+        os.utime(bmp, ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.assertEqual(bmp.stat().st_size, info.st_size)
+        self.assertNotEqual(source_identity(bmp), identity)
+        self.assertIsNone(self.cache.load(bmp, 'm', False, 'e'))
+
     def test_corrupt_cache_is_discarded(self):
         path = self.cache.path_for(self.source, 'm', False, 'e')
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,7 +195,9 @@ class CacheTests(unittest.TestCase):
 
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)
-        Image.new('RGBA', (256, 256), (31, 41, 51, 255)).save(existing, 'WEBP', lossless=True)
+        from token_engine import save_generated
+        save_generated(Image.new('RGBA', (256, 256), (31, 41, 51, 255)),
+                       existing, self.source, 'token', skip_exists=False)
         app = self.make_mock_app()
         app.ext = SimpleNamespace(get=lambda: 'webp')
         app.work_mode = SimpleNamespace(get=lambda: 'token')

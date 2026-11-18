@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import median
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
-CUTOUT_CACHE_VERSION = 1
+CUTOUT_CACHE_VERSION = 2
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 
@@ -26,8 +26,15 @@ class Adjust:
 
 def source_identity(source: Path) -> tuple:
     resolved = Path(source).resolve()
-    info = resolved.stat()
-    return str(resolved), info.st_size, info.st_mtime_ns
+    def signature(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    with resolved.open('rb') as stream:
+        before = os.fstat(stream.fileno())
+        digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+        after = os.fstat(stream.fileno())
+    if signature(before) != signature(after) or signature(after) != signature(resolved.stat()):
+        raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+    return str(resolved), after.st_size, after.st_mtime_ns, digest
 
 
 def assert_source_identity(source: Path, identity: tuple) -> None:
@@ -43,7 +50,8 @@ class DiskCutoutCache:
 
     def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
                  *, identity: tuple | None = None) -> Path:
-        key = [CUTOUT_CACHE_VERSION, *(identity or source_identity(source)),
+        version = identity or source_identity(source)
+        key = [CUTOUT_CACHE_VERSION, version[0], version[-1],
                model, bool(keep_alpha), edge_mode]
         digest = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode('utf-8')).hexdigest()
         return self.directory / f'{digest}.png'
@@ -134,6 +142,24 @@ def _ring_thickness(barrier: Image.Image) -> int:
     return max(1, int(round(median(samples))))
 
 
+def square_dilate(mask: Image.Image, radius: int) -> Image.Image:
+    """Exact square maximum filter using separable, logarithmic shifts."""
+    result = mask
+    for axis in (0, 1):
+        covered = 0
+        while covered < radius:
+            step = min(2 * covered + 1, radius - covered)
+            combined = result
+            for sign in (-1, 1):
+                shifted = Image.new('L', result.size)
+                offset = (sign * step, 0) if axis == 0 else (0, sign * step)
+                shifted.paste(result, offset)
+                combined = ImageChops.lighter(combined, shifted)
+            result = combined
+            covered += step
+    return result
+
+
 def frame_interior(frame: Image.Image) -> Image.Image:
     """Build the character clip mask for the frame.
 
@@ -172,8 +198,7 @@ def frame_interior(frame: Image.Image) -> Image.Image:
 
     thickness = _ring_thickness(alpha)
     under_ring = max(1, int(round(thickness * 0.5)))
-    size = under_ring * 2 + 1
-    clip_mask = inside.filter(ImageFilter.MaxFilter(size))
+    clip_mask = square_dilate(inside, under_ring)
     clip_mask = ImageChops.multiply(clip_mask, outer_shape)
     return clip_mask.filter(ImageFilter.GaussianBlur(.6))
 
@@ -243,7 +268,59 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
     return token
 
 
-def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=None) -> bool:
+def _publish_new(temporary: Path, path: Path) -> bool:
+    try:
+        if os.name == 'nt':
+            os.rename(temporary, path)
+        else:
+            os.link(temporary, path)
+    except FileExistsError:
+        return False
+    return True
+
+
+def _replace_preserving_displaced(temporary: Path, destination: Path, expected: tuple) -> None:
+    """Never silently discard an externally replaced file.
+
+    ReplaceFileW publishes atomically and saves the actual displaced file.
+    On POSIX use a recovery move followed by no-clobber publication.
+    """
+    import uuid
+    recovery = destination.parent / '.tokenforge-recovery'
+    recovery.mkdir(exist_ok=True)
+    backup = recovery / f'{uuid.uuid4().hex}-{destination.name}'
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        replace = ctypes.WinDLL('kernel32', use_last_error=True).ReplaceFileW
+        replace.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                            wintypes.DWORD, wintypes.LPVOID, wintypes.LPVOID]
+        replace.restype = wintypes.BOOL
+        if not replace(str(destination), str(temporary), str(backup), 0, None, None):
+            raise OSError(f'Не удалось заменить {destination.name}; '
+                          f'проверь также папку восстановления {recovery}: '
+                          f'{ctypes.WinError(ctypes.get_last_error())}')
+    else:
+        os.rename(destination, backup)
+        try:
+            if not _publish_new(temporary, destination):
+                raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
+        except BaseException:
+            # Restore only into a vacant name; never clobber another writer.
+            if _publish_new(backup, destination):
+                backup.unlink(missing_ok=True)
+            raise
+    # Compare the bytes of the actually displaced file, not the path checked
+    # before publication. Retain any unexpected version for recovery.
+    if source_identity(backup)[-1] != expected[-1]:
+        raise FileExistsError(f'Результат записан, но другой редактор изменил файл. '
+                              f'Вытесненная версия сохранена: {backup}')
+    backup.unlink()
+    # The recovery directory is intentionally kept; another writer may use it.
+
+
+def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=None,
+                 expected_destination=None) -> bool:
     """Publish only a complete, closed file, optionally without replacement."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -254,16 +331,12 @@ def atomic_write(path: Path, writer, *, replace: bool = True, before_publish=Non
             writer(fp)
         if before_publish is not None:
             before_publish()
-        if replace:
+        if expected_destination is not None:
+            _replace_preserving_displaced(temporary, path, expected_destination)
+        elif replace:
             os.replace(temporary, path)
         else:
-            try:
-                if os.name == 'nt':
-                    os.rename(temporary, path)  # Windows rename refuses an existing target.
-                else:
-                    os.link(temporary, path)  # Atomic no-clobber on POSIX.
-            except FileExistsError:
-                return False
+            return _publish_new(temporary, path)
         return True
     finally:
         if temporary is not None:
@@ -279,51 +352,65 @@ def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
 
 
 def export_owner(source: Path, kind: str) -> str:
-    # ASCII JSON works in the EXIF ImageDescription field of PNG and WebP.
-    return 'TokenForge/1:' + json.dumps([kind, source.stem.casefold()], ensure_ascii=True)
+    return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
 
 
-def read_export_owner(destination: Path) -> str | None:
+def read_export_owner(destination: Path) -> tuple | None:
+    """Read a validated marker; arbitrary filename suffixes are never proof."""
     try:
         with Image.open(destination) as stored:
             owner = stored.getexif().get(270)
-            if isinstance(owner, str) and owner.startswith('TokenForge/1:'):
-                return owner
-    except (OSError, ValueError, SyntaxError):
+        if not isinstance(owner, str):
+            return None
+        prefix, payload = owner.split(':', 1)
+        version = {'TokenForge/1': 1, 'TokenForge/2': 2}.get(prefix)
+        values = json.loads(payload)
+        if (version and isinstance(values, list) and len(values) == 2
+                and values[0] in ('token', 'item', 'copy')
+                and isinstance(values[1], str) and values[1]
+                and '/' not in values[1] and '\\' not in values[1]
+                and values[1] not in ('.', '..')):
+            return version, values[0], values[1]
+    except (OSError, ValueError, SyntaxError, TypeError):
         pass
     return None
 
 
 def is_owned_export(destination: Path, source: Path, kind: str) -> bool:
-    return read_export_owner(destination) == export_owner(source, kind)
+    owner = read_export_owner(destination)
+    if not owner or owner[1] != kind:
+        return False
+    return owner[2].casefold() == (source.name if owner[0] == 2 else source.stem).casefold()
 
 
 def ensure_no_source_collision(destination: Path, source: Path, kind: str) -> None:
-    # Do not reserve the WebP-copy name of a different original, e.g.
-    # Ca.png would otherwise generate Cat.webp beside an actual Cat.jpg.
-    if destination.suffix.lower() != '.webp':
-        return
-    for candidate in destination.parent.iterdir():
-        if (candidate.suffix.lower() not in IMAGE_EXTS
-                or candidate.suffix.lower() == '.webp'
-                or candidate.stem.casefold() != destination.stem.casefold()
-                or not candidate.is_file()):
+    # Two independent originals with the same stem have identical output names.
+    # A different original may also need destination as its own WebP copy.
+    for candidate in list_source_images(source.parent):
+        if candidate == source:
             continue
-        if is_owned_export(candidate, source, kind):
+        if candidate.resolve() == destination.resolve():
+            # An unmarked exact-path conflict is handled by save_generated,
+            # including the user's explicit approval of a legacy export.
             continue
-        raise FileExistsError(f'Имя {destination.name} конфликтует с исходником {candidate.name}. '
-                              'Переименуй один из исходников.')
+        if (candidate.stem.casefold() == source.stem.casefold()
+                or (destination.suffix.lower() == '.webp'
+                    and candidate.stem.casefold() == destination.stem.casefold())):
+            raise FileExistsError(f'Имя {destination.name} конфликтует с исходником {candidate.name}. '
+                                  'Переименуй один из исходников.')
 
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
-                   *, skip_exists: bool, approved_identity: tuple | None = None) -> bool:
+                   *, skip_exists: bool, approved_identity: tuple | None = None,
+                   input_identity: tuple | None = None) -> bool:
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
     if prior is not None:
-        if skip_exists:
+        owned = is_owned_export(destination, source, kind)
+        if skip_exists and owned:
             return False
-        if not is_owned_export(destination, source, kind) and prior != approved_identity:
+        if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
     exif = Image.Exif()
@@ -333,11 +420,13 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     def encode(fp):
         image.save(fp, fmt, exif=exif, **options)
     def guard():
+        if input_identity is not None:
+            assert_source_identity(source, input_identity)
         if prior is not None:
             assert_source_identity(destination, prior)
-    published = atomic_write(destination, encode, replace=prior is not None,
-                             before_publish=guard)
-    if not published and not skip_exists:
+    published = atomic_write(destination, encode, replace=False,
+                             before_publish=guard, expected_destination=prior)
+    if not published and (not skip_exists or not is_owned_export(destination, source, kind)):
         raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
     return published
 
@@ -368,9 +457,10 @@ def save_original_webp(source: Path) -> bool:
         return False
     destination = original_webp_path(source)
     if destination.exists():
-        if read_export_owner(destination) is not None:
-            raise FileExistsError(f'Имя WebP-копии {destination.name} занято результатом TokenForge.')
+        if not is_owned_export(destination, source, 'copy'):
+            raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
         return False
+    identity = source_identity(source)
     with Image.open(source) as raw:
         artwork = ImageOps.exif_transpose(raw)
         # Preserve true transparency without accidentally adding an opaque alpha.
@@ -378,44 +468,23 @@ def save_original_webp(source: Path) -> bool:
             artwork = artwork.convert('RGBA')
         else:
             artwork = artwork.convert('RGB')
-        return atomic_write(destination,
-                            lambda fp: artwork.save(fp, format='WEBP', quality=95,
-                                                    method=6, alpha_quality=100),
-                            replace=False)
+        exif = Image.Exif()
+        exif[270] = export_owner(source, 'copy')
+        created = atomic_write(destination,
+                               lambda fp: artwork.save(fp, format='WEBP', quality=95,
+                                                       method=6, alpha_quality=100, exif=exif),
+                               replace=False, before_publish=lambda: assert_source_identity(source, identity))
+        if not created and not is_owned_export(destination, source, 'copy'):
+            raise FileExistsError(f'Имя WebP-копии {destination.name} занято другим изображением.')
+        return created
 
 
 def list_source_images(folder: Path, exclude: Path | None = None) -> list[Path]:
-    """Scan one directory and avoid ingesting generated tokens/WebP copies.
-
-    If both 'Mage.png' and 'Mage.webp' are present, the non-WebP file wins.
-    For multiple input formats sharing a stem, choose one deterministically.
-    Existing 'Maget.webp' is treated as a generated token when 'Mage' exists.
-    """
-    paths = list_images(folder)
-    # Generated item WebP files should not be mistaken for a new source.
-    # Only exclude when there is a base source with the same stem.
-    stem_set = {p.stem.casefold() for p in paths}
-    paths = [p for p in paths if not (
-        p.suffix.lower() == '.webp' and p.stem.casefold().endswith('_item')
-        and p.stem[:-5].casefold() in stem_set)]
-    if exclude is not None:
-        excluded = exclude.resolve()
-        paths = [p for p in paths if p.resolve() != excluded]
-    stems = {p.stem.casefold() for p in paths}
-    inputs = [p for p in paths
-              if not (p.suffix.lower() in ('.png', '.webp')
-                      and p.stem.casefold().endswith('t')
-                      and p.stem[:-1].casefold() in stems)]
-    # Multiple copies of the same source artwork should not produce identical
-    # output paths or be counted as separate batch jobs.
-    priority = {'.png': 0, '.tif': 1, '.tiff': 2, '.jpg': 3,
-                '.jpeg': 4, '.bmp': 5, '.webp': 6}
-    chosen = {}
-    for p in sorted(inputs, key=lambda p: (p.stem.casefold(),
-                                            priority.get(p.suffix.lower(), 99),
-                                            p.name.casefold())):
-        chosen.setdefault(p.stem.casefold(), p)
-    return sorted(chosen.values(), key=lambda p: p.name.casefold())
+    """Only validated provenance excludes generated art, even if orphaned."""
+    excluded = exclude.resolve() if exclude is not None else None
+    return [path for path in list_images(folder)
+            if (excluded is None or path.resolve() != excluded)
+            and read_export_owner(path) is None]
 
 
 @dataclass
@@ -427,6 +496,7 @@ class BatchResult:
     cancelled: bool = False
     total: int = 0
     error_details: list[str] = field(default_factory=list)
+    outputs: list[Path] = field(default_factory=list)
 
     def record_error(self, source: Path, stage: str, exc: Exception) -> None:
         message = f'{source.name}: {stage}: {exc}'
@@ -434,40 +504,65 @@ class BatchResult:
         self.error_details.append(message + '\n' + traceback.format_exc())
 
 
-def export_batch(files: list[Path], get_cutout, frame: Image.Image,
-                 interior: Image.Image, adjustments: dict[Path, Adjust],
-                 out_size: int = 256, format_name: str = 'webp',
-                 skip_exists: bool = True, convert_original: bool = True,
-                 cancel_event=None, on_progress=None, approved_outputs=None) -> BatchResult:
-    """Export all sources independently; a failed image never aborts the rest."""
+def export_images(files, get_cutout, output_path, renderer, *, kind,
+                  skip_exists=True, convert_original=True, cancel_event=None,
+                  on_progress=None, approved_outputs=None) -> BatchResult:
+    """One export pipeline for both composition modes.
+
+    Capture the source version before invoking the loader and carry it
+    through composition and publication.
+    """
     result = BatchResult(errors=[], total=len(files))
+    stage = 'генерация токена' if kind == 'token' else 'генерация предмета'
     for index, source in enumerate(files):
         if cancel_event is not None and cancel_event.is_set():
             result.cancelled = True
             break
-        if on_progress is not None:
+        if on_progress:
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
         if convert_original:
             try:
                 result.converted += int(save_original_webp(source))
             except Exception as exc:
-                result.record_error(source, 'конвертация оригинала', exc)
-        destination = token_output_path(source, format_name)
+                result.record_error(source, 'преобразование оригинала', exc)
+        destination = output_path(source)
         try:
-            ensure_no_source_collision(destination, source, 'token')
+            ensure_no_source_collision(destination, source, kind)
             if skip_exists and destination.exists():
+                if not is_owned_export(destination, source, kind):
+                    raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')
                 result.skipped += 1
             else:
+                identity = source_identity(source)
                 cutout = get_cutout(source)
-                final_image = compose(cutout, frame, interior, out_size,
-                                      adjustments[source])
-                if save_generated(final_image, destination, source, 'token', skip_exists=skip_exists,
-                                  approved_identity=(approved_outputs or {}).get(destination)):
+                assert_source_identity(source, identity)
+                image = renderer(cutout, source)
+                if save_generated(image, destination, source, kind, skip_exists=skip_exists,
+                                  approved_identity=(approved_outputs or {}).get(destination),
+                                  input_identity=identity):
                     result.created += 1
+                    result.outputs.append(destination)
                 else:
                     result.skipped += 1
         except Exception as exc:
-            result.record_error(source, 'генерация токена', exc)
-        if on_progress is not None:
+            result.record_error(source, stage, exc)
+        if on_progress:
             on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
     return result
+
+
+def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
+                 interior: Image.Image | None, adjustments: dict[Path, Adjust],
+                 out_size: int = 256, format_name: str = 'webp',
+                 skip_exists: bool = True, convert_original: bool = True,
+                 cancel_event=None, on_progress=None, approved_outputs=None,
+                 frame_loader=None) -> BatchResult:
+    def render(cutout, source):
+        nonlocal frame, interior
+        if frame is None and frame_loader is not None:
+            frame, interior = frame_loader()
+        return compose(cutout, frame, interior, out_size, adjustments[source])
+    return export_images(files, get_cutout, lambda p: token_output_path(p, format_name),
+                         render, kind='token', skip_exists=skip_exists,
+                         convert_original=convert_original, cancel_event=cancel_event,
+                         on_progress=on_progress, approved_outputs=approved_outputs)

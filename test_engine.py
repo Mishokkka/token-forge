@@ -61,6 +61,33 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(dest.read_bytes(), b'old')
             self.assertEqual(list(Path(directory).iterdir()), [dest])
 
+    def test_square_dilation_matches_pillow(self):
+        from token_engine import square_dilate
+        from PIL import ImageFilter
+        import random
+        rng = random.Random(7)
+        mask = Image.frombytes('L', (29, 23), bytes(rng.randrange(256) for _ in range(29*23)))
+        for radius in (1, 2, 3, 5, 12):
+            self.assertEqual(square_dilate(mask, radius).tobytes(),
+                             mask.filter(ImageFilter.MaxFilter(radius*2+1)).tobytes())
+
+    def test_replacement_preserves_file_that_races_publication(self):
+        from token_engine import atomic_write, source_identity
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            dest = Path(directory) / 'output.webp'
+            dest.write_bytes(b'old')
+            prior = source_identity(dest)
+            def race():
+                dest.write_bytes(b'external editor')
+            with self.assertRaisesRegex(FileExistsError, 'сохранена'):
+                atomic_write(dest, lambda fp: fp.write(b'new'),
+                             before_publish=race, expected_destination=prior)
+            self.assertEqual(dest.read_bytes(), b'new')
+            recovered = list((dest.parent / '.tokenforge-recovery').iterdir())
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0].read_bytes(), b'external editor')
+
     def test_render_shape_and_alpha(self):
         token = compose(self.figure, self.frame, self.mask, 256)
         self.assertEqual(token.size, (256, 256))
@@ -113,10 +140,14 @@ class EngineTests(unittest.TestCase):
         import tempfile
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
-            for name in ('Mage.png', 'Mage.webp', 'Maget.webp',
-                         'Witch.webp', 'Witcht.webp', 'Artist.jpg', 'RingT.png'):
+            from token_engine import save_generated
+            for name in ('Mage.png', 'Witch.webp', 'Artist.jpg', 'RingT.png'):
                 image = self.figure.convert('RGB') if name.endswith('.jpg') else self.figure
                 image.save(folder / name)
+            save_original_webp(folder / 'Mage.png')
+            for stem, suffix in (('Mage', '.png'), ('Witch', '.webp')):
+                save_generated(self.figure, folder / (stem + 't.webp'),
+                               folder / (stem + suffix), 'token', skip_exists=False)
             found = list_source_images(folder, exclude=folder / 'RingT.png')
             self.assertEqual([p.name for p in found], ['Artist.jpg', 'Mage.png', 'Witch.webp'])
             self.assertEqual(token_output_path(found[1]), folder / 'Maget.webp')
