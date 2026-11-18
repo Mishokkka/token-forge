@@ -10,6 +10,8 @@ import tempfile
 import traceback
 from pathlib import Path
 from statistics import median
+import math
+from local_models import call_rembg
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
 CUTOUT_CACHE_VERSION = 2
@@ -132,7 +134,6 @@ def already_transparent(img: Image.Image) -> bool:
 
 
 def remove_background(img: Image.Image, session, edge_mode: str = 'Очистка краёв') -> Image.Image:
-    from rembg import remove
     # Never hard-threshold the soft mask; fine hair depends on partial alpha.
     kwargs = {'session': session}
     if edge_mode == 'Очистка краёв':
@@ -141,7 +142,7 @@ def remove_background(img: Image.Image, session, edge_mode: str = 'Очистк�
         kwargs['alpha_matting'] = True
     elif edge_mode != 'Обычный':
         raise ValueError(f'Неизвестный режим краёв: {edge_mode}')
-    result = remove(img.convert('RGB'), **kwargs)
+    result = call_rembg('remove', img.convert('RGB'), **kwargs)
     return result.convert('RGBA')
 
 
@@ -283,24 +284,36 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
     center_x, head_width, top_y = silhouette_geometry(cutout)
     # Typical tabletop portrait has hair/head ~40% of token width.
     base_scale = .40 * out_size / max(head_width, 1)
-    scale = max(0.005, base_scale * adjust.zoom / 100)
-    ox = out_size * .5 - center_x * scale + adjust.x / 100 * out_size
-    oy = out_size * adjust.gap / 100 - top_y * scale + adjust.y / 100 * out_size
+    zoom, x, y, gap = map(float, (adjust.zoom, adjust.x, adjust.y, adjust.gap))
+    if not math.isfinite(zoom) or zoom <= 0:
+        raise ValueError('Масштаб токена должен быть положительным и конечным.')
+    if not all(math.isfinite(v) for v in (x, y, gap)):
+        raise ValueError('Положение токена должно быть конечным.')
+    scale = base_scale * (zoom / 100)
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError('Масштаб токена вне допустимого диапазона.')
+    ox = out_size * .5 - center_x * scale + x / 100 * out_size
+    oy = out_size * gap / 100 - top_y * scale + y / 100 * out_size
 
     # Crop at source resolution first so huge source images never create a
     # massive intermediate image when the automatic zoom is high.
-    import math
-    left = math.floor(-ox / scale) - 2
-    upper = math.floor(-oy / scale) - 2
-    right = math.ceil((out_size - ox) / scale) + 2
-    lower = math.ceil((out_size - oy) / scale) + 2
-    left, upper = max(0, left), max(0, upper)
-    right, lower = min(cutout.width, right), min(cutout.height, lower)
+    if not all(math.isfinite(v) for v in (ox, oy)):
+        raise ValueError('Положение токена вне допустимого диапазона.')
+    def bound(value, length, *, start):
+        value = max(0.0, min(float(length), value))
+        return (max(0, math.floor(value) - 2) if start
+                else min(length, math.ceil(value) + 2))
+    left = bound(-ox / scale, cutout.width, start=True)
+    upper = bound(-oy / scale, cutout.height, start=True)
+    right = bound((out_size - ox) / scale, cutout.width, start=False)
+    lower = bound((out_size - oy) / scale, cutout.height, start=False)
     image_layer = Image.new('RGBA', (out_size, out_size), (0, 0, 0, 0))
     if right > left and lower > upper:
         cropped = cutout.crop((left, upper, right, lower))
         target_size = (max(1, int(round((right - left) * scale))),
                        max(1, int(round((lower - upper) * scale))))
+        if max(target_size) > max(4096, out_size * 8):
+            raise ValueError('Масштаб токена слишком велик для безопасной компоновки.')
         scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
         image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
     inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
@@ -490,7 +503,7 @@ def _probe_owner(stream, *, require_pixels=False):
                 try:
                     stored.load()
                 except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
-                    raise InvalidExportError('Готовое изображение повреждено. Отключи пропуск и создай его заново.') from exc
+                    raise InvalidExportError('Готовое изображение повреждено.') from exc
             return owner
     except InvalidExportError:
         raise
@@ -644,7 +657,13 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
 
 def validate_skip(destination, source, kind, *, identity=None):
     identity = identity if identity is not None else source_identity(destination)
-    if not is_owned_export(destination, source, kind, identity=identity, require_pixels=True):
+    try:
+        owned = is_owned_export(destination, source, kind, identity=identity, require_pixels=True)
+    except InvalidExportError as exc:
+        hint = ('Перемести или удали повреждённую WebP-копию и повтори обработку.'
+                if kind == 'copy' else 'Отключи пропуск готовых изображений и повтори обработку.')
+        raise InvalidExportError(f'{destination.name}: {exc} {hint}') from exc
+    if not owned:
         raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.')
     assert_source_identity(destination, identity)
 
@@ -748,19 +767,23 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         return created
 
 
+def excluded_file(path: Path, excluded: Path | None) -> bool:
+    if excluded is None:
+        return False
+    try:
+        return path.samefile(excluded)
+    except OSError:
+        return False
+
+
 def list_source_images(folder: Path, exclude: Path | None = None, *, cancel_event=None) -> list[Path]:
-    """Only validated provenance excludes generated art, even if orphaned."""
-    excluded = exclude.resolve() if exclude is not None else None
+    """Exclude the selected frame (including aliases) and validated results."""
     result = []
     for path in list_images(folder):
         if cancel_event is not None and cancel_event.is_set():
             break
-        if excluded is not None and path.name.casefold() == excluded.name.casefold():
-            try:
-                if path.samefile(excluded):
-                    continue
-            except OSError:
-                pass
+        if excluded_file(path, exclude):
+            continue
         if read_export_owner(path) is None:
             result.append(path)
     return result

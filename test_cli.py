@@ -71,6 +71,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(state2, 'skipped')
         self.assertEqual(token2, token)
 
+    def test_backend_system_exit_is_logged_and_returns_failure(self):
+        from local_models import new_local_session
+        real_import = __import__('importlib').import_module
+        def backend(name, *args, **kwargs):
+            if name == 'rembg':
+                raise SystemExit(1)
+            return real_import(name, *args, **kwargs)
+        with patch('importlib.import_module', side_effect=backend):
+            with self.assertRaisesRegex(RuntimeError, 'rembg/onnxruntime') as caught:
+                new_local_session('birefnet-general')
+            self.assertIsInstance(caught.exception.__cause__, SystemExit)
+            self.settings['keep_alpha'] = False
+            self.settings['convert_original'] = False
+            self.save_settings()
+            with patch.object(token_cli, 'notify_user') as notify:
+                self.assertEqual(token_cli.run_auto(self.photo), 1)
+                notify.assert_called_once()
+            self.assertIn('rembg/onnxruntime', token_cli.LOG_FILE.read_text(encoding='utf-8'))
+        self.assertFalse((self.photo.parent / (self.photo.stem + 't.webp')).exists())
+
+    def test_configured_frame_cannot_be_used_as_art(self):
+        self.settings['ring'] = str(self.photo)
+        self.save_settings()
+        for action in (token_cli.automatic_token, token_cli.automatic_item):
+            with self.assertRaisesRegex(ValueError, 'рамка'):
+                action(self.photo)
+
     def test_existing_copy_and_token_are_resolved_to_original(self):
         token_cli.automatic_token(self.photo)
         webp = self.photo.with_suffix('.webp')
@@ -400,7 +427,9 @@ class SendToTests(unittest.TestCase):
     def test_legacy_migration_removes_only_named_verbs(self):
         legacy = context_menu.ROOT + r'\TokenForge.Create\command'
         foreign = context_menu.ROOT + r'\OtherApp\command'
-        for path in (legacy, foreign):
+        legacy_ext = context_menu.LEGACY_ROOT + r'\.png\shell\TokenForge.Create\command'
+        neighbor = context_menu.LEGACY_ROOT + r'\.png\shell\OtherApp\command'
+        for path in (legacy, foreign, legacy_ext, neighbor):
             with self.reg.CreateKeyEx(self.reg.HKEY_CURRENT_USER, path, 0, self.reg.KEY_WRITE):
                 pass
         context_menu.install(self.base)
@@ -408,8 +437,13 @@ class SendToTests(unittest.TestCase):
         self.assertNotIn(legacy.rsplit('\\', 1)[0], self.reg.keys)
         self.assertIn(foreign, self.reg.keys)
         self.assertIn(foreign.rsplit('\\', 1)[0], self.reg.keys)
+        self.assertNotIn(legacy_ext, self.reg.keys)
+        self.assertNotIn(legacy_ext.rsplit('\\', 1)[0], self.reg.keys)
+        self.assertIn(neighbor, self.reg.keys)
+        self.assertIn(neighbor.rsplit('\\', 1)[0], self.reg.keys)
         context_menu.remove()
         self.assertIn(foreign, self.reg.keys)
+        self.assertIn(neighbor, self.reg.keys)
 
     def test_removal_preserves_replaced_shortcut(self):
         context_menu.install(self.base)

@@ -14,7 +14,7 @@ from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache,
     export_batch, frame_interior, list_source_images, read_image,
     remove_background, token_output_path, source_identity, read_export_owner,
-    LoadedCutout,
+    LoadedCutout, excluded_file,
 )
 from item_engine import ITEM_MODES, ItemAdjust, item_output_path, export_items
 
@@ -28,7 +28,7 @@ def read_settings() -> dict:
     return read_settings_file(PREFS_FILE, strict=True)
 
 
-def resolve_context_source(filename: str | Path) -> Path:
+def resolve_context_source(filename: str | Path, *, frame_path: Path | None = None) -> Path:
     """Resolve a selected Explorer file to its source if it is a generated copy.
 
     A generated .webp copy must map to the original PNG/JPEG where available,
@@ -39,6 +39,11 @@ def resolve_context_source(filename: str | Path) -> Path:
         raise FileNotFoundError(f'Файл не найден: {path}')
     if path.suffix.lower() not in IMAGE_EXTS:
         raise ValueError(f'Неподдерживаемый формат: {path.suffix}')
+    # Use configured frame for every entry point, not just GUI discovery.
+    if frame_path is None:
+        frame_path = Path(read_settings().get('ring') or BASE / 'RingT.png')
+    if excluded_file(path, frame_path):
+        raise ValueError('Выбранный файл используется как рамка, а не исходный арт.')
     owner = read_export_owner(path)
     if owner is None:
         return path
@@ -46,11 +51,11 @@ def resolve_context_source(filename: str | Path) -> Path:
         candidate = path.with_name(owner[2])
         if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
                 and candidate.resolve() != path and read_export_owner(candidate) is None
-                and candidate.resolve() != (BASE / 'RingT.png').resolve()):
+                and not excluded_file(candidate, frame_path)):
             return candidate.resolve()
         matches = []
     else:
-        candidates = list_source_images(path.parent, exclude=BASE / 'RingT.png')
+        candidates = list_source_images(path.parent, exclude=frame_path)
         matches = [p for p in candidates if p.stem.casefold() == owner[2].casefold()]
     if len(matches) != 1:
         raise ValueError(f'Не удалось однозначно найти исходный арт для {path.name}.')
@@ -89,8 +94,8 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
     Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
     loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
     """
-    source = resolve_context_source(filename)
     settings = read_settings()
+    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
     frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
     def load_frame():
         frame = read_image(frame_path)
@@ -133,8 +138,8 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
 def automatic_item(filename: str | Path) -> tuple[str, Path]:
     """Create 500x500 equipment art using the same reusable cutout cache."""
-    source = resolve_context_source(filename)
     settings = read_settings()
+    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
     keep_alpha = bool(settings.get('keep_alpha', True))
@@ -177,9 +182,9 @@ def write_log(message: str, exception: BaseException | None = None) -> None:
 
 def notify_user(title: str, message: str, *, error: bool = False):
     """Brief unobtrusive notification; display a persistent dialog on errors."""
-    import tkinter as tk
-    from tkinter import messagebox
     try:
+        import tkinter as tk
+        from tkinter import messagebox
         root = tk.Tk()
         root.withdraw()
         if error:

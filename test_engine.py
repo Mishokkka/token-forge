@@ -283,20 +283,34 @@ class EngineTests(unittest.TestCase):
             dest = token_output_path(source)
             self.figure.save(dest)
             before = dest.read_bytes()
+            import os
             original = token_engine.source_identity
+            stat = dest.stat()
+            identity_a = original(dest)
+            calls = []
+            replacement = Image.new('RGBA', (17, 19), 'red')
             def race(path):
-                identity = original(path)
-                if path == dest:
+                if path != dest:
+                    return original(path)
+                calls.append(path)
+                if len(calls) == 1:
                     exif = Image.Exif()
                     exif[270] = token_engine.export_owner(source, 'token')
-                    self.figure.save(dest, exif=exif)
-                return identity
+                    replacement.save(dest, exif=exif)
+                    return identity_a
+                # A non-snapshot implementation sees B, then receives A
+                # again at the final fingerprint guard (ABA).
+                dest.write_bytes(before)
+                os.utime(dest, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                self.assertEqual(original(dest), identity_a)
+                return identity_a
             with patch('token_engine.source_identity', side_effect=race):
                 with self.assertRaises(OSError):
                     save_generated(self.figure, dest, source, 'token', skip_exists=False)
-            # The externally supplied file remains intact, not our export.
+            self.assertEqual(calls, [dest])
             self.assertNotEqual(dest.read_bytes(), before)
             self.assertEqual(token_engine.read_export_owner(dest), (2, 'token', 'Hero.png'))
+            self.assertEqual(read_image(dest).size, replacement.size)
 
     def test_corrupt_owned_png_is_not_counted_as_skip(self):
         from token_engine import save_generated, read_export_owner
@@ -319,6 +333,75 @@ class EngineTests(unittest.TestCase):
             result = export_batch([source], read_image, self.frame, self.mask, {source: Adjust()},
                                   format_name='png', convert_original=False, skip_exists=False)
             self.assertEqual(result.created, 1)
+
+    def test_late_corrupt_export_is_not_a_successful_skip(self):
+        from token_engine import save_generated, export_owner, InvalidExportError
+        import token_engine
+        import struct
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source, 'png')
+            def late_writer(temporary, destination):
+                exif = Image.Exif()
+                exif[270] = export_owner(source, 'token')
+                self.figure.save(destination, exif=exif)
+                data = destination.read_bytes()
+                pos = 8
+                while data[pos+4:pos+8] != b'IDAT':
+                    pos += 12 + struct.unpack('>I', data[pos:pos+4])[0]
+                destination.write_bytes(data[:pos+9])
+                return False
+            with patch.object(token_engine, '_publish_new', side_effect=late_writer):
+                with self.assertRaisesRegex(InvalidExportError, 'Отключи пропуск'):
+                    save_generated(self.figure, dest, source, 'token', skip_exists=True)
+            self.assertTrue(dest.is_file())
+
+    def test_copy_corruption_has_correct_recovery_step(self):
+        from token_engine import InvalidExportError, validate_skip
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = source.with_suffix('.webp')
+            save_original_webp(source)
+            with patch('token_engine.is_owned_export', side_effect=InvalidExportError('Готовое изображение повреждено.')):
+                with self.assertRaisesRegex(InvalidExportError, 'Перемести или удали повреждённую WebP-копию'):
+                    validate_skip(dest, source, 'copy')
+
+    def test_zoom_matches_preview_at_very_small_scale(self):
+        cutout = Image.new('RGBA', (4000, 400), 'red')
+        # Transparent frame and opaque interior isolate the scaling geometry.
+        frame = Image.new('RGBA', (512, 512))
+        interior = Image.new('L', (512, 512), 255)
+        a = compose(cutout, frame, interior, 256, Adjust(zoom=5)).getchannel('A').getbbox()
+        b = compose(cutout, frame, interior, 512, Adjust(zoom=5)).getchannel('A').getbbox()
+        self.assertGreater(b[2] - b[0], a[2] - a[0])
+        self.assertAlmostEqual((b[2]-b[0]) / 2, a[2]-a[0], delta=1)
+        for zoom in (0, -1, float('inf'), float('nan')):
+            with self.assertRaises(ValueError):
+                compose(cutout, frame, interior, 256, Adjust(zoom=zoom))
+
+    def test_ring_exclusion_handles_alias_and_distinct_same_name(self):
+        import os
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            ring = folder / 'Ring.png'
+            alias = folder / 'FrameAlias.png'
+            unrelated_folder = folder / 'other'
+            unrelated_folder.mkdir()
+            self.figure.save(ring)
+            self.figure.save(unrelated_folder / ring.name)
+            # Hardlinks exercise same-file semantics without Windows admin.
+            os.link(ring, alias)
+            self.assertEqual(list_source_images(folder, exclude=alias), [])
+            self.assertEqual(list_source_images(unrelated_folder, exclude=alias),
+                             [unrelated_folder / ring.name])
+            try:
+                symbolic = folder / 'Symbolic.png'
+                symbolic.symlink_to(ring)
+            except OSError:
+                return  # hardlink coverage already ran
+            self.assertEqual(list_source_images(folder, exclude=symbolic), [])
 
     def test_cleanup_failure_keeps_publication_error(self):
         from token_engine import atomic_write

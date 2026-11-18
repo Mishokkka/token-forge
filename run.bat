@@ -1,11 +1,8 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-cd /d "%~dp0"
-if errorlevel 1 goto bad_directory
-if not errorlevel 0 goto bad_directory
 title TokenForge
-if not exist ".venv\Scripts\python.exe" goto need_install
-".venv\Scripts\python.exe" "tokenforge.py" %*
+if not exist "%~dp0.venv\Scripts\python.exe" goto need_install
+"%~dp0.venv\Scripts\python.exe" "%~dp0tokenforge.py" %*
 if errorlevel 1 goto failed
 if not errorlevel 0 goto failed
 exit /b 0
@@ -21,7 +18,3 @@ echo ERROR: TokenForge stopped. See error details above.
 pause
 exit /b 1
 
-:bad_directory
-echo ERROR: Could not enter the program directory.
-pause
-exit /b 1
