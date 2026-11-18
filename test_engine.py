@@ -366,6 +366,47 @@ class EngineTests(unittest.TestCase):
                                skip_exists=False, approved_identity=identity)
             self.assertFalse(dest.exists())
 
+    def test_approval_rechecked_after_encoding_copy(self):
+        import token_engine
+        from token_engine import source_identity
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            dest = token_output_path(source)
+            Image.new('RGBA', (20, 20), 'blue').save(dest)
+            approved = source_identity(dest)
+            replacement = Image.new('RGBA', (21, 21), 'red')
+            original_write = token_engine.atomic_write
+            def intervening_write(path, writer, **kwargs):
+                def encode(fp):
+                    writer(fp)
+                    if path == source.with_suffix('.webp'):
+                        replacement.save(dest)
+                return original_write(path, encode, **kwargs)
+            loader = Mock(side_effect=AssertionError('stale approval must stop rendering'))
+            with patch('token_engine.atomic_write', side_effect=intervening_write):
+                result = export_batch([source], loader, self.frame, self.mask, {source: Adjust()},
+                                      skip_exists=False, approved_outputs={dest: approved})
+            loader.assert_not_called()
+            self.assertEqual((result.created, result.converted), (0, 0))
+            self.assertEqual(len(result.errors), 1)
+            self.assertIn('Подтверди заново', result.errors[0])
+            self.assertFalse(source.with_suffix('.webp').exists())
+            self.assertEqual(read_image(dest).size, replacement.size)
+
+    def test_invalid_output_extension_rejected_before_encoding(self):
+        from token_engine import save_generated
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            with self.assertRaises(ValueError):
+                token_output_path(source, 'jpg')
+            dest = source.with_name('Herot.jpg')
+            with self.assertRaises(ValueError):
+                save_generated(self.figure, dest, source, 'token', skip_exists=False)
+            self.assertFalse(dest.exists())
+
     def test_late_corrupt_export_is_not_a_successful_skip(self):
         from token_engine import save_generated, export_owner, InvalidExportError
         import token_engine

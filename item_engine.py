@@ -140,7 +140,7 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     image = _orient(cutout, adjust)
     # Center: the user requested >=5% whitespace, diagonals use a small
     # visual margin. Three black outline pixels need their own safe space.
-    margin = round(size * (.05 if adjust.layout == 'По центру' else .018))
+    margin = math.ceil(size * .05) if adjust.layout == 'По центру' else round(size * .018)
     inset = margin + stroke_px
     available = size - 2 * inset
     if available < 1:

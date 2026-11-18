@@ -104,6 +104,47 @@ class CliTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'рамка'):
                 action(self.photo)
 
+    def test_generated_result_keeps_logical_source_alias_and_output_folder(self):
+        # Directory junctions work on Windows without developer-mode symlink
+        # privileges and give a real alias to the source's parent directory.
+        import os
+        import subprocess
+        target = self.root / 'Real'
+        target.mkdir()
+        original = target / 'Original.png'
+        original.write_bytes(self.photo.read_bytes())
+        alias = self.art_folder / 'Alias'
+        if sys.platform == 'win32':
+            subprocess.run([os.environ['COMSPEC'], '/d', '/c', 'mklink', '/J',
+                            str(alias), str(target)], check=True, capture_output=True)
+            self.addCleanup(lambda: alias.rmdir() if alias.exists() else None)
+        else:
+            alias.symlink_to(target, target_is_directory=True)
+        source = alias / 'Original.png'
+        self.assertEqual(token_cli.resolve_context_source(source), source)
+        _, output = token_cli.automatic_token(source)
+        self.assertEqual(output.parent, alias)
+        self.assertEqual(token_cli.resolve_context_source(output), source)
+        self.assertEqual(token_cli.automatic_token(output), ('skipped', output))
+
+    def test_file_symlink_source_is_not_redirected_to_target(self):
+        # File symlinks may not be permitted on a Windows runner. Exercise
+        # the logical-name contract even there with an actual alias and a
+        # simulated resolve() result, without requiring elevated rights.
+        alias = self.art_folder / 'Alias.png'
+        alias.write_bytes(self.photo.read_bytes())
+        real_resolve = Path.resolve
+        def resolve(path, *args, **kwargs):
+            return self.photo if path == alias else real_resolve(path, *args, **kwargs)
+        self.settings['convert_original'] = False
+        self.save_settings()
+        with patch.object(Path, 'resolve', resolve):
+            self.assertEqual(token_cli.resolve_context_source(alias), alias)
+            status, output = token_cli.automatic_token(alias)
+            self.assertEqual((status, output.name), ('created', 'Aliast.webp'))
+            self.assertEqual(token_cli.resolve_context_source(output), alias)
+            self.assertEqual(token_cli.automatic_token(output)[0], 'skipped')
+
     def test_existing_copy_and_token_are_resolved_to_original(self):
         token_cli.automatic_token(self.photo)
         webp = self.photo.with_suffix('.webp')
@@ -469,14 +510,27 @@ class SendToTests(unittest.TestCase):
         context_menu.install(self.base)
         paths = list(context_menu.shortcut_paths(self.folder))
         originals = {p: p.read_bytes() for p in paths}
+        replacement_base = self.base / 'New installation'
+        replacement_base.mkdir()
+        # The shortcut fixture uses the exe and script contents only through
+        # their path; build a distinct valid install structure.
+        import shutil
+        for entry in self.base.iterdir():
+            if entry.name in ('.venv', 'tokenforge.py', 'sendto_entry.py'):
+                dest = replacement_base / entry.name
+                if entry.is_dir():
+                    shutil.copytree(entry, dest)
+                else:
+                    shutil.copy2(entry, dest)
         original = context_menu._detach_expected
         def race(target, content, recovery):
             if target == paths[1] and content == originals[target]:
+                self.assertNotEqual(paths[0].read_bytes(), originals[paths[0]])
                 target.write_bytes(b'foreign replacement')
             return original(target, content, recovery)
         with patch.object(context_menu, '_detach_expected', side_effect=race):
             with self.assertRaisesRegex(OSError, 'изменился'):
-                context_menu.install(self.base)
+                context_menu.install(replacement_base)
         self.assertEqual(paths[1].read_bytes(), b'foreign replacement')
         for path in (paths[0], *paths[2:]):
             self.assertEqual(path.read_bytes(), originals[path])

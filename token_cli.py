@@ -34,7 +34,9 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     A generated .webp copy must map to the original PNG/JPEG where available,
     so its saved placement and cached extraction can be reused.
     """
-    path = Path(filename).expanduser().resolve()
+    # Preserve the logical user-selected directory entry. Resolving a
+    # symlink is useful for content identity, not for output naming.
+    path = Path(os.path.abspath(Path(filename).expanduser()))
     if not path.is_file():
         raise FileNotFoundError(f'Файл не найден: {path}')
     if path.suffix.lower() not in IMAGE_EXTS:
@@ -52,9 +54,9 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     if owner[0] == 2:
         candidate = path.with_name(owner[2])
         if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
-                and candidate.resolve() != path and read_export_owner(candidate) is None
+                and not excluded_file(candidate, path) and read_export_owner(candidate) is None
                 and not excluded_file(candidate, frame_path)):
-            return candidate.resolve()
+            return candidate
         matches = []
     else:
         candidates = list_source_images(path.parent, exclude=frame_path)

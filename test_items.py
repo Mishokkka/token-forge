@@ -28,6 +28,11 @@ class ItemTests(unittest.TestCase):
         bbox = rendered.getchannel('A').getbbox()
         self.assertGreaterEqual(min(bbox[0], bbox[1], 500-bbox[2], 500-bbox[3]), 23)
 
+    def test_small_center_canvas_meets_5_percent_margin(self):
+        rendered = compose_item(Image.new('RGBA', (100, 100), 'red'), size=49)
+        bbox = rendered.getchannel('A').getbbox()
+        self.assertGreaterEqual(min(bbox[0], bbox[1], 49-bbox[2], 49-bbox[3]), 3)
+
     def test_diagonal_axis(self):
         ascending = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[1]))
         descending = compose_item(self.sword, ItemAdjust(layout=ITEM_MODES[2]))

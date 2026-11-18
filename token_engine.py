@@ -706,6 +706,8 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
                                   'Переименуй его или подтверди замену вручную.')
     exif = Image.Exif()
     exif[270] = export_owner(source, kind)
+    if destination.suffix.lower() not in ('.png', '.webp'):
+        raise ValueError('Результат TokenForge должен иметь расширение PNG или WebP.')
     fmt = 'PNG' if destination.suffix.lower() == '.png' else 'WEBP'
     options = {'optimize': True} if fmt == 'PNG' else {'lossless': True, 'method': 6}
     def encode(fp):
@@ -743,10 +745,25 @@ def original_webp_path(source: Path) -> Path:
 
 def token_output_path(source: Path, format_name: str = 'webp') -> Path:
     """Output beside source using the user's requested t suffix."""
+    if not isinstance(format_name, str) or format_name.lower() not in ('png', 'webp'):
+        raise ValueError('Неподдерживаемый формат токена.')
     return source.with_name(f'{source.stem}t.{format_name.lower()}')
 
 
-def save_original_webp(source: Path, *, collision_index=None, input_identity=None) -> Publication:
+class StaleApprovalError(OSError):
+    """An explicit overwrite approval no longer matches its destination."""
+
+
+def assert_approval(destination, approved):
+    if approved is not None:
+        try:
+            assert_source_identity(destination, approved)
+        except OSError as exc:
+            raise StaleApprovalError(f'Файл {destination.name} изменился после подтверждения замены. Подтверди заново.') from exc
+
+
+def save_original_webp(source: Path, *, collision_index=None, input_identity=None,
+                       approval_guard=None) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
@@ -754,6 +771,8 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
     """
     identity = input_identity if input_identity is not None else source_identity(source)
     assert_source_identity(source, identity)
+    if approval_guard is not None:
+        approval_guard()
     if source.suffix.lower() == '.webp':
         return Publication(False)
     destination = original_webp_path(source)
@@ -766,6 +785,8 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         if collision_index is not None:
             ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
         assert_source_identity(source, identity)
+        if approval_guard is not None:
+            approval_guard()
     with source_snapshot(source, identity) as snapshot, Image.open(snapshot) as raw:
         artwork = ImageOps.exif_transpose(raw)
         # Preserve true transparency without accidentally adding an opaque alpha.
@@ -861,8 +882,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             else:
                 assert_source_identity(source, identity)
             # A stale approval must not trigger either of this job's writes.
-            if approved is not None:
-                assert_source_identity(destination, approved)
+            assert_approval(destination, approved)
         except Exception as exc:
             result.record_error(source, stage, exc)
             if on_progress:
@@ -870,12 +890,20 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             continue
         if convert_original:
             try:
-                publication = save_original_webp(source, collision_index=folders, input_identity=identity)
+                publication = save_original_webp(
+                    source, collision_index=folders, input_identity=identity,
+                    approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
                 result.converted += int(bool(publication))
                 result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
+            except StaleApprovalError as exc:
+                result.record_error(source, 'преобразование оригинала', exc)
+                if on_progress:
+                    on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
+                continue
             except Exception as exc:
                 result.record_error(source, 'преобразование оригинала', exc)
         try:
+            assert_approval(destination, approved)
             assert_source_identity(source, identity)
             ensure_no_source_collision(destination, source, kind, folders)
             if skip_exists and destination.exists():
