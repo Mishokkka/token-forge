@@ -32,9 +32,11 @@ def model_revision(name):
     require_local_model(name)
     xdg = os.environ.get('XDG_DATA_HOME')
     explicit = os.environ.get('U2NET_HOME')
-    legacy = Path(explicit or (Path(xdg or '~') / '.u2net')).expanduser()
-    home = Path(explicit or os.environ.get('REMBG_HOME') or
-                (Path(xdg) / 'rembg' if xdg else '~/.rembg')).expanduser()
+    # Match rembg's getenv semantics, including deliberately empty values.
+    legacy = Path(os.environ.get('U2NET_HOME',
+                                 os.path.join(os.environ.get('XDG_DATA_HOME', '~'), '.u2net'))).expanduser()
+    default_home = os.path.join(xdg, 'rembg') if xdg else '~/.rembg'
+    home = Path(explicit or os.environ.get('REMBG_HOME', default_home)).expanduser()
     candidates = (home / 'models' / name / (name + '.onnx'),
                   legacy / (name + '.onnx'), home / (name + '.onnx'))
     stamps = []

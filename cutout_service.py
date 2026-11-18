@@ -1,5 +1,6 @@
 """Shared extraction/cache policy for GUI and Explorer/CLI entry points."""
 from dataclasses import dataclass
+from contextlib import ExitStack
 from PIL import Image
 from token_engine import already_transparent, assert_source_identity, validate_art_dimensions
 from local_models import require_local_model, model_revision
@@ -62,8 +63,22 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
             verify_revision()
             return CutoutResult(None, revision)
         # Recheck under the reservation before allocating decoded pixels.
-        # Transparent bypass and AI extraction share the same publication policy.
-        with process_lock(disk_cache.directory.parent / 'inference', timeout=120):
+        # If the cache directory is inaccessible, already-transparent artwork
+        # can still be returned safely without either inference or disk writes.
+        with ExitStack() as reservation:
+            try:
+                reservation.enter_context(process_lock(disk_cache.directory.parent / 'inference', timeout=120))
+            except OSError:
+                if not keep_alpha:
+                    raise
+                original = decode(path, identity=identity)
+                if not already_transparent(original):
+                    raise
+                validate_art_dimensions(original)
+                check()
+                verify_revision()
+                remember(memory, memory_key, original, count_limit=memory_limit)
+                return CutoutResult(original, revision)
             revision = model_revision(model)
             memory_key = (*key, revision)
             cutout = cached()

@@ -91,8 +91,9 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
 def automatic_token(filename: str | Path) -> tuple[str, Path]:
     """Create a single token with the saved settings and disk extraction cache.
 
-    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
-    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
+    Returns (status, token_path), where status is 'created', 'skipped',
+    'created_with_warning', or 'skipped_with_warning'. Fatal errors raise
+    exceptions. Never loads the Tk GUI; inference is only used when needed.
     """
     settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='token')
     frame_path = Path(settings['ring'])
@@ -131,7 +132,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
 
 def automatic_item(filename: str | Path) -> tuple[str, Path]:
-    """Create 500x500 equipment art using the same reusable cutout cache."""
+    """Create 500x500 equipment art with automatic_token's status contract."""
     settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='item')
     source = resolve_context_source(filename, frame_path=Path(settings['ring']))
     model = settings.get('model', DEFAULT_MODEL)

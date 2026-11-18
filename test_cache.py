@@ -160,6 +160,65 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(sessions[model], (('new',), second))
         disk.save.assert_called_once()
 
+    def test_transparent_cutout_survives_unavailable_inference_lock(self):
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        model = 'birefnet-general'
+        identity = source_identity(self.source)
+        disk = Mock(directory=self.cache.directory)
+        disk.load.return_value = None
+        transparent = Image.new('RGBA', (10, 10), (20, 30, 40, 80))
+        extract, factory, verify = Mock(), Mock(), Mock()
+        decode = Mock(return_value=transparent)
+        def load(keep_alpha=True):
+            return load_cutout(self.source, model, keep_alpha, 'e',
+                               key=(*identity, model, keep_alpha, 'e'),
+                               disk_cache=disk, memory={}, sessions={}, decode=decode,
+                               extract=extract, session_factory=factory, verify=verify)
+        with patch('cutout_service.process_lock', side_effect=PermissionError('read-only')):
+            self.assertIs(load().image, transparent)
+            verify.assert_called_once()
+            decode.return_value = Image.new('RGBA', (10, 10), 'red')
+            with self.assertRaises(PermissionError):
+                load()
+            decode.reset_mock()
+            with self.assertRaises(PermissionError):
+                load(False)
+            decode.assert_not_called()
+            decode.return_value = transparent
+            verify.side_effect = OSError('source changed')
+            with self.assertRaisesRegex(OSError, 'source changed'):
+                load()
+        disk.save.assert_not_called()
+        extract.assert_not_called()
+        factory.assert_not_called()
+
+    def test_model_revision_matches_empty_rembg_and_legacy_roots(self):
+        import os
+        from local_models import model_revision
+        model = 'birefnet-general'
+        # An empty REMBG_HOME resolves relative to the current directory.
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(self.directory)
+            root = Path('models') / model
+            root.mkdir(parents=True)
+            weights = root / (model + '.onnx')
+            weights.write_bytes(b'one')
+            with patch.dict(os.environ, {'REMBG_HOME': '', 'XDG_DATA_HOME': ''}, clear=True):
+                before = model_revision(model)
+                weights.write_bytes(b'changed')
+                self.assertNotEqual(before, model_revision(model))
+            flat = Path(model + '.onnx')
+            flat.write_bytes(b'old')
+            with patch.dict(os.environ, {'U2NET_HOME': '', 'REMBG_HOME': 'other'}, clear=True):
+                before = model_revision(model)
+                flat.write_bytes(b'new flat')
+                self.assertNotEqual(before, model_revision(model))
+        finally:
+            os.chdir(old_cwd)
+
     def test_second_cache_hit_does_not_reencode_or_run_inference(self):
         from unittest.mock import Mock
         from cutout_service import load_cutout
@@ -842,15 +901,16 @@ class CacheTests(unittest.TestCase):
             setattr(app, name, SimpleNamespace(get=lambda v=value: v))
         app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
         app.preview_stamp = file_stamp(self.source)
-        app.last_full_check = time.monotonic()
-        with patch('tokenforge.threading.Thread') as launch, \
+        app.last_full_check = 100.0
+        with patch('tokenforge.time.monotonic', return_value=100.0) as clock, \
+             patch('tokenforge.threading.Thread') as launch, \
              patch.object(app, '_cache_key', wraps=app._cache_key) as hash_source:
             app._request_preview(verify=True)
             launch.call_args.kwargs['target']()
             hash_source.assert_not_called()
             self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
             app.busy = False
-            app.last_full_check -= 31
+            clock.return_value = 131.0
             app._request_preview(verify=True)
             launch.call_args.kwargs['target']()
             hash_source.assert_called_once()
