@@ -415,15 +415,18 @@ class EngineTests(unittest.TestCase):
             dest = token_output_path(source)
             save_generated(self.figure, dest, source, 'token', skip_exists=False)
             expected = source_identity(dest)
+            # Windows temp paths may use 8.3 aliases (e.g. RUNNER~1).
+            # Count opens of the underlying file, not of one spelling of its path.
             opened = []
             original = Path.open
             def track(path, *args, **kwargs):
-                if path == dest:
+                if path.samefile(dest):
                     opened.append(path)
                 return original(path, *args, **kwargs)
             with patch.object(Path, 'open', track):
                 identity, owned = inspect_existing_export(dest, source, 'token')
-            self.assertEqual(opened, [dest])
+            self.assertEqual(len(opened), 1)
+            self.assertTrue(opened[0].samefile(dest))
             self.assertTrue(owned)
             self.assertEqual(identity, expected)
 
