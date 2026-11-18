@@ -134,6 +134,7 @@ class TokenForge:
         self.last_full_check = 0.0
         self.preview_cached_only = False
         self.preview_retry = False
+        self.preview_saved_only = False
         self.frame_loading = False
         self.frame_generation = 0
         self.pending_frame = None
@@ -645,6 +646,7 @@ class TokenForge:
         self.pending_render = None
         self.preview_stamp = None
         self.preview_retry = False
+        self.preview_saved_only = False
         self.selected = None
         self.current_cutout = None
         self.current_key = None
@@ -666,6 +668,7 @@ class TokenForge:
         self.pending_render = None
         self.preview_stamp = None
         self.preview_retry = False
+        self.preview_saved_only = False
         self.preview_pending = False
         self.selected = path
         self.preview_label.set(path.name)
@@ -809,7 +812,8 @@ class TokenForge:
         if self.closing or not self.selected:
             return
         can_render = self.work_mode.get() == 'item' or self.frame is not None or self.show_cutout.get()
-        if not can_render and not cached_only:
+        saved_only_check = verify and self.preview_saved_only
+        if not can_render and not cached_only and not saved_only_check:
             return
         if self.busy or self.approval_pending:
             if not verify:
@@ -824,21 +828,22 @@ class TokenForge:
         previous_stamp = self.preview_stamp
         last_full_check = self.last_full_check
         saved_mode = self.work_mode.get()
-        saved_ext = self.ext.get() if cached_only else None
-        prefer_saved = cached_only and not self.show_cutout.get() and not verify
+        prefer_saved = (cached_only and not self.show_cutout.get() and not verify) or saved_only_check
+        saved_ext = self.ext.get() if prefer_saved else None
         saved_adjustment = (self._current_item_adjust() if saved_mode == 'item'
                             else self._current_adjust()) if prefer_saved else None
         saved_size = int(self.size.get()) if prefer_saved and saved_mode == 'token' else None
         saved_frame = self.frame if prefer_saved and saved_mode == 'token' else None
         self.busy = True
         if not verify:
+            self.preview_saved_only = False
             self.status.set(f'Подготовка: {path.name}. При первом запуске модель может скачиваться.')
 
         def work():
-            saved = self._load_saved_preview(path, saved_mode, saved_ext) if prefer_saved else None
+            saved = self._load_saved_preview(path, saved_mode, saved_ext) if prefer_saved and not verify else None
             if saved is not None:
                 self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved[0])))
-            if not can_render and saved is None:
+            if not can_render and saved is None and not saved_only_check:
                 self.events.put(('preview_no_frame', request))
                 return
             observed = file_stamp(path)
@@ -855,7 +860,16 @@ class TokenForge:
             if verify and key == previous:
                 self.events.put(('preview_unchanged', (request, observed, checked_at)))
                 return
-            if verify:
+            if saved_only_check:
+                # A saved-only view never starts extraction on a file watcher.
+                # Reinspect the generated image and warn about the new source.
+                saved = self._load_saved_preview(path, saved_mode, saved_ext)
+                if saved is None:
+                    self.events.put(('preview', (request, None, None, observed, checked_at,
+                                                 ('Готовый результат отсутствует или повреждён. Измени ползунок для обработки.',))))
+                    return
+                self.events.put(('saved_preview', (request, saved_mode, saved_ext, saved[0])))
+            elif verify:
                 self.events.put(('preview_invalidated', request))
             notice = ()
             if saved is not None:
@@ -864,8 +878,10 @@ class TokenForge:
                           else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction)
                           if saved_frame is not None else None)
                 notice = freshness_warnings(saved[1], key[:4], recipe)
-            if not can_render:
-                self.events.put(('preview_no_frame', request))
+            if saved_only_check or not can_render:
+                if not can_render:
+                    notice += ('Выбери корректное PNG-кольцо для редактирования.',)
+                self.events.put(('preview', (request, None, key, observed, checked_at, notice)))
                 return
             img, key = self._get_cutout(path, model, keep_alpha, edge_mode,
                                         key=key, cached_only=saved is not None)
@@ -880,7 +896,7 @@ class TokenForge:
         # least every 30s while idle, including same-metadata edits.
         if self.closing:
             return
-        if (self.current_cutout is not None or self.preview_retry) and not (self.busy or self.approval_pending):
+        if (self.current_cutout is not None or self.preview_retry or self.preview_saved_only) and not (self.busy or self.approval_pending):
             self._request_preview(verify=True)
         self.root.after(2500, self._watch_source)
 
@@ -1201,6 +1217,7 @@ class TokenForge:
             if (request == self._preview_request() and mode == self.work_mode.get()
                     and ext == self.ext.get() and not self.show_cutout.get()
                     and not (self.preview_pending and not self.preview_cached_only)):
+                self.preview_saved_only = True
                 self._show_token(image)
         elif action == 'preview_no_frame':
             if data == self._preview_request():
@@ -1252,13 +1269,16 @@ class TokenForge:
                 self.preview_retry = False
                 self.preview_stamp = stamp
                 self.last_full_check = checked_at
+                self.current_cutout = img
+                self.current_key = key
+                self.preview_saved_only = img is None and key is not None
                 if img is not None:
-                    self.current_cutout = img
-                    self.current_key = key
                     # This cutout satisfies a pending full extraction too.
                     self.preview_pending = False
                     self._render()
                 else:
+                    if key is None:
+                        self._show_token(None)
                     self.status.set(' '.join(notice) if notice else
                                     f'Готовый результат: {self.selected.name}. Для редактирования измени ползунок.')
         elif action == 'error':

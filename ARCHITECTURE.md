@@ -17,7 +17,7 @@ The review rounds identified related families of defects, rather than one faulty
 
 - A non-cooperating external editor cannot be universally locked out. A late source change is reported; the user may regenerate. Existing original WebP copies are never overwritten automatically.
 - The logical source path controls naming and output placement; resolved paths identify content and shared placement preferences. Filename collision discovery uses one directory index per batch, followed by targeted native filename queries on Windows and conservative live scans elsewhere. Publication checks relevant names and the exact destination; skip requires a decodable owned image. This cannot stop another application creating a colliding name after publication.
-- The GUI keeps the lightweight saved-image viewing path. Full extraction is deferred until necessary; source changes detected during editable preview trigger a refresh.
+- The GUI keeps the lightweight saved-image viewing path. Full extraction is deferred until necessary; source changes detected during editable preview trigger a refresh. Saved-result-only views keep checking source identity and provenance without triggering inference.
 - SendTo takes one additional menu step and is visible for non-image files; the entry point validates the selection. This removes the shared-registry design risk rather than attempting to predict future machine-wide registrations. Previously created shared registry parents are not removed blindly.
 - Tests simulate difficult external races and Windows replacement failures. Real shortcut creation/readback is exercised in Windows CI, not actual Explorer click interaction or neural inference/model accuracy.
 

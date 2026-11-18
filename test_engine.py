@@ -211,6 +211,37 @@ class EngineTests(unittest.TestCase):
         gray.info['transparency'] = 16384
         self.assertEqual(list(decode_artwork(gray).getchannel('A').getdata()), [255, 0, 255, 255])
 
+    def test_tagged_16bit_gray_uses_compatible_color_transform(self):
+        import io
+        import struct
+        from PIL import ImageCms
+        from token_engine import decode_artwork
+        # Minimal ICC v2 display profile: GRAY input, XYZ PCS, D50, gamma 2.2.
+        # Build it in the test so no OS-installed profile is required.
+        fixed = lambda value: round(value * 65536)
+        white = struct.pack('>4s4xiii', b'XYZ ', fixed(.9642), fixed(1), fixed(.8249))
+        curve = struct.pack('>4s4xIH2x', b'curv', 1, round(2.2 * 256))
+        header = bytearray(128)
+        header[8:12] = bytes((2, 16, 0, 0))
+        header[12:24] = b'mntrGRAYXYZ '
+        header[36:40] = b'acsp'
+        header[68:80] = struct.pack('>iii', fixed(.9642), fixed(1), fixed(.8249))
+        tags = struct.pack('>I4sII4sII', 2, b'wtpt', 156, len(white),
+                           b'kTRC', 156 + len(white), len(curve))
+        data = header + tags + white + curve
+        data[:4] = struct.pack('>I', len(data))
+        gray = Image.new('I;16', (4, 1))
+        gray.putdata([0, 16384, 32768, 65535])
+        gray.info['icc_profile'] = bytes(data)
+        gray.info['transparency'] = 16384
+        decoded = decode_artwork(gray)
+        self.assertEqual(decoded.mode, 'RGBA')
+        self.assertEqual(list(decoded.getchannel('A').getdata()), [255, 0, 255, 255])
+        pixels = list(decoded.getchannel('R').getdata())
+        self.assertTrue(pixels[0] < pixels[1] < pixels[2] < pixels[3])
+        profile = ImageCms.ImageCmsProfile(io.BytesIO(decoded.info['icc_profile']))
+        self.assertIn('sRGB', ImageCms.getProfileDescription(profile))
+
     def test_oversized_ring_and_discovery_reject_before_pixel_decode(self):
         from token_engine import load_frame, read_export_owner
         from PIL import PngImagePlugin

@@ -251,9 +251,8 @@ def decode_artwork(raw, *, force_alpha=False):
         if grayscale16 and isinstance(transparent, int):
             # Test the original sample, not its quantized RGB equivalent.
             from PIL import ImageMath
-            alpha = ImageMath.lambda_eval(lambda args: args['samples'] != args['key'],
-                                          samples=artwork, key=transparent)
-            alpha = alpha.point(lambda value: value * 255).convert('L')
+            alpha = ImageMath.lambda_eval(lambda args: (args['samples'] != args['key']) * 255,
+                                          samples=artwork.convert('I'), key=transparent).convert('L')
         else:
             alpha = artwork.convert('RGBA').getchannel('A')
     if profile:

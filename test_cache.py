@@ -209,6 +209,7 @@ class CacheTests(unittest.TestCase):
         app.last_full_check = 0.0
         app.preview_cached_only = False
         app.preview_retry = False
+        app.preview_saved_only = False
         app.frame_loading = False
         app.frame_generation = 0
         app.pending_frame = None
@@ -1055,6 +1056,43 @@ class CacheTests(unittest.TestCase):
         app._request_preview = Mock()
         app._watch_source()
         app._request_preview.assert_called_once_with(verify=True)
+
+    def test_saved_only_view_rechecks_source_without_inference(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust, source_identity, save_generated, token_recipe
+        app = self.make_mock_app()
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app._current_adjust = lambda: Adjust()
+        app.status, app._show_token, app.root = Mock(), Mock(), Mock()
+        app.events = queue.Queue()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        saved_path = token_output_path(self.source)
+        ident = source_identity(self.source)
+        recipe = token_recipe(app.frame, Adjust(), 256, 'webp', ('birefnet-general', True, 'e'))
+        save_generated(Image.new('RGBA', (256, 256), 'red'), saved_path, self.source, 'token',
+                       skip_exists=False, input_identity=ident, recipe=recipe)
+        app._get_cutout = Mock(return_value=(None, app._cache_key(self.source, 'birefnet-general', True, 'e')))
+        with patch('tokenforge.threading.Thread') as launch:
+            app._request_preview(cached_only=True)
+            launch.call_args.kwargs['target']()
+            while not app.events.empty():
+                app._handle_worker_event(*app.events.get_nowait())
+            self.assertTrue(app.preview_saved_only)
+            self.assertFalse(app.current_cutout)
+            app._get_cutout.reset_mock()
+            Image.new('RGB', (171, 220), 'blue').save(self.source)
+            app._watch_source()
+            self.assertEqual(launch.call_count, 2)
+            launch.call_args.kwargs['target']()
+            while not app.events.empty():
+                app._handle_worker_event(*app.events.get_nowait())
+            app._get_cutout.assert_not_called()
+            self.assertTrue(app.preview_saved_only)
+            self.assertIn('Исходник изменился', app.status.set.call_args.args[0])
 
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)
