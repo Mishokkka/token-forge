@@ -100,6 +100,8 @@ class CacheTests(unittest.TestCase):
         app.current_key = None
         app.current_cutout = None
         app.closing = False
+        app.approval_pending = False
+        app.busy = False
         app.worker = None
         app.preview_generation = 0
         app.preview_cached_only = False
@@ -109,6 +111,8 @@ class CacheTests(unittest.TestCase):
         app.pending_scan = None
         app.active_scan = None
         app.folder = None
+        app.frame_path = Path(__file__).parent / 'RingT.png'
+        app.preview_pending = False
         app.folder_preference = ''
         app.files = []
         app.selected = None
@@ -240,6 +244,9 @@ class CacheTests(unittest.TestCase):
         app.ext, app.size = control('png'), control('1024')
         app._adjust_for = lambda path: Adjust(zoom=160)
         app._after_preview()
+        app._run_export.assert_not_called()
+        app.busy = False
+        app._after_preview()
         request = app._run_export.call_args.args[0]
         self.assertEqual(request[5:7], ('webp', 256))
         self.assertEqual(request[11][self.source].zoom, 70)
@@ -311,6 +318,137 @@ class CacheTests(unittest.TestCase):
             app._poll()
             error.assert_not_called()
         app._request_preview.assert_called_once_with(cached_only=False)
+
+    def test_modal_preview_error_cannot_start_another_worker(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.root, app.status = Mock(), Mock()
+        app.selected = self.source
+        app.events = queue.Queue()
+        app.pending_export = object()
+        pending = app.pending_export
+        app.preview_pending = False
+        app.busy = True
+        app.model = SimpleNamespace(get=lambda: 'birefnet-general')
+        app.keep_alpha = SimpleNamespace(get=lambda: False)
+        app.edge_mode = SimpleNamespace(get=lambda: 'e')
+        app._show_token = Mock()
+        app._request_preview = Mock()
+        app._run_export = Mock()
+        def nested(*args):
+            self.assertTrue(app.busy)
+            app._watch_source()
+            app._after_preview()
+            app._request_preview.assert_not_called()
+            app._run_export.assert_not_called()
+        app.events.put(('error', (app._preview_request(), 'temporary IO error', True, False)))
+        with patch('tokenforge.messagebox.showerror', side_effect=nested) as dialog:
+            app._poll()
+            dialog.assert_called_once()
+        app._run_export.assert_called_once_with(pending)
+        self.assertIsNone(app.pending_export)
+
+    def test_approval_pins_source_before_nested_callbacks(self):
+        import queue
+        import threading
+        from unittest.mock import Mock
+        from token_engine import Adjust
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.selected = self.source
+        app.running_batch = app.busy = False
+        app.pending_export = None
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.status, app.root = Mock(), Mock()
+        app.progress, app.events, app.cancel_event = {}, queue.Queue(), threading.Event()
+        for name, value in {'work_mode': 'token', 'model': 'birefnet-general', 'keep_alpha': True,
+                            'edge_mode': 'Обычный', 'ext': 'webp', 'size': '256',
+                            'skip_exists': True, 'convert_original': True}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        app._adjust_for = lambda p: Adjust()
+        app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'Обычный')
+        app.current_cutout = read_image(self.source)
+        dest = token_output_path(self.source)
+        Image.new('RGBA', (30, 30), 'blue').save(dest)
+        before = dest.read_bytes()
+        def nested(*args):
+            self.assertTrue(app.approval_pending)
+            Image.new('RGBA', (20, 30), 'red').save(self.source)
+            app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'Обычный')
+            app._start_export([self.source], force_overwrite=True)
+            return True
+        with patch('tokenforge.messagebox.askyesno', side_effect=nested) as dialog, \
+             patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
+            app._export_current()
+            dialog.assert_called_once()
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get_nowait())
+        self.assertEqual(events[-1][0], 'done')
+        result = events[-1][1]
+        self.assertEqual((result.created, result.converted), (0, 0))
+        self.assertTrue(result.errors)
+        self.assertEqual(dest.read_bytes(), before)
+        self.assertFalse(self.source.with_suffix('.webp').exists())
+
+    def test_worker_start_failure_posts_terminal_event(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        worker = Mock()
+        worker.start.side_effect = RuntimeError('thread unavailable')
+        with patch('tokenforge.threading.Thread', return_value=worker):
+            app._launch_worker(Mock(), lambda exc: app.events.put(('error', str(exc))))
+        self.assertEqual(app.events.get_nowait(), ('error', 'thread unavailable'))
+
+    def test_worker_system_exit_posts_terminal_event(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        with patch('tokenforge.threading.Thread', side_effect=lambda target, daemon: SimpleNamespace(start=target)):
+            app._launch_worker(Mock(side_effect=SystemExit(1)),
+                               lambda exc: app.events.put(('error', app._worker_error_text(exc))))
+        name, message = app.events.get_nowait()
+        self.assertEqual(name, 'error')
+        self.assertIn('код 1', message)
+
+    def test_reset_forces_preview_instead_of_saved_token(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        app.selected = self.source
+        key = str(self.source.resolve())
+        app.settings = {'overrides': {key: {'zoom': 150}}}
+        app._settings_baseline = {'overrides': {key: {'zoom': 150}}}
+        app._select = Mock()
+        app._schedule_save = Mock()
+        app._reset_current()
+        app._select.assert_called_once_with(self.source, force_preview=True)
+        self.assertNotIn(key, app.settings['overrides'])
+
+    def test_explicit_selection_preview_does_not_show_old_token(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.settings = {}
+        app.preview_label = Mock()
+        for name in ('zoom', 'x', 'y', 'gap', 'item_layout', 'item_zoom', 'item_x', 'item_y',
+                     'item_rotation', 'item_flip_horizontal', 'item_flip_vertical', 'item_clean_noise'):
+            setattr(app, name, Mock())
+        from token_engine import Adjust
+        from item_engine import ItemAdjust
+        app._current_adjust = Mock(return_value=Adjust())
+        app._current_item_adjust = Mock(return_value=ItemAdjust())
+        app._adjust_for = Mock(return_value=Adjust())
+        app._item_adjust_for = Mock(return_value=ItemAdjust())
+        app._show_saved_token, app._show_token, app._request_preview = Mock(), Mock(), Mock()
+        app._select(self.source, force_preview=True)
+        app._show_saved_token.assert_not_called()
+        app._show_token.assert_called_once_with(None)
+        app._request_preview.assert_called_once_with()
 
     def test_clamped_widget_does_not_overwrite_unedited_setting(self):
         from item_engine import ItemAdjust
