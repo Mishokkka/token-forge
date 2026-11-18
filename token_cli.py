@@ -1,0 +1,226 @@
+"""CLI actions for Windows Explorer. Does not create the main GUI."""
+from __future__ import annotations
+
+from cutout_service import load_cutout
+from settings_store import read_settings_file, adjustment_for, output_format
+from local_models import DEFAULT_MODEL, require_local_model, new_local_session
+import os
+import traceback
+from datetime import datetime
+from pathlib import Path
+from app_paths import preferences_dir
+
+from token_engine import (
+    IMAGE_EXTS, Adjust, DiskCutoutCache,
+    export_batch, frame_interior, list_source_images, read_image,
+    remove_background, token_output_path, source_identity, read_export_owner,
+    LoadedCutout, excluded_file,
+)
+from item_engine import item_output_path, export_items
+
+BASE = Path(__file__).resolve().parent
+PREFS_DIR = preferences_dir()
+PREFS_FILE = PREFS_DIR / 'settings.json'
+LOG_FILE = PREFS_DIR / 'context_actions.log'
+
+
+def read_settings() -> dict:
+    return read_settings_file(PREFS_FILE, strict=True)
+
+
+def resolve_context_source(filename: str | Path, *, frame_path: Path | None = None) -> Path:
+    """Resolve a selected Explorer file to its source if it is a generated copy.
+
+    A generated .webp copy must map to the original PNG/JPEG where available,
+    so its saved placement and cached extraction can be reused.
+    """
+    # Preserve the logical user-selected directory entry. Resolving a
+    # symlink is useful for content identity, not for output naming.
+    path = Path(os.path.abspath(Path(filename).expanduser()))
+    if not path.is_file():
+        raise FileNotFoundError(f'Файл не найден: {path}')
+    if path.suffix.lower() not in IMAGE_EXTS:
+        raise ValueError(f'Неподдерживаемый формат: {path.suffix}')
+    # Use configured frame for every entry point, not just GUI discovery.
+    if frame_path is None:
+        # GUI open must remain usable for recovery from an invalid settings
+        # file. Automatic commands pass their strictly read frame explicitly.
+        frame_path = Path(read_settings_file(PREFS_FILE).get('ring') or BASE / 'RingT.png')
+    if excluded_file(path, frame_path):
+        raise ValueError('Выбранный файл используется как рамка, а не исходный арт.')
+    owner = read_export_owner(path)
+    if owner is None:
+        return path
+    if owner[0] == 2:
+        candidate = path.with_name(owner[2])
+        if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
+                and not excluded_file(candidate, path) and read_export_owner(candidate) is None
+                and not excluded_file(candidate, frame_path)):
+            return candidate
+        matches = []
+    else:
+        candidates = list_source_images(path.parent, exclude=frame_path)
+        matches = [p for p in candidates if p.stem.casefold() == owner[2].casefold()]
+    if len(matches) != 1:
+        raise ValueError(f'Не удалось однозначно найти исходный арт для {path.name}.')
+    return matches[0]
+
+
+def _adjust_for(settings: dict, source: Path) -> Adjust:
+    return adjustment_for(settings, source, 'token')
+
+
+def make_cutout_loader(model, keep_alpha, edge_mode):
+    require_local_model(model)
+    cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
+    memory, sessions = {}, {}
+    def get_cutout(path: Path):
+        identity = source_identity(path)
+        key = (*identity, model, keep_alpha, edge_mode)
+        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
+                            disk_cache=cache, memory=memory, sessions=sessions,
+                            decode=read_image, extract=remove_background, session_factory=new_local_session)
+        return LoadedCutout(cutout, identity)
+
+    return get_cutout
+
+
+def automatic_token(filename: str | Path) -> tuple[str, Path]:
+    """Create a single token with the saved settings and disk extraction cache.
+
+    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
+    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
+    """
+    settings = read_settings()
+    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    source = resolve_context_source(filename, frame_path=frame_path)
+    def load_frame():
+        frame = read_image(frame_path)
+        if frame.width != frame.height:
+            raise ValueError('PNG-кольцо должно быть квадратным.')
+        return frame, frame_interior(frame)
+
+    model = settings.get('model', DEFAULT_MODEL)
+    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    keep_alpha = bool(settings.get('keep_alpha', True))
+    ext = output_format(settings.get('ext', 'webp'), strict=True)
+    size = int(settings.get('size', 256))
+    if size not in (256, 512, 1024):
+        raise ValueError('Неподдерживаемый размер токена в настройках.')
+
+    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
+    result = export_batch(
+        [source], get_cutout, None, None, {source: _adjust_for(settings, source)},
+        frame_loader=load_frame,
+        out_size=size, format_name=ext,
+        skip_exists=bool(settings.get('skip_exists', True)),
+        convert_original=bool(settings.get('convert_original', True)),
+    )
+    for warning in result.warnings:
+        write_log(warning)
+    if result.errors:
+        for detail in result.error_details:
+            write_log(detail)
+        if not (result.created or result.skipped):
+            raise RuntimeError('\n'.join(result.errors))
+    destination = token_output_path(source, ext)
+    if result.created:
+        return ('created_with_warning' if result.errors or result.warnings else 'created'), destination
+    if result.skipped and destination.is_file():
+        return ('skipped_with_warning' if result.errors or result.warnings else 'skipped'), destination
+    raise RuntimeError('Токен не был создан: неизвестный результат операции.')
+
+
+def automatic_item(filename: str | Path) -> tuple[str, Path]:
+    """Create 500x500 equipment art using the same reusable cutout cache."""
+    settings = read_settings()
+    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
+    model = settings.get('model', DEFAULT_MODEL)
+    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    keep_alpha = bool(settings.get('keep_alpha', True))
+    adj = adjustment_for(settings, source, 'item')
+    get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
+    result = export_items([source], get_cutout, {source: adj},
+                          skip_exists=bool(settings.get('skip_exists', True)),
+                          convert_original=bool(settings.get('convert_original', True)))
+    for warning in result.warnings:
+        write_log(warning)
+    if result.errors:
+        for detail in result.error_details:
+            write_log(detail)
+        if not (result.created or result.skipped):
+            raise RuntimeError('\n'.join(result.errors))
+    destination = item_output_path(source)
+    if result.created:
+        return ('created_with_warning' if result.errors or result.warnings else 'created'), destination
+    if result.skipped and destination.is_file():
+        return ('skipped_with_warning' if result.errors or result.warnings else 'skipped'), destination
+    raise RuntimeError('Предмет не был создан.')
+
+
+def write_log(message: str, exception: BaseException | None = None) -> None:
+    try:
+        PREFS_DIR.mkdir(parents=True, exist_ok=True)
+        with LOG_FILE.open('a', encoding='utf-8') as fp:
+            fp.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
+            if exception is not None:
+                fp.write(''.join(traceback.format_exception(exception)))
+    except OSError:
+        pass
+
+
+def notify_user(title: str, message: str, *, error: bool = False):
+    """Brief unobtrusive notification; display a persistent dialog on errors."""
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        if error:
+            messagebox.showerror(title, message, parent=root)
+        else:
+            toast = tk.Toplevel(root)
+            toast.overrideredirect(True)
+            toast.attributes('-topmost', True)
+            panel = tk.Frame(toast, bg='#242932', padx=17, pady=13,
+                             highlightbackground='#6689c7', highlightthickness=1)
+            panel.pack(fill='both', expand=True)
+            tk.Label(panel, text=title, fg='white', bg='#242932',
+                     font=('Segoe UI Semibold', 11)).pack(anchor='w')
+            tk.Label(panel, text=message, fg='#e3e7ed', bg='#242932',
+                     font=('Segoe UI', 10), wraplength=350, justify='left').pack(anchor='w', pady=(4, 0))
+            toast.update_idletasks()
+            w, h = toast.winfo_reqwidth(), toast.winfo_reqheight()
+            x = max(0, toast.winfo_screenwidth() - w - 24)
+            y = max(0, toast.winfo_screenheight() - h - 78)
+            toast.geometry(f'{w}x{h}+{x}+{y}')
+            toast.after(3200, root.destroy)
+            root.mainloop()
+        if error:
+            root.destroy()
+    except Exception:
+        # Logging is the fallback if GUI notification cannot be displayed.
+        pass
+
+
+def run_auto(filename: str | Path, *, item: bool = False) -> int:
+    from runtime_streams import initialize_missing_streams
+    initialize_missing_streams()
+    try:
+        status, destination = (automatic_item(filename) if item else automatic_token(filename))
+        if status.endswith('_with_warning'):
+            write_log(f'Результат доступен с предупреждениями: {destination}')
+            notify_user('TokenForge: предупреждение',
+                        f'Результат: {destination.name}. Обработка завершена с предупреждениями. Подробности: {LOG_FILE}',
+                        error=True)
+        elif status == 'created':
+            write_log(f'Создан: {destination}')
+            notify_user('TokenForge', f'Создан {"предмет" if item else "токен"}: {destination.name}')
+        else:
+            write_log(f'Пропущен (уже существует): {destination}')
+            notify_user('TokenForge', f'Файл уже существует: {destination.name}')
+        return 0
+    except Exception as exc:
+        write_log(f'ОШИБКА для {filename}: {exc}', exc)
+        notify_user('Ошибка TokenForge', f'{exc}\n\nПодробности: {LOG_FILE}', error=True)
+        return 1

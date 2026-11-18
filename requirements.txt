@@ -1,0 +1,3 @@
+-r requirements-base.txt
+rembg[cpu]>=2.0.87,<2.1
+tkinterdnd2>=0.4.2,<1
