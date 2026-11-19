@@ -552,6 +552,7 @@ class CacheTests(unittest.TestCase):
         app = self.make_mock_app()
         app.selected = self.source
         app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
         from token_engine import Adjust
         app._current_adjust = lambda: Adjust()
         app.status, app._show_token = Mock(), Mock()
@@ -1213,6 +1214,7 @@ class CacheTests(unittest.TestCase):
         app = self.make_mock_app()
         app.selected = self.source
         app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
         app._current_adjust = lambda: Adjust()
         app.status, app._show_token, app.root = Mock(), Mock(), Mock()
         app.events = queue.Queue()
@@ -1251,6 +1253,7 @@ class CacheTests(unittest.TestCase):
         app = self.make_mock_app()
         app.selected = self.source
         app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
         app._current_adjust = lambda: Adjust()
         app.status, app._show_token, app.root = Mock(), Mock(), Mock()
         app.events = queue.Queue()
@@ -1310,6 +1313,7 @@ class CacheTests(unittest.TestCase):
         app = self.make_mock_app()
         app.selected = self.source
         app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
         app._current_adjust = lambda: Adjust()
         app.status, app._show_token = Mock(), Mock()
         app.events = queue.Queue()

@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 import context_menu
 import token_cli
 import tokenforge
+from token_engine import CapturedArtwork
 
 
 class CliTests(unittest.TestCase):
@@ -176,7 +177,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(token_cli.resolve_context_source(output), self.photo)
         self.settings['skip_exists'] = False
         self.save_settings()
-        with patch.object(token_cli, 'read_image', side_effect=AssertionError('Cache miss')):
+        with patch.object(CapturedArtwork, 'decode', side_effect=AssertionError('Cache miss')):
             self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
         self.assertFalse((self.art_folder / (self.photo.stem + '_item_item.webp')).exists())
 

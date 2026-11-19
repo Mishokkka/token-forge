@@ -915,6 +915,34 @@ class EngineTests(unittest.TestCase):
                     self.assertTrue(any('Параметры генерации' in w for w in report.warnings))
                     loader.assert_not_called()
 
+    def test_token_recipe_tracks_the_actual_interior_mask(self):
+        from token_engine import token_recipe, read_export_owner
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            adjust = Adjust()
+            changed_mask = self.mask.copy()
+            changed_mask.paste(0, (0, 0, changed_mask.width // 2, changed_mask.height))
+            def run(mask, loader, skip=True):
+                return export_batch([source], loader, self.frame, mask, {source: adjust},
+                                    skip_exists=skip, convert_original=False)
+            canonical = token_recipe(self.frame, adjust, 256, 'webp', None)
+            changed = token_recipe(self.frame, adjust, 256, 'webp', None, interior=changed_mask)
+            self.assertNotEqual(canonical, changed)
+            self.assertEqual(run(self.mask, read_image).created, 1)
+            destination = token_output_path(source)
+            self.assertEqual(read_export_owner(destination)[4], canonical)
+            loader = Mock(side_effect=AssertionError('skip must not extract'))
+            report = run(changed_mask, loader)
+            self.assertEqual(report.skipped, 1, report.errors)
+            self.assertTrue(any('Параметры генерации' in w for w in report.warnings))
+            loader.assert_not_called()
+            report = run(changed_mask, read_image, skip=False)
+            self.assertEqual(report.created, 1, report.errors)
+            self.assertEqual(read_export_owner(destination)[4], changed)
+            self.assertFalse(run(changed_mask, loader).warnings)
+
     def test_early_skip_reads_current_recipe_after_validating_existing_file(self):
         import token_engine
         from token_engine import extraction_provenance

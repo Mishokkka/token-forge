@@ -832,10 +832,17 @@ def extraction_provenance(model, keep_alpha, edge_mode, *, revision=None):
             model_revision(model) if revision is None else revision)
 
 
-def token_recipe(frame, adjustment, size, format_name, extraction, *, frame_digest=None):
+def token_recipe(frame, adjustment, size, format_name, extraction, *, interior=None,
+                 frame_digest=None, interior_digest=None):
+    """Describe both inputs to token composition, including the clipping mask."""
+    if interior is None:
+        interior = frame_interior(frame)
     digest = frame_digest if frame_digest is not None else hashlib.sha256(frame.tobytes()).hexdigest()
-    return recipe_digest('token', frame=digest, frame_size=frame.size, size=size,
-                         format=format_name.lower(), placement=canonical_placement(adjustment),
+    mask_digest = (interior_digest if interior_digest is not None
+                   else hashlib.sha256(interior.tobytes()).hexdigest())
+    return recipe_digest('token', frame=digest, frame_size=frame.size, frame_mode=frame.mode,
+                         interior=mask_digest, interior_size=interior.size, interior_mode=interior.mode,
+                         size=size, format=format_name.lower(), placement=canonical_placement(adjustment),
                          extraction=extraction)
 
 
@@ -1468,7 +1475,7 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  cancel_event=None, on_progress=None, approved_outputs=None,
                  frame_loader=None, expected_inputs=None, extraction_recipe=None,
                  captured_loader=None) -> BatchResult:
-    frame_digest = None
+    frame_digest = interior_digest = None
     prepared_frame = None
     def ensure_frame():
         nonlocal frame, interior
@@ -1476,9 +1483,9 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
             frame, interior = frame_loader()
         return frame
     def recipe_for(source, actual=None):
-        nonlocal frame_digest
+        nonlocal frame_digest, interior_digest
         try:
-            if ensure_frame() is None:
+            if ensure_frame() is None or interior is None:
                 return None
         except (OSError, ValueError, Image.DecompressionBombError):
             # Preserve the ability to skip existing valid pixels without an
@@ -1486,10 +1493,11 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
             return None
         if frame_digest is None:
             frame_digest = hashlib.sha256(frame.tobytes()).hexdigest()
+            interior_digest = hashlib.sha256(interior.tobytes()).hexdigest()
         extraction = actual if actual is not None else (
             extraction_recipe() if callable(extraction_recipe) else extraction_recipe)
         return token_recipe(frame, adjustments[source], out_size, format_name, extraction,
-                            frame_digest=frame_digest)
+                            interior=interior, frame_digest=frame_digest, interior_digest=interior_digest)
     def render(cutout, source):
         nonlocal prepared_frame
         if ensure_frame() is None or interior is None:

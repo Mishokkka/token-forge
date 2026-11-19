@@ -850,6 +850,7 @@ class TokenForge:
                             else self._current_adjust()) if prefer_saved else None
         saved_size = int(self.size.get()) if prefer_saved and saved_mode == 'token' else None
         saved_frame = self.frame if prefer_saved and saved_mode == 'token' else None
+        saved_interior = self.interior if saved_frame is not None else None
         self.busy = True
         if not verify:
             self.preview_saved_only = False
@@ -909,8 +910,9 @@ class TokenForge:
                 # Base both the warning and the watcher on its returned key.
                 extraction = extraction_provenance(model, keep_alpha, edge_mode, revision=key[-1])
                 recipe = (item_recipe(saved_adjustment, extraction) if saved_mode == 'item'
-                          else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction)
-                          if saved_frame is not None else None)
+                          else token_recipe(saved_frame, saved_adjustment, saved_size, saved_ext, extraction,
+                                            interior=saved_interior)
+                          if saved_frame is not None and saved_interior is not None else None)
                 notice = freshness_warnings(saved[1], key[:4], recipe)
             if not can_render:
                 notice += ('Выбери корректное PNG-кольцо для редактирования.',)

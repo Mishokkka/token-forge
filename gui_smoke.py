@@ -34,7 +34,19 @@ def run():
                              encoding='utf-8')
         def unexpected_dialog(*args, **kwargs):
             raise AssertionError(f'Unexpected dialog: {args}')
-        with patch.object(tokenforge, 'PREFS_DIR', prefs), \
+        displayed = []
+        apply_event = tokenforge.TokenForge._apply_worker_event
+
+        def observe_event(app, action, data):
+            current = action == 'rendered' and app._render_is_current(data[0])
+            apply_event(app, action, data)
+            if current:
+                job, image, error = data
+                if error is None and image is not None:
+                    displayed.append(job)
+
+        with patch.object(tokenforge.TokenForge, '_apply_worker_event', observe_event), \
+             patch.object(tokenforge, 'PREFS_DIR', prefs), \
              patch.object(tokenforge, 'PREFS_FILE', pref_file), \
              patch.object(tokenforge, 'new_local_session', side_effect=AssertionError('Unexpected AI session')), \
              patch.object(tokenforge.messagebox, 'showerror', side_effect=unexpected_dialog), \
@@ -72,11 +84,16 @@ def run():
                              'initial asynchronous frame, scan and preview')
                 assert app.selected.samefile(source)
                 assert app.display_photo is not None
+                assert displayed and app._render_is_current(displayed[-1]), app.status.get()
+                initial_serial = displayed[-1].serial
                 print('GUI startup, frame, list, preview: OK', flush=True)
                 for zoom in (110, 125, 140):
                     app.zoom.set(zoom)
                     app._on_adjust('zoom')
                 update_until(idle, 'coalesced slider rendering')
+                assert displayed and app._render_is_current(displayed[-1]), app.status.get()
+                assert displayed[-1].serial > initial_serial
+                assert displayed[-1].adjustment.zoom == 140
                 save = find_button(app.root, 'Сохранить выбранный')
                 assert save is not None
                 save.invoke()
