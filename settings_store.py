@@ -6,7 +6,8 @@ import json
 import math
 from pathlib import Path
 
-from token_engine import atomic_write, Adjust
+from token_engine import atomic_write, Adjust, source_identity, source_snapshot, assert_source_identity
+from local_models import LOCAL_MODELS, DEFAULT_MODEL, require_local_model
 from item_engine import ItemAdjust, ITEM_MODES
 from process_lock import process_lock as settings_lock
 
@@ -16,7 +17,7 @@ def read_settings_file(path: Path, *, strict=False) -> dict:
         data = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
         return {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         if strict:
             raise
         return {}
@@ -27,6 +28,94 @@ def read_settings_file(path: Path, *, strict=False) -> dict:
     return {}
 
 
+
+
+EDGE_MODES = ('Очистка краёв', 'Обычный', 'Alpha matting (медленно)')
+BOOL_DEFAULTS = {'keep_alpha': True, 'skip_exists': True, 'convert_original': True}
+
+
+def decode_settings(raw, *, default_frame, strict=False, mode=None):
+    """One global schema for GUI and CLI. Accept only unambiguous legacy values.
+
+    Strict automated actions reject invalid relevant values before writing.
+    The GUI uses safe defaults and allows the user to correct them.
+    Unknown fields and per-art overrides survive local edits.
+    """
+    result = deepcopy(raw)
+    def invalid(name, default):
+        if strict:
+            raise ValueError(f'Некорректная настройка: {name}. Открой TokenForge и исправь её.')
+        return default
+
+    for name, default in BOOL_DEFAULTS.items():
+        value = raw.get(name, default)
+        if isinstance(value, bool):
+            pass
+        elif isinstance(value, (int, str)) and str(value).strip().lower() in ('1', 'true', 'yes', 'on'):
+            value = True
+        elif isinstance(value, (int, str)) and str(value).strip().lower() in ('0', 'false', 'no', 'off'):
+            value = False
+        else:
+            value = invalid(name, default)
+        result[name] = value
+    for name, allowed, default in (('model', LOCAL_MODELS, DEFAULT_MODEL),
+                                   ('edge_mode', EDGE_MODES, EDGE_MODES[0])):
+        value = raw.get(name, default)
+        if name == 'model' and strict:
+            require_local_model(value)
+        result[name] = value if isinstance(value, str) and value in allowed else invalid(name, default)
+    # Token-only options must not prevent an item export.
+    if mode != 'item':
+        result['ext'] = output_format(raw.get('ext', 'webp'), strict=strict)
+        size = raw.get('size', 256)
+        if isinstance(size, str) and size in ('256', '512', '1024'):
+            size = int(size)
+        result['size'] = size if type(size) is int and size in (256, 512, 1024) else invalid('size', 256)
+    ring = raw.get('ring', str(default_frame))
+    if not isinstance(ring, str) or '\0' in ring:
+        ring = invalid('ring', str(default_frame))
+    result['ring'] = ring or str(default_frame)
+    folder = raw.get('folder', '')
+    result['folder'] = folder if isinstance(folder, str) and '\0' not in folder else ''
+    result['work_mode'] = raw.get('work_mode') if raw.get('work_mode') in ('token', 'item') else 'token'
+    result['item_layout'] = valid_layout(raw.get('item_layout'))
+    for name in ('overrides', 'item_overrides'):
+        if not isinstance(raw.get(name), dict):
+            result[name] = {}
+    return result
+
+
+def recover_settings_file(path: Path):
+    """Explicit recovery: back up exact invalid bytes before replacing them.
+
+    Recheck under the lock so a concurrently repaired document wins.
+    IO/permission errors are not interpreted as corrupt JSON.
+    """
+    import uuid
+    with settings_lock(path, timeout=0):
+        try:
+            return read_settings_file(path, strict=True), None
+        except (ValueError, RecursionError):
+            identity = source_identity(path)
+            with source_snapshot(path, identity) as captured:
+                data = captured.read()
+            # The file may have changed while waiting for the user's consent.
+            try:
+                parsed = json.loads(data.decode('utf-8'))
+            except (ValueError, RecursionError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed, None
+            backup = path.with_name(f'{path.name}.corrupt-{uuid.uuid4().hex}.bak')
+            if not atomic_write(backup, lambda fp: fp.write(data), replace=False):
+                raise FileExistsError(backup)
+            publication = atomic_write(path, lambda fp: fp.write(b'{}\n'),
+                                       before_publish=lambda: assert_source_identity(path, identity),
+                                       expected_destination=identity)
+            if publication.warnings:
+                raise OSError('Восстановление с предупреждениями: ' + '; '.join(publication.warnings)
+                              + f'. Резервная копия: {backup}')
+            return {}, backup
 
 
 TOKEN_RANGES = {'zoom': (5, 320), 'x': (-120, 120),
@@ -91,6 +180,20 @@ def adjustment_for(settings, source, mode, default_layout=None):
     return decode_adjustment(override_for(settings, group, source), mode, default_layout)
 
 
+class BatchAdjustments:
+    """Lazily resolve placement from the captured settings, once per file."""
+    def __init__(self, settings, mode, default_layout=None):
+        self.settings = settings
+        self.mode = mode
+        self.default_layout = default_layout
+        self._values = {}
+
+    def __getitem__(self, source):
+        if source not in self._values:
+            self._values[source] = adjustment_for(self.settings, source, self.mode, self.default_layout)
+        return self._values[source]
+
+
 _MISSING = object()
 
 
@@ -112,10 +215,10 @@ def merge_delta(latest: dict, baseline: dict, current: dict) -> dict:
     return result
 
 
-def save_settings_delta(path: Path, baseline: dict, current: dict, *, resets=()) -> bool:
+def save_settings_delta(path: Path, baseline: dict, current: dict, *, resets=(), lock_timeout=3.0) -> bool:
     if baseline == current and not resets:
         return False
-    with settings_lock(path):
+    with settings_lock(path, timeout=lock_timeout):
         latest = read_settings_file(path, strict=True)
         # A reset is an explicit operation, even when the local snapshot
         # never contained that override. Apply it to the latest document.

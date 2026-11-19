@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 import context_menu
 import token_cli
 import tokenforge
+from token_engine import CapturedArtwork
 
 
 class CliTests(unittest.TestCase):
@@ -54,6 +55,14 @@ class CliTests(unittest.TestCase):
 
     def save_settings(self):
         (self.pref / 'settings.json').write_text(json.dumps(self.settings, ensure_ascii=False), encoding='utf-8')
+
+    def test_legacy_boolean_string_is_not_truthy_in_auto(self):
+        self.settings['convert_original'] = 'false'
+        self.settings['skip_exists'] = '0'
+        self.save_settings()
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'created')
+        self.assertFalse(self.photo.with_suffix('.webp').exists())
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'created')
 
     def test_context_auto_creates_art_and_token(self):
         with patch.object(token_cli, 'remove_background', side_effect=AssertionError('AI invoked')):
@@ -168,7 +177,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(token_cli.resolve_context_source(output), self.photo)
         self.settings['skip_exists'] = False
         self.save_settings()
-        with patch.object(token_cli, 'read_image', side_effect=AssertionError('Cache miss')):
+        with patch.object(CapturedArtwork, 'decode', side_effect=AssertionError('Cache miss')):
             self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
         self.assertFalse((self.art_folder / (self.photo.stem + '_item_item.webp')).exists())
 
@@ -240,7 +249,8 @@ class CliTests(unittest.TestCase):
         self.settings['overrides'] = None
         self.settings['item_overrides'] = None
         self.save_settings()
-        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped')
+        self.assertEqual(token_cli.automatic_token(self.photo)[0], 'skipped_with_warning')
+        self.assertIn('Не удалось проверить актуальность', token_cli.LOG_FILE.read_text(encoding='utf-8'))
         self.assertEqual(token_cli.automatic_item(self.photo)[0], 'created')
 
     def test_shared_adjustment_schema_keeps_valid_fields_and_rejects_unsafe_format(self):

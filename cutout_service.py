@@ -1,36 +1,126 @@
 """Shared extraction/cache policy for GUI and Explorer/CLI entry points."""
-from token_engine import already_transparent, assert_source_identity
-from local_models import require_local_model
+from dataclasses import dataclass
+from contextlib import ExitStack
+from PIL import Image
+from token_engine import already_transparent, assert_source_identity, validate_art_dimensions
+from local_models import require_local_model, model_revision
+from process_lock import process_lock
+
+MEMORY_LIMIT_BYTES = 256 * 1024**2
+
+
+@dataclass(frozen=True)
+class CutoutResult:
+    image: Image.Image | None
+    revision: tuple
+
+
+def remember(memory, key, image, *, count_limit=6, byte_limit=MEMORY_LIMIT_BYTES):
+    """Cache ownership is bounded by decoded pixel bytes, not just count."""
+    memory.pop(key, None)
+    weight = lambda im: im.width * im.height * 4
+    if weight(image) <= byte_limit and count_limit > 0:
+        memory[key] = image
+    while len(memory) > count_limit or sum(weight(im) for im in memory.values()) > byte_limit:
+        memory.pop(next(iter(memory)))
 
 
 def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, sessions,
-                decode, extract, session_factory, cached_only=False, memory_limit=6):
+                decode, extract, session_factory, cached_only=False, memory_limit=6,
+                verify=None):
     require_local_model(model)
     identity = key[:4]
-    cutout = memory.get(key)
-    if cutout is None:
-        cutout = disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity)
+    check = verify if verify is not None else lambda: assert_source_identity(path, identity)
+    revision = model_revision(model)
+    memory_key = (*key, revision)
+
+    def cached():
+        image = memory.get(memory_key)
+        if image is not None:
+            return image
+        return disk_cache.load(path, model, keep_alpha, edge_mode, identity=identity, revision=revision)
+
+    def verify_revision():
+        if model_revision(model) != revision:
+            sessions.clear()
+            raise OSError('Файлы модели изменились во время удаления фона. Повтори обработку.')
+
+    def publish(image):
+        validate_art_dimensions(image)
+        verify_revision()
+        try:
+            disk_cache.save(path, model, keep_alpha, edge_mode, image,
+                            identity=identity, revision=revision)
+        except OSError:
+            # Caching is optional, source verification is not.
+            check()
+        verify_revision()
+
+    cutout = cached()
     if cutout is None:
         if cached_only:
-            assert_source_identity(path, identity)
-            return None
-        original = decode(path, identity=identity)
-        assert_source_identity(path, identity)
-        if keep_alpha and already_transparent(original):
-            cutout = original
-        else:
-            if model not in sessions:
-                sessions[model] = session_factory(model)
-            cutout = extract(original, sessions[model], edge_mode)
-        # Never poison the cache if the source changed during extraction.
-        assert_source_identity(path, identity)
-        try:
-            disk_cache.save(path, model, keep_alpha, edge_mode, cutout, identity=identity)
-        except OSError:
-            pass  # A cache write failure must not prevent exporting an image.
-    assert_source_identity(path, identity)
-    memory.pop(key, None)
-    memory[key] = cutout
-    while len(memory) > memory_limit:
-        memory.pop(next(iter(memory)))
-    return cutout
+            check()
+            verify_revision()
+            return CutoutResult(None, revision)
+        # Try an immediate reservation for possible alpha bypasses. If
+        # uncontended, the second cache lookup still precedes source decoding.
+        lock_path = disk_cache.directory.parent / 'inference'
+        original = None
+        with ExitStack() as reservation:
+            try:
+                reservation.enter_context(process_lock(lock_path, timeout=0 if keep_alpha else 120))
+            except OSError as lock_error:
+                if not keep_alpha:
+                    raise
+                revision = model_revision(model)
+                memory_key = (*key, revision)
+                original = decode(path, identity=identity)
+                validate_art_dimensions(original)
+                if already_transparent(original):
+                    # No inference and no contested disk publication.
+                    check()
+                    verify_revision()
+                    remember(memory, memory_key, original, count_limit=memory_limit)
+                    return CutoutResult(original, revision)
+                if not isinstance(lock_error, TimeoutError):
+                    raise
+                # Opaque artwork still needs the shared inference lock. Reuse
+                # the verified decode only if the second cache lookup misses.
+                reservation.enter_context(process_lock(lock_path, timeout=120))
+            revision = model_revision(model)
+            memory_key = (*key, revision)
+            cutout = cached()
+            if cutout is None:
+                if original is None:
+                    original = decode(path, identity=identity)
+                if keep_alpha and already_transparent(original):
+                    cutout = original
+                else:
+                    existing = sessions.get(model)
+                    if existing is not None and existing[0] == revision:
+                        session = existing[1]
+                    else:
+                        # Release previous native sessions before allocating another.
+                        sessions.clear()
+                        del existing
+                        for attempt in range(2):
+                            session = session_factory(model)
+                            observed = model_revision(model)
+                            if observed == revision:
+                                break
+                            # A first download may legitimately change the revision.
+                            # Never relabel a session that loaded an unknown version.
+                            del session
+                            revision = observed
+                        else:
+                            raise OSError('Файлы модели нестабильны. Повтори обработку.')
+                        memory_key = (*key, revision)
+                        sessions[model] = (revision, session)
+                    cutout = extract(original, session, edge_mode)
+                publish(cutout)
+
+    # Also verify hits (including the second lookup under the inference lock).
+    check()
+    verify_revision()
+    remember(memory, memory_key, cutout, count_limit=memory_limit)
+    return CutoutResult(cutout, revision)

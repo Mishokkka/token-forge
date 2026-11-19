@@ -1,20 +1,97 @@
 """TokenForge image pipeline. Tk-independent so composition can be tested offline."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from contextlib import contextmanager
+from dataclasses import dataclass, field, asdict
+from contextlib import contextmanager, ExitStack, nullcontext
 import hashlib
 import json
 import os
 import tempfile
+import struct
 import traceback
 from pathlib import Path
 from statistics import median
 import math
-from local_models import call_rembg
+from local_models import call_rembg, model_revision
+from process_lock import process_lock
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
-CUTOUT_CACHE_VERSION = 2
+CUTOUT_CACHE_VERSION = 5
+MAX_ENCODED_BYTES = 256 * 1024 * 1024
+MAX_IMAGE_PIXELS = 64 * 1024 * 1024
+MAX_IMAGE_SIDE = 16384
+ART_FORMATS = ('PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF')
+
+
+def _validate_dimensions(width, height, *, ring=False):
+    if ring:
+        if width != height:
+            raise ValueError('PNG-кольцо должно быть квадратным.')
+        if width > 4096:
+            raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+    if (width <= 0 or height <= 0 or width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE
+            or width * height > MAX_IMAGE_PIXELS):
+        raise ValueError('Изображение превышает ресурсный лимит TokenForge (64 МиПикс, сторона 16384).')
+
+
+def validate_art_dimensions(image):
+    _validate_dimensions(*image.size)
+    return image
+
+
+def _webp_dimensions(stream):
+    """Inspect the RIFF canvas header, without allocating a native decoder.
+
+    Simple lossy/lossless and extended (including animated) WebP layouts have
+    distinct dimension fields. A recognized but invalid header fails closed.
+    """
+    stream.seek(0)
+    try:
+        header = stream.read(30)
+        if header[:4] != b'RIFF' or header[8:12] != b'WEBP':
+            return None
+        if len(header) < 20:
+            raise ValueError('Повреждённый заголовок WebP.')
+        kind = header[12:16]
+        length = int.from_bytes(header[16:20], 'little')
+        riff_end = 8 + int.from_bytes(header[4:8], 'little')
+        if 20 + length + (length & 1) > riff_end:
+            raise ValueError('Повреждённый заголовок WebP.')
+        if kind == b'VP8X' and length == 10 and len(header) >= 30:
+            return (1 + int.from_bytes(header[24:27], 'little'),
+                    1 + int.from_bytes(header[27:30], 'little'))
+        if kind == b'VP8L' and length >= 5 and len(header) >= 25 and header[20] == 0x2f:
+            bits = int.from_bytes(header[21:25], 'little')
+            if bits >> 29 == 0:
+                return (1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff))
+        if (kind == b'VP8 ' and length >= 10 and len(header) >= 30
+                and not header[20] & 1 and header[23:26] == b'\x9d\x01\x2a'):
+            return (int.from_bytes(header[26:28], 'little') & 0x3fff,
+                    int.from_bytes(header[28:30], 'little') & 0x3fff)
+        raise ValueError('Повреждённый или неподдерживаемый заголовок WebP.')
+    finally:
+        stream.seek(0)
+
+
+@contextmanager
+def open_art(source, *, formats=ART_FORMATS, ring=False):
+    """Validate before WebP decoder creation, then verify decoded dimensions.
+
+    A pathname is opened once: header inspection and Pillow see the same
+    handle (or an existing immutable snapshot for captured artwork).
+    """
+    context = open(source, 'rb') if isinstance(source, (str, bytes, os.PathLike)) else nullcontext(source)
+    with context as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() > MAX_ENCODED_BYTES:
+            raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+        dimensions = _webp_dimensions(stream)
+        if dimensions is not None:
+            _validate_dimensions(*dimensions, ring=ring)
+        # Pillow also keeps its own decompression-bomb limit.
+        with Image.open(stream, formats=formats) as image:
+            _validate_dimensions(*image.size, ring=ring)
+            yield image
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 
@@ -43,16 +120,20 @@ def _fingerprint(source: Path, snapshot=None) -> tuple:
     resolved = Path(source).resolve()
     signature = stat_signature
     path_before = resolved.stat()
+    if path_before.st_size > MAX_ENCODED_BYTES:
+        raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
     with resolved.open('rb') as stream:
         before = os.fstat(stream.fileno())
-        if snapshot is None:
-            digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-        else:
-            hasher = hashlib.sha256()
-            for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-                hasher.update(chunk)
+        hasher = hashlib.sha256()
+        total = 0
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            total += len(chunk)
+            if total > MAX_ENCODED_BYTES:
+                raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+            hasher.update(chunk)
+            if snapshot is not None:
                 snapshot.write(chunk)
-            digest = hasher.hexdigest()
+        digest = hasher.hexdigest()
         after = os.fstat(stream.fileno())
         path_after = resolved.stat()
     # On Windows fstat and stat need not expose identical inode/device IDs.
@@ -61,7 +142,7 @@ def _fingerprint(source: Path, snapshot=None) -> tuple:
             or signature(path_before) != signature(path_after)
             or (after.st_size, after.st_mtime_ns) != (path_after.st_size, path_after.st_mtime_ns)):
         raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
-    if snapshot is not None and snapshot.tell() != path_after.st_size:
+    if total != path_after.st_size:
         raise OSError(f'Размер исходного файла изменился: {source.name}')
     return str(resolved), path_after.st_size, path_after.st_mtime_ns, digest
 
@@ -87,26 +168,33 @@ def assert_source_identity(source: Path, identity: tuple) -> None:
 class DiskCutoutCache:
     """Lossless persistent cache. No image extraction rerun for unchanged inputs."""
 
-    def __init__(self, directory: Path):
+    def __init__(self, directory: Path, *, max_bytes=2 * 1024**3, max_entries=4096):
         self.directory = Path(directory)
+        self.max_bytes = max_bytes
+        self.max_entries = max_entries
+        self._last_prune = None
+        self._bytes_since_prune = 0
 
     def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
-                 *, identity: tuple | None = None) -> Path:
+                 *, identity: tuple | None = None, revision=None) -> Path:
         version = identity or source_identity(source)
+        revision = model_revision(model) if revision is None else revision
         key = [CUTOUT_CACHE_VERSION, version[0], version[-1],
-               model, bool(keep_alpha), edge_mode]
+               model, bool(keep_alpha), edge_mode, revision]
         digest = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode('utf-8')).hexdigest()
         return self.directory / f'{digest}.png'
 
     def load(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
-             *, identity: tuple | None = None) -> Image.Image | None:
-        path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
+             *, identity: tuple | None = None, revision=None) -> Image.Image | None:
+        path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
         try:
-            with Image.open(path) as stored:
-                stored.load()
-                if stored.format != 'PNG':
-                    raise ValueError('Invalid cache format')
-                return stored.convert('RGBA')
+            with open_art(path, formats=('PNG',)) as stored:
+                image = stored.convert('RGBA')
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+            return image
         except FileNotFoundError:
             return None
         except (OSError, ValueError, Image.DecompressionBombError):
@@ -115,21 +203,66 @@ class DiskCutoutCache:
             return None
 
     def save(self, source: Path, model: str, keep_alpha: bool,
-             edge_mode: str, cutout: Image.Image, *, identity: tuple | None = None) -> None:
-        destination = self.path_for(source, model, keep_alpha, edge_mode, identity=identity)
-        if identity is not None:
-            assert_source_identity(source, identity)
+             edge_mode: str, cutout: Image.Image, *, identity: tuple | None = None,
+             revision=None) -> None:
+        destination = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
+        validate_art_dimensions(cutout)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = None
         try:
             with tempfile.NamedTemporaryFile(mode='wb', suffix='.png', dir=destination.parent,
                                              prefix='.tmp-', delete=False) as tmp:
                 temporary = Path(tmp.name)
-                cutout.convert('RGBA').save(tmp, format='PNG', compress_level=1)
-            os.replace(temporary, destination)
+                rgba = cutout if cutout.mode == 'RGBA' else cutout.convert('RGBA')
+                rgba.save(tmp, format='PNG', compress_level=1)
+            if identity is not None:
+                assert_source_identity(source, identity)
+            encoded_bytes = temporary.stat().st_size
+            if encoded_bytes <= self.max_bytes:
+                os.replace(temporary, destination)
+                self._bytes_since_prune += encoded_bytes
+                self._maybe_prune()
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
+
+    def _maybe_prune(self):
+        import time
+        now = time.monotonic()
+        if (self._last_prune is None or now - self._last_prune >= 30
+                or self._bytes_since_prune >= min(self.max_bytes // 8, 128 * 1024**2)):
+            try:
+                self.prune()
+                self._last_prune = now
+                self._bytes_since_prune = 0
+            except OSError:
+                pass  # Cache maintenance never blocks successful exports.
+
+    def prune(self):
+        """Best-effort LRU of only our cache names; never touch source images."""
+        with process_lock(self.directory / '.maintenance', timeout=0):
+            entries = []
+            for path in self.directory.glob('*.png'):
+                if not _valid_digest(path.stem) or path.is_symlink():
+                    continue
+                try:
+                    st = path.stat()
+                    if path.is_file():
+                        entries.append((st.st_mtime_ns, st.st_size, path))
+                except OSError:
+                    continue
+            total, count = sum(item[1] for item in entries), len(entries)
+            for stamp, size, path in sorted(entries):
+                if total <= self.max_bytes and count <= self.max_entries:
+                    break
+                try:
+                    st = path.stat()
+                    if (st.st_mtime_ns, st.st_size) == (stamp, size):
+                        path.unlink()
+                        total -= size
+                        count -= 1
+                except OSError:
+                    continue
 
 
 @contextmanager
@@ -144,6 +277,8 @@ def source_snapshot(path: Path, identity: tuple):
     with tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode='w+b') as snapshot:
         with path.open('rb') as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                if snapshot.tell() + len(chunk) > min(identity[1], MAX_ENCODED_BYTES):
+                    raise OSError(f'Исходный файл изменился во время чтения: {path.name}')
                 digest.update(chunk)
                 snapshot.write(chunk)
         if snapshot.tell() != identity[1] or digest.hexdigest() != identity[-1]:
@@ -152,13 +287,122 @@ def source_snapshot(path: Path, identity: tuple):
         yield snapshot
 
 
+def decode_artwork(raw, *, force_alpha=False):
+    """Normalize tagged artwork to sRGB; preserve alpha independently of color.
+
+    Never attach a CMYK/grayscale source profile to converted RGB data.
+    Invalid embedded profiles fail with an actionable per-image error.
+    """
+    import io
+    from PIL import ImageCms
+    # Pillow exposes a 16-bit grayscale+alpha PNG as RGBA. Capture the
+    # decoder's original sample layout before exif_transpose loads it.
+    gray_alpha16_png = (raw.format == 'PNG' and raw.mode == 'RGBA'
+                        and any(tile[3] == 'LA;16B' for tile in getattr(raw, 'tile', ())))
+    artwork = ImageOps.exif_transpose(raw)
+    has_alpha = 'A' in artwork.getbands() or 'transparency' in artwork.info
+    grayscale16 = artwork.mode in ('I;16', 'I;16L', 'I;16B')
+    profile = artwork.info.get('icc_profile')
+    alpha = None
+    if has_alpha and (profile or grayscale16):
+        transparent = artwork.info.get('transparency')
+        if grayscale16 and isinstance(transparent, int):
+            # Test the original sample, not its quantized RGB equivalent.
+            from PIL import ImageMath
+            alpha = ImageMath.lambda_eval(lambda args: (args['samples'] != args['key']) * 255,
+                                          samples=artwork.convert('I'), key=transparent).convert('L')
+        else:
+            alpha = artwork.convert('RGBA').getchannel('A')
+    if profile:
+        try:
+            source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+            target = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
+            if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB', 'I;16', 'I;16L', 'I;16B'):
+                color = artwork
+            elif artwork.mode == '1':
+                color = artwork.convert('L')
+            elif artwork.mode == 'LA':
+                color = artwork.getchannel('L')
+            elif gray_alpha16_png:
+                # The decoder already expanded gray into three equal 8-bit
+                # channels. CMS needs one gray channel; alpha is independent.
+                color = artwork.getchannel('R')
+            else:
+                color = artwork.convert('RGB')
+            result = ImageCms.profileToProfile(color, source, target, outputMode='RGB')
+            if alpha is not None:
+                result.putalpha(alpha)
+            elif force_alpha:
+                result = result.convert('RGBA')
+            result.info['icc_profile'] = target.tobytes()
+            return result
+        except (OSError, ValueError, TypeError, ImageCms.PyCMSError) as exc:
+            raise ValueError('Некорректный или неподдерживаемый цветовой профиль ICC. '
+                             'Сохрани изображение в sRGB и повтори обработку.') from exc
+    # Pillow's ordinary 16-bit -> RGB conversion clips values above 255.
+    # Scale the sample range rather than saturating most grayscale pixels.
+    if grayscale16:
+        gray = artwork.convert('I').point(lambda value: (value + 128) / 257).convert('L')
+        result = gray.convert('RGBA' if has_alpha or force_alpha else 'RGB')
+        if alpha is not None:
+            result.putalpha(alpha)
+        return result
+    return artwork.convert('RGBA' if has_alpha or force_alpha else 'RGB')
+
+
+class BorrowedStream:
+    """File API proxy with a borrowed (not transferred) lifetime."""
+    def __init__(self, stream):
+        self.stream = stream
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+    def close(self):
+        pass
+
+
+class CapturedArtwork:
+    """One lazily materialized, digest-verified byte snapshot per export.
+
+    Skip-only jobs do not spool the source. Copy and extraction decode the
+    same immutable bytes. Publication guards still hash the live source.
+    """
+    def __init__(self, path: Path, identity: tuple):
+        self.path = path
+        self.identity = identity
+        self._stack = ExitStack()
+        self._stream = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)
+
+    @contextmanager
+    def open(self):
+        if self._stream is None:
+            self._stream = self._stack.enter_context(source_snapshot(self.path, self.identity))
+        self._stream.seek(0)
+        # Pillow must not acquire ownership of the shared file object.
+        with open_art(BorrowedStream(self._stream)) as image:
+            yield image
+
+    def decode(self):
+        with self.open() as image:
+            return decode_artwork(image, force_alpha=True)
+
+
 def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
     if identity is None:
-        with Image.open(path) as img:
-            return ImageOps.exif_transpose(img).convert('RGBA')
+        if path.stat().st_size > MAX_ENCODED_BYTES:
+            raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+        with open_art(path) as img:
+            return decode_artwork(img, force_alpha=True)
     with source_snapshot(path, identity) as snapshot:
-        with Image.open(snapshot) as img:
-            return ImageOps.exif_transpose(img).convert('RGBA')
+        with open_art(snapshot) as img:
+            return decode_artwork(img, force_alpha=True)
 
 
 def already_transparent(img: Image.Image) -> bool:
@@ -278,6 +522,14 @@ def _enclosed_shape(barrier: Image.Image) -> Image.Image:
     return outside.point(lambda p: 0 if p == 255 else 255)
 
 
+def load_frame(path: Path):
+    if path.stat().st_size > MAX_ENCODED_BYTES:
+        raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+    with open_art(path, ring=True) as raw:
+        frame = decode_artwork(raw, force_alpha=True)
+    return frame, frame_interior(frame)
+
+
 def silhouette_geometry(cutout: Image.Image):
     """Find rough head center and apparent head width without face detection.
 
@@ -309,12 +561,32 @@ def silhouette_geometry(cutout: Image.Image):
     return float(median(centers)), head_width, float(y0)
 
 
+@dataclass(frozen=True)
+class PreparedTokenFrame:
+    size: int
+    interior: Image.Image
+    frame: Image.Image
+    visible: Image.Image
+
+
+def prepare_token_frame(frame, interior, out_size):
+    """Prepare the invariant ring layers once per frame and output size."""
+    inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    support = interior.point(lambda a: 255 if a else 0).resize(
+        (out_size, out_size), Image.Resampling.NEAREST)
+    inner = ImageChops.multiply(inner, support)
+    resized_frame = frame.resize((out_size, out_size), Image.Resampling.LANCZOS)
+    visible = ImageChops.invert(resized_frame.getchannel('A'))
+    return PreparedTokenFrame(out_size, inner, resized_frame, visible)
+
+
 def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
-            out_size: int = 256, adjust: Adjust | None = None) -> Image.Image:
+            out_size: int = 256, adjust: Adjust | None = None, *, geometry=None,
+            prepared_frame=None) -> Image.Image:
     """Place cutout against a ring, clipping everything outside its interior."""
     if adjust is None:
         adjust = Adjust()
-    center_x, head_width, top_y = silhouette_geometry(cutout)
+    center_x, head_width, top_y = silhouette_geometry(cutout) if geometry is None else geometry
     # Typical tabletop portrait has hair/head ~40% of token width.
     base_scale = .40 * out_size / max(head_width, 1)
     zoom, x, y, gap = map(float, (adjust.zoom, adjust.x, adjust.y, adjust.gap))
@@ -349,12 +621,14 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
             raise ValueError('Масштаб токена слишком велик для безопасной компоновки.')
         scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
         image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
-    inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
-    support = interior.point(lambda a: 255 if a else 0).resize(
-        (out_size, out_size), Image.Resampling.NEAREST)
-    inner = ImageChops.multiply(inner, support)
-    image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), inner))
-    token = Image.alpha_composite(image_layer, frame.resize((out_size, out_size), Image.Resampling.LANCZOS))
+    prepared = prepare_token_frame(frame, interior, out_size) if prepared_frame is None else prepared_frame
+    if prepared.size != out_size:
+        raise ValueError('Размер подготовленной рамки не соответствует размеру токена.')
+    image_layer.putalpha(ImageChops.multiply(image_layer.getchannel('A'), prepared.interior))
+    visible = ImageChops.multiply(image_layer.getchannel('A'), prepared.visible)
+    if visible.getbbox() is None:
+        raise ValueError('Персонаж полностью вне видимой области рамки. Измени положение или масштаб.')
+    token = Image.alpha_composite(image_layer, prepared.frame)
     return token
 
 
@@ -537,8 +811,69 @@ def save_token(image: Image.Image, path: Path, format_name: str = 'WebP',
                              replace=replace))
 
 
-def export_owner(source: Path, kind: str) -> str:
-    return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
+def canonical_placement(adjustment):
+    return {name: float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else value
+            for name, value in asdict(adjustment).items()}
+
+
+def recipe_digest(kind, **settings):
+    payload = json.dumps({'kind': kind, 'algorithm': 1, **settings}, sort_keys=True,
+                         ensure_ascii=True, separators=(',', ':'), allow_nan=False)
+    return hashlib.sha256(payload.encode('ascii')).hexdigest()
+
+
+COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100,
+                            color='sRGB', decoder=2)
+
+
+def extraction_provenance(model, keep_alpha, edge_mode, *, revision=None):
+    """Use the exact observed revision for rendered pixels, current one for freshness."""
+    return (model, keep_alpha, edge_mode, CUTOUT_CACHE_VERSION,
+            model_revision(model) if revision is None else revision)
+
+
+def token_recipe(frame, adjustment, size, format_name, extraction, *, interior=None,
+                 frame_digest=None, interior_digest=None):
+    """Describe both inputs to token composition, including the clipping mask."""
+    if interior is None:
+        interior = frame_interior(frame)
+    digest = frame_digest if frame_digest is not None else hashlib.sha256(frame.tobytes()).hexdigest()
+    mask_digest = (interior_digest if interior_digest is not None
+                   else hashlib.sha256(interior.tobytes()).hexdigest())
+    return recipe_digest('token', frame=digest, frame_size=frame.size, frame_mode=frame.mode,
+                         interior=mask_digest, interior_size=interior.size, interior_mode=interior.mode,
+                         size=size, format=format_name.lower(), placement=canonical_placement(adjustment),
+                         extraction=extraction)
+
+
+def _valid_digest(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+
+
+def export_owner(source: Path, kind: str, *, source_digest=None, recipe=None) -> str:
+    if source_digest is None:
+        return 'TokenForge/2:' + json.dumps([kind, source.name], ensure_ascii=True)
+    if not _valid_digest(source_digest) or (recipe is not None and not _valid_digest(recipe)):
+        raise ValueError('Invalid export provenance')
+    return 'TokenForge/3:' + json.dumps([kind, source.name, source_digest, recipe], ensure_ascii=True)
+
+
+def freshness_warnings(owner, identity, recipe=None):
+    """Ownership authorizes replacement; freshness never grants permission."""
+    if identity is None:
+        return ()
+    if owner[0] < 3:
+        return ('Актуальность старого результата не подтверждена; при необходимости создай его заново.',)
+    messages = []
+    if owner[3] != identity[-1]:
+        messages.append('Исходник изменился; готовый результат устарел.')
+    if recipe is None:
+        messages.append('Не удалось проверить актуальность параметров генерации.')
+    elif owner[4] != recipe:
+        messages.append('Параметры генерации изменились; готовый результат может быть устаревшим.')
+    if messages:
+        messages.append('Существующий файл оставлен без изменений.')
+    return tuple(messages)
 
 
 class InvalidExportError(OSError):
@@ -549,18 +884,22 @@ def _parse_owner(owner):
     if not isinstance(owner, str) or len(owner) > 4096:
         return None
     prefix, separator, payload = owner.partition(':')
-    version = {'TokenForge/1': 1, 'TokenForge/2': 2}.get(prefix)
+    version = {'TokenForge/1': 1, 'TokenForge/2': 2, 'TokenForge/3': 3}.get(prefix)
     if not separator or version is None:
         return None
     try:
         values = json.loads(payload)
     except (ValueError, RecursionError):
         return None
-    if (isinstance(values, list) and len(values) == 2
+    if (isinstance(values, list) and len(values) == (4 if version == 3 else 2)
             and values[0] in ('token', 'item', 'copy')
             and isinstance(values[1], str) and values[1]
             and not any(c in values[1] for c in ('/', '\\', ':', '\0'))
             and values[1] not in ('.', '..')):
+        if version == 3:
+            if not _valid_digest(values[2]) or (values[3] is not None and not _valid_digest(values[3])):
+                return None
+            return version, *values
         return version, values[0], values[1]
     return None
 
@@ -568,7 +907,7 @@ def _parse_owner(owner):
 def _probe_owner(stream, *, require_pixels=False):
     """Discovery is not evidence that the pixels are decodable."""
     try:
-        with Image.open(stream) as stored:
+        with open_art(stream, formats=('PNG', 'WEBP')) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if owner and require_pixels:
                 try:
@@ -582,6 +921,58 @@ def _probe_owner(stream, *, require_pixels=False):
         return None
 
 
+def _probe_webp_owner(stream, size):
+    """Read only bounded RIFF headers and EXIF, never create a WebP decoder.
+
+    Discovery can recognize old exports even if current pixel limits would
+    reject them. This is not pixel validation or authorization to replace.
+    """
+    header = stream.read(12)
+    if len(header) != 12 or header[:4] != b'RIFF' or header[8:] != b'WEBP':
+        return None
+    end = 8 + struct.unpack_from('<I', header, 4)[0]
+    if not 12 <= end <= size:
+        return None
+    owner = None
+    image_chunk = False
+    for index in range(4096):
+        if stream.tell() == end:
+            return owner if image_chunk else None
+        if end - stream.tell() < 8:
+            return None
+        chunk = stream.read(8)
+        if len(chunk) != 8:
+            return None
+        kind, length = struct.unpack('<4sI', chunk)
+        next_chunk = stream.tell() + length + (length & 1)
+        if next_chunk > end:
+            return None
+        if index == 0:
+            # EXIF is only supported by extended WebP containers.
+            if kind != b'VP8X' or length != 10:
+                return None
+            flags = stream.read(10)
+            if len(flags) != 10 or not flags[0] & 0x08:
+                return None
+        elif kind == b'EXIF':
+            # TokenForge ownership strings are <= 4096 characters. Allow
+            # ample space for legacy EXIF, but never read an arbitrary chunk.
+            if not 0 < length <= 1024 * 1024 or owner is not None:
+                return None
+            data = stream.read(length)
+            if len(data) != length:
+                return None
+            exif = Image.Exif()
+            exif.load(data)
+            owner = _parse_owner(exif.get(270))
+            if owner is None:
+                return None
+        elif kind in (b'VP8 ', b'VP8L', b'ANMF') and length:
+            image_chunk = True
+        stream.seek(next_chunk)
+    return None
+
+
 def read_export_owner(destination: Path, *, identity=None, require_pixels=False) -> tuple | None:
     """For mutations, inspect the exact bytes that were fingerprinted."""
     if destination.suffix.lower() not in ('.png', '.webp'):
@@ -589,7 +980,21 @@ def read_export_owner(destination: Path, *, identity=None, require_pixels=False)
     if identity is not None:
         with source_snapshot(destination, identity) as snapshot:
             return _probe_owner(snapshot, require_pixels=require_pixels)
-    return _probe_owner(destination, require_pixels=require_pixels)
+    try:
+        with destination.open('rb') as stream:
+            size = os.fstat(stream.fileno()).st_size
+            if size > MAX_ENCODED_BYTES:
+                return None
+            header = stream.read(12)
+            stream.seek(0)
+            if not require_pixels and header[:4] == b'RIFF' and header[8:] == b'WEBP':
+                return _probe_webp_owner(stream, size)
+            return _probe_owner(stream, require_pixels=require_pixels)
+    except InvalidExportError:
+        raise
+    except (OSError, ValueError, SyntaxError, TypeError, RecursionError, struct.error,
+            IndexError, OverflowError, Image.DecompressionBombError):
+        return None
 
 
 def recorded_source_matches(source: Path, filename: str) -> bool:
@@ -614,7 +1019,7 @@ def is_owned_export(destination: Path, source: Path, kind: str, *, identity=None
 def _owner_matches(owner, source, kind):
     if not owner or owner[1] != kind:
         return False
-    if owner[0] == 2:
+    if owner[0] >= 2:
         return recorded_source_matches(source, owner[2])
     if owner[2].casefold() != source.stem.casefold():
         return False
@@ -631,16 +1036,16 @@ def inspect_existing_export(destination, source, kind):
         return identity, _owner_matches(owner, source, kind)
 
 
-def read_owned_export_image(destination, source, kind):
+def read_owned_export_image(destination, source, kind, *, include_owner=False):
     """Decode only the same verified bytes whose ownership was inspected."""
     with fingerprinted_snapshot(destination) as (identity, snapshot):
-        with Image.open(snapshot) as stored:
+        with open_art(snapshot, formats=('PNG', 'WEBP')) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if not _owner_matches(owner, source, kind):
                 return None
             image = stored.convert('RGBA')
     assert_source_identity(destination, identity)
-    return image
+    return (image, owner) if include_owner else image
 
 
 def _windows_stem_names(folder, stem):
@@ -752,7 +1157,8 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
 def validate_skip(destination, source, kind, *, identity=None):
     identity = identity if identity is not None else source_identity(destination)
     try:
-        owned = is_owned_export(destination, source, kind, identity=identity, require_pixels=True)
+        owner = read_export_owner(destination, identity=identity, require_pixels=True)
+        owned = _owner_matches(owner, source, kind)
     except InvalidExportError as exc:
         hint = ('Перемести или удали повреждённую WebP-копию и повтори обработку.'
                 if kind == 'copy' else 'Отключи пропуск готовых изображений и повтори обработку.')
@@ -761,11 +1167,19 @@ def validate_skip(destination, source, kind, *, identity=None):
         hint = ' Перемести или переименуй существующий файл и повтори обработку.' if kind == 'copy' else ''
         raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.{hint}')
     assert_source_identity(destination, identity)
+    return owner
 
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
                    *, skip_exists: bool, approved_identity: tuple | None = None,
-                   input_identity: tuple | None = None, collision_index=None) -> Publication:
+                   input_identity: tuple | None = None, collision_index=None, recipe=None,
+                   skip_recipe=None) -> Publication:
+    # A late competing publication must be compared with the current settings,
+    # not the actual extraction recipe of pixels that we did not publish.
+    def skipped(owner):
+        current = skip_recipe() if skip_recipe is not None else recipe
+        return Publication(False, freshness_warnings(owner, input_identity, current))
+
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
     prior = source_identity(destination) if destination.exists() else None
@@ -778,15 +1192,17 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
         if skip_exists and owned:
             if collision_index is not None:
                 ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-            validate_skip(destination, source, kind, identity=prior)
+            owner = validate_skip(destination, source, kind, identity=prior)
             if input_identity is not None:
                 assert_source_identity(source, input_identity)
-            return Publication(False)
+            return skipped(owner)
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
     exif = Image.Exif()
-    exif[270] = export_owner(source, kind)
+    exif[270] = export_owner(source, kind,
+                             source_digest=input_identity[-1] if input_identity is not None else None,
+                             recipe=recipe)
     if destination.suffix.lower() not in ('.png', '.webp'):
         raise ValueError('Результат TokenForge должен иметь расширение PNG или WebP.')
     fmt = 'PNG' if destination.suffix.lower() == '.png' else 'WEBP'
@@ -810,8 +1226,9 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
             raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
         if collision_index is not None:
             ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-        validate_skip(destination, source, kind)
+        owner = validate_skip(destination, source, kind)
         check_input()
+        return skipped(owner)
     return published
 
 
@@ -853,22 +1270,26 @@ def assert_approval(destination, approved):
 
 
 def save_original_webp(source: Path, *, collision_index=None, input_identity=None,
-                       approval_guard=None) -> Publication:
+                       approval_guard=None, captured=None) -> Publication:
     """Create a high-quality copy, preserving alpha and image dimensions.
 
     Returns True only if a new file was written. Never overwrite an existing
     WebP (which might be a hand-edited asset).
     """
     identity = input_identity if input_identity is not None else source_identity(source)
-    assert_source_identity(source, identity)
+    if captured is not None and (captured.path != source or captured.identity != identity):
+        raise ValueError('Снимок не соответствует исходнику.')
     if approval_guard is not None:
         approval_guard()
     if source.suffix.lower() == '.webp':
         return Publication(False)
     destination = original_webp_path(source)
     if destination.exists():
-        validate_skip(destination, source, 'copy')
-        return Publication(False)
+        if collision_index is not None:
+            ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
+        owner = validate_skip(destination, source, 'copy')
+        assert_source_identity(source, identity)
+        return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
     if collision_index is not None:
         ensure_no_source_collision(destination, source, 'copy', collision_index)
     def guard():
@@ -877,24 +1298,25 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
         assert_source_identity(source, identity)
         if approval_guard is not None:
             approval_guard()
-    with source_snapshot(source, identity) as snapshot, Image.open(snapshot) as raw:
-        artwork = ImageOps.exif_transpose(raw)
-        # Preserve true transparency without accidentally adding an opaque alpha.
-        if 'A' in artwork.getbands() or 'transparency' in artwork.info:
-            artwork = artwork.convert('RGBA')
-        else:
-            artwork = artwork.convert('RGB')
+    capture_context = CapturedArtwork(source, identity) if captured is None else nullcontext(captured)
+    with capture_context as capture, capture.open() as raw:
+        artwork = decode_artwork(raw)
+        color_options = {'icc_profile': artwork.info['icc_profile']} if artwork.info.get('icc_profile') else {}
         exif = Image.Exif()
-        exif[270] = export_owner(source, 'copy')
+        exif[270] = export_owner(source, 'copy', source_digest=identity[-1], recipe=COPY_RECIPE)
         created = atomic_write(destination,
                                lambda fp: artwork.save(fp, format='WEBP', quality=95,
-                                                       method=6, alpha_quality=100, exif=exif),
+                                                       method=6, alpha_quality=100, exif=exif,
+                                                       **color_options),
                                replace=False, before_publish=guard,
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
         if not created:
-            validate_skip(destination, source, 'copy')
+            if collision_index is not None:
+                ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
+            owner = validate_skip(destination, source, 'copy')
             assert_source_identity(source, identity)
+            return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
         return created
 
 
@@ -924,6 +1346,7 @@ def list_source_images(folder: Path, exclude: Path | None = None, *, cancel_even
 class LoadedCutout:
     image: Image.Image
     identity: tuple
+    extraction: tuple | None = None
 
 
 @dataclass
@@ -948,7 +1371,8 @@ class BatchResult:
 
 def export_images(files, get_cutout, output_path, renderer, *, kind,
                   skip_exists=True, convert_original=True, cancel_event=None,
-                  on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
+                  on_progress=None, approved_outputs=None, expected_inputs=None,
+                  recipe_for=None, captured_loader=None) -> BatchResult:
     """One export pipeline for both composition modes.
 
     Capture the source version before invoking the loader and carry it
@@ -963,14 +1387,13 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             break
         if on_progress:
             on_progress(index, len(files), f'[{index + 1}/{len(files)}] {source.name}')
-        destination = output_path(source)
-        approved = (approved_outputs or {}).get(destination)
         try:
-            identity = (expected_inputs or {}).get(str(source))
-            if identity is None:
-                identity = source_identity(source)
-            else:
-                assert_source_identity(source, identity)
+            destination = output_path(source)
+            approved = (approved_outputs or {}).get(destination)
+            identity = source_identity(source)
+            expected = (expected_inputs or {}).get(str(source))
+            if expected is not None and expected != identity:
+                raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
             # A stale approval must not trigger either of this job's writes.
             assert_approval(destination, approved)
         except Exception as exc:
@@ -978,51 +1401,68 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             if on_progress:
                 on_progress(index+1, len(files), f'Выполнено: {index + 1}/{len(files)}')
             continue
-        if convert_original:
+        with CapturedArtwork(source, identity) as captured:
+            if convert_original:
+                try:
+                    publication = save_original_webp(
+                        source, collision_index=folders, input_identity=identity, captured=captured,
+                        approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
+                    result.converted += int(bool(publication))
+                    copy_destination = original_webp_path(source)
+                    result.warnings.extend(f'{source.name}: {copy_destination.name}: {warning}'
+                                           for warning in publication.warnings)
+                except StaleApprovalError as exc:
+                    result.record_error(source, 'преобразование оригинала', exc)
+                    if on_progress:
+                        on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
+                    continue
+                except Exception as exc:
+                    result.record_error(source, 'преобразование оригинала', exc)
             try:
-                publication = save_original_webp(
-                    source, collision_index=folders, input_identity=identity,
-                    approval_guard=(lambda: assert_approval(destination, approved)) if approved is not None else None)
-                result.converted += int(bool(publication))
-                result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
-            except StaleApprovalError as exc:
-                result.record_error(source, 'преобразование оригинала', exc)
-                if on_progress:
-                    on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
-                continue
-            except Exception as exc:
-                result.record_error(source, 'преобразование оригинала', exc)
-        try:
-            assert_approval(destination, approved)
-            assert_source_identity(source, identity)
-            ensure_no_source_collision(destination, source, kind, folders)
-            if skip_exists and destination.exists():
-                ensure_no_source_collision(destination, source, kind, folders, live=True)
-                validate_skip(destination, source, kind)
-                assert_source_identity(source, identity)
-                result.skipped += 1
-            else:
-                loaded = get_cutout(source)
-                if isinstance(loaded, LoadedCutout):
-                    if loaded.identity != identity:
-                        raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
-                    cutout = loaded.image
-                    identity = loaded.identity
-                else:
-                    cutout = loaded
-                assert_source_identity(source, identity)
-                image = renderer(cutout, source)
-                publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
-                                             approved_identity=approved,
-                                             input_identity=identity, collision_index=folders)
-                if publication:
-                    result.created += 1
-                    result.outputs.append(destination)
-                    result.warnings.extend(f'{source.name}: {warning}' for warning in publication.warnings)
-                else:
+                assert_approval(destination, approved)
+                ensure_no_source_collision(destination, source, kind, folders)
+                if skip_exists and destination.exists():
+                    ensure_no_source_collision(destination, source, kind, folders, live=True)
+                    owner = validate_skip(destination, source, kind)
+                    assert_source_identity(source, identity)
+                    recipe = recipe_for(source) if recipe_for is not None else None
+                    result.warnings.extend(f'{source.name}: {destination.name}: {w}'
+                                           for w in freshness_warnings(owner, identity, recipe))
                     result.skipped += 1
-        except Exception as exc:
-            result.record_error(source, stage, exc)
+                else:
+                    recipe = recipe_for(source) if recipe_for is not None else None
+                    if captured_loader is None:
+                        # Legacy injectable loader contract retains the old guard.
+                        assert_source_identity(source, identity)
+                        loaded = get_cutout(source)
+                        assert_source_identity(source, identity)
+                    else:
+                        loaded = captured_loader(captured)
+                    if isinstance(loaded, LoadedCutout):
+                        if loaded.identity != identity:
+                            raise OSError(f'Исходный файл изменился во время обработки: {source.name}')
+                        cutout = loaded.image
+                        identity = loaded.identity
+                    else:
+                        cutout = loaded
+                    image = renderer(cutout, source)
+                    # Use the revision that actually produced the pixels, not
+                    # an observation made before first download or model reload.
+                    actual = loaded.extraction if isinstance(loaded, LoadedCutout) else None
+                    if recipe_for is not None and (recipe is None or actual is not None):
+                        recipe = recipe_for(source, actual)
+                    publication = save_generated(image, destination, source, kind, skip_exists=skip_exists,
+                                                 approved_identity=approved,
+                                                 input_identity=identity, collision_index=folders, recipe=recipe,
+                                                 skip_recipe=(lambda: recipe_for(source)) if recipe_for is not None else None)
+                    result.warnings.extend(f'{source.name}: {destination.name}: {warning}' for warning in publication.warnings)
+                    if publication:
+                        result.created += 1
+                        result.outputs.append(destination)
+                    else:
+                        result.skipped += 1
+            except Exception as exc:
+                result.record_error(source, stage, exc)
         if on_progress:
             on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
     return result
@@ -1033,13 +1473,41 @@ def export_batch(files: list[Path], get_cutout, frame: Image.Image | None,
                  out_size: int = 256, format_name: str = 'webp',
                  skip_exists: bool = True, convert_original: bool = True,
                  cancel_event=None, on_progress=None, approved_outputs=None,
-                 frame_loader=None, expected_inputs=None) -> BatchResult:
-    def render(cutout, source):
+                 frame_loader=None, expected_inputs=None, extraction_recipe=None,
+                 captured_loader=None) -> BatchResult:
+    frame_digest = interior_digest = None
+    prepared_frame = None
+    def ensure_frame():
         nonlocal frame, interior
         if frame is None and frame_loader is not None:
             frame, interior = frame_loader()
-        return compose(cutout, frame, interior, out_size, adjustments[source])
+        return frame
+    def recipe_for(source, actual=None):
+        nonlocal frame_digest, interior_digest
+        try:
+            if ensure_frame() is None or interior is None:
+                return None
+        except (OSError, ValueError, Image.DecompressionBombError):
+            # Preserve the ability to skip existing valid pixels without an
+            # available frame; rendering a new result still requires it.
+            return None
+        if frame_digest is None:
+            frame_digest = hashlib.sha256(frame.tobytes()).hexdigest()
+            interior_digest = hashlib.sha256(interior.tobytes()).hexdigest()
+        extraction = actual if actual is not None else (
+            extraction_recipe() if callable(extraction_recipe) else extraction_recipe)
+        return token_recipe(frame, adjustments[source], out_size, format_name, extraction,
+                            interior=interior, frame_digest=frame_digest, interior_digest=interior_digest)
+    def render(cutout, source):
+        nonlocal prepared_frame
+        if ensure_frame() is None or interior is None:
+            raise ValueError('Выбери корректное PNG-кольцо.')
+        if prepared_frame is None:
+            prepared_frame = prepare_token_frame(frame, interior, out_size)
+        return compose(cutout, frame, interior, out_size, adjustments[source],
+                       prepared_frame=prepared_frame)
     return export_images(files, get_cutout, lambda p: token_output_path(p, format_name),
                          render, kind='token', skip_exists=skip_exists,
                          convert_original=convert_original, cancel_event=cancel_event,
-                         on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs)
+                         on_progress=on_progress, approved_outputs=approved_outputs, expected_inputs=expected_inputs,
+                         recipe_for=recipe_for, captured_loader=captured_loader)

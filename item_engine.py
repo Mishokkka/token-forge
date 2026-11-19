@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, export_images
+from token_engine import BatchResult, export_images, recipe_digest, canonical_placement
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -121,7 +121,7 @@ def _orient(cutout: Image.Image, adjust: ItemAdjust) -> Image.Image:
 
 
 def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
-                 size: int = ITEM_SIZE, stroke_px: int = ITEM_STROKE) -> Image.Image:
+                 size: int = ITEM_SIZE, stroke_px: int = ITEM_STROKE, *, prepared=None) -> Image.Image:
     """Fit complete item, preserve border, and make all UI sliders meaningful.
 
     Zoom=100 means the maximum size *at the requested center*, so a zoom
@@ -137,7 +137,7 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     if not all(math.isfinite(float(value)) for value in (adjust.x, adjust.y, adjust.rotation)):
         raise ValueError('Некорректные параметры положения или поворота.')
 
-    image = _orient(cutout, adjust)
+    image = _orient(cutout, adjust) if prepared is None else prepared
     # Center: the user requested >=5% whitespace, diagonals use a small
     # visual margin. Three black outline pixels need their own safe space.
     margin = math.ceil(size * .05) if adjust.layout == 'По центру' else round(size * .018)
@@ -186,11 +186,21 @@ def outline_subject(canvas, stroke_px):
     return border
 
 
+def item_recipe(adjustment, extraction):
+    return recipe_digest('item', size=ITEM_SIZE, stroke=ITEM_STROKE,
+                         placement=canonical_placement(adjustment), extraction=extraction)
+
+
 def export_items(files, get_cutout, adjustments: dict[Path, ItemAdjust],
                  skip_exists=True, convert_original=True, cancel_event=None,
-                 on_progress=None, approved_outputs=None, expected_inputs=None) -> BatchResult:
+                 on_progress=None, approved_outputs=None, expected_inputs=None, extraction_recipe=None,
+                 captured_loader=None) -> BatchResult:
     return export_images(files, get_cutout, item_output_path,
                          lambda image, source: compose_item(image, adjustments[source]),
                          kind='item', skip_exists=skip_exists, convert_original=convert_original,
                          cancel_event=cancel_event, on_progress=on_progress,
-                         approved_outputs=approved_outputs, expected_inputs=expected_inputs)
+                         approved_outputs=approved_outputs, expected_inputs=expected_inputs,
+                         captured_loader=captured_loader,
+                         recipe_for=lambda source, actual=None: item_recipe(
+                             adjustments[source], actual if actual is not None else (
+                                 extraction_recipe() if callable(extraction_recipe) else extraction_recipe)))

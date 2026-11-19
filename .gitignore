@@ -1,0 +1,32 @@
+# Local Python and build products
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+
+# Local settings, caches, models and temporary recovery output
+settings.json
+settings.json.*
+*.log
+*.onnx
+*.pth
+*.safetensors
+.u2net/
+.rembg/
+cutouts/
+.tokenforge-recovery*/
+.tokenforge-*.tmp
+*.lock
+
+# Editors, operating systems and local archives
+.vscode/
+.idea/
+.env
+Thumbs.db
+desktop.ini
+*.zip

@@ -19,6 +19,40 @@ class CacheTests(unittest.TestCase):
         Image.new('RGB', (170, 220), (60, 50, 40)).save(self.source)
         self.cache = DiskCutoutCache(self.directory / 'cache')
 
+    def test_memory_cache_evicts_by_decoded_bytes(self):
+        from cutout_service import remember
+        memory = {}
+        image = Image.new('RGBA', (20, 20), 'red')
+        remember(memory, 'first', image, byte_limit=2000)
+        remember(memory, 'second', image, byte_limit=2000)
+        self.assertEqual(list(memory), ['second'])
+        remember(memory, 'oversize', Image.new('RGBA', (50, 50)), byte_limit=2000)
+        self.assertEqual(list(memory), ['second'])
+
+    def test_model_revision_invalidates_disk_cache(self):
+        with patch('token_engine.model_revision', return_value=('version-one',)):
+            first = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
+        with patch('token_engine.model_revision', return_value=('version-two',)):
+            second = self.cache.path_for(self.source, 'birefnet-general', False, 'e')
+        self.assertNotEqual(first, second)
+
+    def test_disk_prune_only_removes_old_owned_cache_names(self):
+        import os
+        self.cache.directory.mkdir()
+        keep = self.cache.directory / 'notes.png'
+        keep.write_bytes(b'foreign')
+        one = self.cache.directory / ('a' * 64 + '.png')
+        two = self.cache.directory / ('b' * 64 + '.png')
+        for path in (one, two):
+            path.write_bytes(b'cache')
+        os.utime(one, (100, 100))
+        os.utime(two, (200, 200))
+        cache = DiskCutoutCache(self.cache.directory, max_bytes=5, max_entries=1)
+        cache.prune()
+        self.assertFalse(one.exists())
+        self.assertTrue(two.exists())
+        self.assertEqual(keep.read_bytes(), b'foreign')
+
     def test_disk_cache_persists_full_rgba_unchanged(self):
         image = Image.new('RGBA', (170, 220), (11, 22, 33, 0))
         image.putpixel((20, 30), (71, 92, 154, 157))
@@ -77,9 +111,181 @@ class CacheTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 app._get_cutout(self.source, 'birefnet-general', False, 'e')
         extracted.assert_called_once()
-        self.assertNotIn(key, app.cache)
+        self.assertFalse(app.cache)
         self.assertFalse(original_disk.exists())
         self.assertIsNone(self.cache.load(self.source, 'birefnet-general', False, 'e'))
+
+    def test_model_reload_requires_stable_revision_and_publishes_under_lock(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        identity = source_identity(self.source)
+        model = 'birefnet-general'
+        revision = ['old']
+        memory, sessions = {}, {}
+        held = []
+        @contextmanager
+        def lock(*args, **kwargs):
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        disk = Mock()
+        disk.directory = self.cache.directory
+        disk.load.return_value = None
+        def save(*args, **kwargs):
+            self.assertTrue(held)
+            self.assertEqual(kwargs['revision'], ('new',))
+        disk.save.side_effect = save
+        first, second = object(), object()
+        def make_session(name):
+            if revision[0] == 'old':
+                revision[0] = 'new'
+                return first
+            return second
+        factory = Mock(side_effect=make_session)
+        cutout = Image.new('RGBA', (10, 10), 'red')
+        extract = Mock(return_value=cutout)
+        with patch('cutout_service.model_revision', side_effect=lambda name: tuple(revision)), \
+             patch('cutout_service.process_lock', side_effect=lock):
+            result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
+                                 disk_cache=disk, memory=memory, sessions=sessions, decode=read_image,
+                                 extract=extract, session_factory=factory)
+        self.assertIs(result.image, cutout)
+        self.assertEqual(result.revision, ('new',))
+        self.assertEqual(factory.call_count, 2)
+        self.assertIs(extract.call_args.args[1], second)
+        self.assertEqual(sessions[model], (('new',), second))
+        disk.save.assert_called_once()
+
+    def test_transparent_cutout_survives_unavailable_inference_lock(self):
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        model = 'birefnet-general'
+        identity = source_identity(self.source)
+        disk = Mock(directory=self.cache.directory)
+        disk.load.return_value = None
+        transparent = Image.new('RGBA', (10, 10), (20, 30, 40, 80))
+        extract, factory, verify = Mock(), Mock(), Mock()
+        decode = Mock(return_value=transparent)
+        def load(keep_alpha=True):
+            return load_cutout(self.source, model, keep_alpha, 'e',
+                               key=(*identity, model, keep_alpha, 'e'),
+                               disk_cache=disk, memory={}, sessions={}, decode=decode,
+                               extract=extract, session_factory=factory, verify=verify)
+        with patch('cutout_service.process_lock', side_effect=PermissionError('read-only')):
+            self.assertIs(load().image, transparent)
+            verify.assert_called_once()
+            decode.return_value = Image.new('RGBA', (10, 10), 'red')
+            with self.assertRaises(PermissionError):
+                load()
+            decode.reset_mock()
+            with self.assertRaises(PermissionError):
+                load(False)
+            decode.assert_not_called()
+            decode.return_value = transparent
+            verify.side_effect = OSError('source changed')
+            with self.assertRaisesRegex(OSError, 'source changed'):
+                load()
+        disk.save.assert_not_called()
+        extract.assert_not_called()
+        factory.assert_not_called()
+
+    def test_model_revision_matches_empty_rembg_and_legacy_roots(self):
+        import os
+        from local_models import model_revision
+        model = 'birefnet-general'
+        # An empty REMBG_HOME resolves relative to the current directory.
+        old_cwd = Path.cwd()
+        try:
+            os.chdir(self.directory)
+            root = Path('models') / model
+            root.mkdir(parents=True)
+            weights = root / (model + '.onnx')
+            weights.write_bytes(b'one')
+            with patch.dict(os.environ, {'REMBG_HOME': '', 'XDG_DATA_HOME': ''}, clear=True):
+                before = model_revision(model)
+                weights.write_bytes(b'changed')
+                self.assertNotEqual(before, model_revision(model))
+            flat = Path(model + '.onnx')
+            flat.write_bytes(b'old')
+            with patch.dict(os.environ, {'U2NET_HOME': '', 'REMBG_HOME': 'other'}, clear=True):
+                before = model_revision(model)
+                flat.write_bytes(b'new flat')
+                self.assertNotEqual(before, model_revision(model))
+        finally:
+            os.chdir(old_cwd)
+
+    def test_contended_inference_lock_only_delays_art_that_needs_inference(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        model = 'birefnet-general'
+        identity = source_identity(self.source)
+        transparent = Image.new('RGBA', (10, 10), (20, 30, 40, 80))
+        opaque = Image.new('RGBA', (10, 10), 'red')
+        waiting, held = [], []
+        @contextmanager
+        def lock(path, timeout):
+            waiting.append(timeout)
+            if timeout == 0:
+                raise TimeoutError('contended')
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        for image, cache_hit in ((transparent, False), (opaque, True), (opaque, False)):
+            with self.subTest(alpha=image.getpixel((0, 0))[3], cache_hit=cache_hit):
+                waiting.clear()
+                disk = Mock(directory=self.cache.directory)
+                disk.load.side_effect = [None, transparent if cache_hit else None]
+                decode = Mock(return_value=image)
+                def infer(*args):
+                    self.assertTrue(held)
+                    return transparent
+                extract, factory = Mock(side_effect=infer), Mock(return_value=object())
+                with patch('cutout_service.process_lock', side_effect=lock):
+                    result = load_cutout(self.source, model, True, 'e',
+                                         key=(*identity, model, True, 'e'),
+                                         disk_cache=disk, memory={}, sessions={}, decode=decode,
+                                         extract=extract, session_factory=factory)
+                self.assertIs(result.image, transparent)
+                decode.assert_called_once()
+                self.assertFalse(held)
+                if image is transparent:
+                    self.assertEqual(waiting, [0])
+                    extract.assert_not_called()
+                    disk.save.assert_not_called()
+                else:
+                    self.assertEqual(waiting, [0, 120])
+                    self.assertEqual(disk.load.call_count, 2)
+                    self.assertEqual(extract.call_count, int(not cache_hit))
+                    self.assertEqual(disk.save.call_count, int(not cache_hit))
+
+    def test_second_cache_hit_does_not_reencode_or_run_inference(self):
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        identity = source_identity(self.source)
+        model = 'birefnet-general'
+        image = Image.new('RGBA', (10, 10), 'red')
+        disk = Mock()
+        disk.directory = self.cache.directory
+        disk.load.side_effect = [None, image]
+        extract, factory, decode = Mock(), Mock(), Mock()
+        result = load_cutout(self.source, model, False, 'e', key=(*identity, model, False, 'e'),
+                             disk_cache=disk, memory={}, sessions={}, decode=decode,
+                             extract=extract, session_factory=factory)
+        self.assertIs(result.image, image)
+        disk.save.assert_not_called()
+        decode.assert_not_called()
+        extract.assert_not_called()
+        factory.assert_not_called()
 
     def test_snapshot_decodes_captured_bytes_even_if_path_is_replaced(self):
         from token_engine import source_identity, source_snapshot, read_image
@@ -104,11 +310,24 @@ class CacheTests(unittest.TestCase):
         app.busy = False
         app.worker = None
         app.preview_generation = 0
+        app.render_serial = 0
+        app.pending_render = None
+        from preview_renderer import PreviewRenderer
+        app.preview_renderer = PreviewRenderer()
+        app.preview_stamp = None
+        app.last_full_check = 0.0
         app.preview_cached_only = False
         app.preview_retry = False
+        app.preview_saved_only = False
+        app.preview_export_stamp = None
+        app.frame_loading = False
+        app.frame_generation = 0
+        app.pending_frame = None
+        app.size = SimpleNamespace(get=lambda: '256')
         app.scan_running = False
         app.scan_generation = 0
         app.pending_scan = None
+        app.pending_export = None
         app.active_scan = None
         app.folder = None
         app.frame_path = Path(__file__).parent / 'RingT.png'
@@ -191,7 +410,10 @@ class CacheTests(unittest.TestCase):
                             'skip_exists': True, 'convert_original': False}.items():
             setattr(app, name, control(value))
         app._adjust_for = lambda path: Adjust()
-        app._get_cutout = lambda path, *args: (read_image(path), source_identity(path) + args)
+        app._get_cutout = lambda path, *args, captured=None: (
+            captured.decode() if captured is not None else read_image(path),
+            (captured.identity if captured is not None else source_identity(path)) + args
+            + (__import__('local_models').model_revision(args[0]),))
         destination = token_output_path(self.source)
         save_generated(Image.new('RGBA', (256, 256), 'red'), destination, self.source,
                        'token', skip_exists=False)
@@ -285,12 +507,12 @@ class CacheTests(unittest.TestCase):
         request = app._preview_request()
         app.preview_generation += 1
         app.selected = None
-        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key)))
+        app.events.put(('preview', (request, Image.new('RGBA', (1, 1)), key, None, 0.0, ())))
         with patch.object(app, '_cache_key', side_effect=AssertionError('GUI hashed source')):
             app._poll()
         self.assertFalse(app.busy)
         self.assertFalse(app.preview_pending)
-        app.root.after.assert_called_once_with(120, app._poll)
+        app.root.after.assert_called_once_with(40, app._poll)
 
     def test_unmarked_saved_result_is_not_shown(self):
         existing = token_output_path(self.source)
@@ -329,7 +551,10 @@ class CacheTests(unittest.TestCase):
         from unittest.mock import Mock
         app = self.make_mock_app()
         app.selected = self.source
-        app.frame = object()
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        from token_engine import Adjust
+        app._current_adjust = lambda: Adjust()
         app.status, app._show_token = Mock(), Mock()
         app.events = queue.Queue()
         for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
@@ -338,7 +563,7 @@ class CacheTests(unittest.TestCase):
         saved = Image.new('RGBA', (256, 256), 'red')
         app._get_cutout = Mock(return_value=(None, ('key',)))
         with patch('tokenforge.threading.Thread') as launch, \
-             patch.object(app, '_load_saved_preview', return_value=saved) as load:
+             patch.object(app, '_load_saved_preview', return_value=(saved, (2, 'token', self.source.name))) as load:
             app._request_preview(cached_only=True)
             load.assert_not_called()
             launch.call_args.kwargs['target']()
@@ -354,19 +579,111 @@ class CacheTests(unittest.TestCase):
         app._show_token.assert_not_called()
 
     def test_render_failure_clears_canvas_but_retains_cutout(self):
+        import queue
         from unittest.mock import Mock
         app = self.make_mock_app()
         app.current_cutout = Image.new('RGBA', (50, 50), (255, 0, 0, 7))
         app._show_token, app.status = Mock(), Mock()
+        app.events = queue.Queue()
+        app.pending_export = None
+        app.selected = self.source
         app.show_cutout = SimpleNamespace(get=lambda: False)
         app.work_mode = SimpleNamespace(get=lambda: 'item')
         from item_engine import ItemAdjust
         app._current_item_adjust = lambda: ItemAdjust(clean_noise=True)
-        self.assertFalse(app._render())
-        app._show_token.assert_called_once_with(None)
-        self.assertIsNotNone(app.current_cutout)
-        app._current_item_adjust = lambda: ItemAdjust(clean_noise=False)
-        self.assertTrue(app._render())
+        with patch('tokenforge.threading.Thread') as launch:
+            self.assertTrue(app._render())
+            app._show_token.assert_not_called()
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_called_once_with(None)
+            self.assertIsNotNone(app.current_cutout)
+            app._current_item_adjust = lambda: ItemAdjust(clean_noise=False)
+            self.assertTrue(app._render())
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            self.assertIsInstance(app._show_token.call_args.args[0], Image.Image)
+
+    def test_frame_load_is_async_and_superseded_results_are_ignored(self):
+        import queue
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        app.events = queue.Queue()
+        app.status, app.ring_label = Mock(), Mock()
+        app._refresh_frame_sources = Mock()
+        app._schedule_save = Mock()
+        first, second = self.directory / 'first.png', self.directory / 'second.png'
+        frame = Image.new('RGBA', (32, 32))
+        mask = Image.new('L', (32, 32))
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch('tokenforge.load_frame', return_value=(frame, mask)) as load:
+            app._request_frame(first)
+            older = launch.call_args.kwargs['target']
+            load.assert_not_called()
+            app._request_frame(second)
+            older()
+            app._handle_worker_event(*app.events.get_nowait())
+            self.assertEqual(launch.call_count, 2)
+            app._refresh_frame_sources.assert_not_called()
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+        self.assertEqual(app.frame_path, second)
+        app._refresh_frame_sources.assert_called_once()
+        app._schedule_save.assert_called_once()
+
+    def test_slider_burst_coalesces_and_rejects_old_render(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust
+        app = self.make_mock_app()
+        app.pending_export = None
+        app.current_cutout = Image.new('RGBA', (100, 100), 'red')
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.events = queue.Queue()
+        app.status, app._show_token = Mock(), Mock()
+        app.show_cutout = SimpleNamespace(get=lambda: False)
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        app._current_adjust = lambda: Adjust()
+        with patch('tokenforge.threading.Thread') as launch:
+            app._render()
+            first = launch.call_args.kwargs['target']
+            for zoom in (110, 120, 130):
+                app._current_adjust = lambda zoom=zoom: Adjust(zoom=zoom)
+                app._render()
+            self.assertEqual(launch.call_count, 1)
+            self.assertEqual(app.pending_render.adjustment.zoom, 130)
+            first()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_not_called()
+            self.assertEqual(launch.call_count, 2)
+            launch.call_args.kwargs['target']()
+            app._handle_worker_event(*app.events.get_nowait())
+            app._show_token.assert_called_once()
+
+    def test_preview_geometry_reused_for_placement_only(self):
+        from preview_renderer import PreviewJob, PreviewRenderer
+        from token_engine import Adjust, silhouette_geometry, prepare_token_frame, compose
+        image = Image.new('RGBA', (100, 120), 'red')
+        frame = read_image(Path(__file__).parent / 'RingT.png')
+        mask = frame_interior(frame)
+        renderer = PreviewRenderer()
+        with patch('preview_renderer.silhouette_geometry', wraps=silhouette_geometry) as geometry, \
+             patch('preview_renderer.prepare_token_frame', wraps=prepare_token_frame) as prepare:
+            for serial, zoom in enumerate((80, 100, 130)):
+                adjust = Adjust(zoom=zoom)
+                result = renderer.render(PreviewJob(1, serial, image, 'token', False,
+                                                    frame, mask, adjust), None)
+                self.assertEqual(result.tobytes(), compose(image, frame, mask, 512, adjust).tobytes())
+            self.assertEqual(geometry.call_count, 1)
+            self.assertEqual(prepare.call_count, 1)
+            renderer.render(PreviewJob(2, 5, image.copy(), 'token', False, frame, mask, Adjust()), None)
+            self.assertEqual(geometry.call_count, 2)
+            self.assertEqual(prepare.call_count, 1)
+            renderer.render(PreviewJob(2, 6, image, 'token', False, frame, mask, Adjust(), 256), None)
+            renderer.render(PreviewJob(2, 7, image, 'token', False, frame.copy(), mask, Adjust(), 256), None)
+            self.assertEqual(prepare.call_count, 3)
 
     def test_close_decline_rearms_only_transient_save_failure(self):
         from unittest.mock import Mock
@@ -620,6 +937,64 @@ class CacheTests(unittest.TestCase):
         self.assertEqual(event[0], 'preview')
         self.assertNotEqual(event[1][2], app.current_key)
 
+    def test_unchanged_preview_metadata_defers_full_read_but_not_forever(self):
+        import queue
+        import time
+        from unittest.mock import Mock
+        from token_engine import file_stamp
+        app = self.make_mock_app()
+        app.events, app.status = queue.Queue(), Mock()
+        app.selected = self.source
+        app.frame = object()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'model': 'birefnet-general',
+                            'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+        app.preview_stamp = file_stamp(self.source)
+        app.last_full_check = 100.0
+        with patch('tokenforge.time.monotonic', return_value=100.0) as clock, \
+             patch('tokenforge.threading.Thread') as launch, \
+             patch.object(app, '_cache_key', wraps=app._cache_key) as hash_source:
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+            hash_source.assert_not_called()
+            self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
+            app.busy = False
+            clock.return_value = 131.0
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+            hash_source.assert_called_once()
+            self.assertEqual(app.events.get_nowait()[0], 'preview_unchanged')
+
+    def test_model_revision_invalidates_preview_even_when_source_unchanged(self):
+        import queue
+        import time
+        from unittest.mock import Mock
+        from token_engine import file_stamp
+        app = self.make_mock_app()
+        app.events, app.status = queue.Queue(), Mock()
+        app.selected = self.source
+        app.frame = object()
+        for name, value in {'work_mode': 'token', 'show_cutout': False,
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        with patch('tokenforge.model_revision', return_value=('old',)):
+            app.current_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+        app.current_cutout = read_image(self.source)
+        app.preview_stamp = file_stamp(self.source)
+        app.last_full_check = time.monotonic()
+        with patch('tokenforge.model_revision', return_value=('new',)), \
+             patch('tokenforge.threading.Thread') as launch:
+            new_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+            app._get_cutout = Mock(return_value=(app.current_cutout, new_key))
+            app._request_preview(verify=True)
+            launch.call_args.kwargs['target']()
+        self.assertEqual(app.events.get_nowait()[0], 'preview_invalidated')
+        action, data = app.events.get_nowait()
+        self.assertEqual(action, 'preview')
+        self.assertEqual(data[2], new_key)
+        app._get_cutout.assert_called_once()
+
     def test_close_waits_for_export_worker_and_discards_queue(self):
         import queue
         import threading
@@ -832,6 +1207,139 @@ class CacheTests(unittest.TestCase):
         app._watch_source()
         app._request_preview.assert_called_once_with(verify=True)
 
+    def test_saved_only_view_rechecks_source_without_inference(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust, source_identity, save_generated, token_recipe, extraction_provenance
+        app = self.make_mock_app()
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app._current_adjust = lambda: Adjust()
+        app.status, app._show_token, app.root = Mock(), Mock(), Mock()
+        app.events = queue.Queue()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        saved_path = token_output_path(self.source)
+        ident = source_identity(self.source)
+        recipe = token_recipe(app.frame, Adjust(), 256, 'webp',
+                              extraction_provenance('birefnet-general', True, 'e'))
+        save_generated(Image.new('RGBA', (256, 256), 'red'), saved_path, self.source, 'token',
+                       skip_exists=False, input_identity=ident, recipe=recipe)
+        app._get_cutout = Mock(return_value=(None, app._cache_key(self.source, 'birefnet-general', True, 'e')))
+        with patch('tokenforge.threading.Thread') as launch:
+            app._request_preview(cached_only=True)
+            launch.call_args.kwargs['target']()
+            while not app.events.empty():
+                app._handle_worker_event(*app.events.get_nowait())
+            self.assertTrue(app.preview_saved_only)
+            self.assertFalse(app.current_cutout)
+            app._get_cutout.reset_mock()
+            Image.new('RGB', (171, 220), 'blue').save(self.source)
+            app._watch_source()
+            self.assertEqual(launch.call_count, 2)
+            launch.call_args.kwargs['target']()
+            while not app.events.empty():
+                app._handle_worker_event(*app.events.get_nowait())
+            app._get_cutout.assert_not_called()
+            self.assertTrue(app.preview_saved_only)
+            self.assertIn('Исходник изменился', app.status.set.call_args.args[0])
+
+    def test_saved_only_watcher_tracks_export_and_never_runs_inference(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust, source_identity, save_generated, token_recipe, extraction_provenance
+        app = self.make_mock_app()
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app._current_adjust = lambda: Adjust()
+        app.status, app._show_token, app.root = Mock(), Mock(), Mock()
+        app.events = queue.Queue()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        saved_path = token_output_path(self.source)
+        source_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+        recipe = token_recipe(app.frame, Adjust(), 256, 'webp',
+                              extraction_provenance('birefnet-general', True, 'e', revision=source_key[-1]))
+        def save(path, color):
+            save_generated(Image.new('RGBA', (256, 256), color), path, self.source, 'token',
+                           skip_exists=False, input_identity=source_identity(self.source), recipe=recipe)
+        save(saved_path, 'red')
+        app._get_cutout = Mock(return_value=(None, source_key))
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch('tokenforge.time.monotonic', return_value=100.0) as clock, \
+             patch.object(app, '_load_saved_preview', wraps=app._load_saved_preview) as load:
+            def consume():
+                launch.call_args.kwargs['target']()
+                while not app.events.empty():
+                    app._handle_worker_event(*app.events.get_nowait())
+            app._request_preview(cached_only=True)
+            consume()
+            self.assertTrue(app.preview_saved_only)
+            app._get_cutout.reset_mock()
+            load.reset_mock()
+            clock.return_value = 103.0
+            app._watch_source()
+            consume()
+            load.assert_not_called()
+            saved_path.unlink()
+            app._watch_source()
+            consume()
+            app._show_token.assert_called_with(None)
+            self.assertIn('отсутствует или повреждён', app.status.set.call_args.args[0])
+            self.assertTrue(app.preview_saved_only)
+            save(saved_path, 'blue')
+            app._watch_source()
+            consume()
+            self.assertEqual(app._show_token.call_args.args[0].getpixel((0, 0)), (0, 0, 255, 255))
+            saved_path.write_bytes(b'corrupt')
+            # Even if metadata appears unchanged, the periodic full check
+            # must revalidate the export and clear stale pixels.
+            clock.return_value = 135.0
+            with patch.object(app, '_saved_export_stamp', return_value=app.preview_export_stamp):
+                app._watch_source()
+                consume()
+            app._show_token.assert_called_with(None)
+            self.assertTrue(app.preview_saved_only)
+            app._get_cutout.assert_not_called()
+
+    def test_saved_preview_warning_uses_revision_returned_by_cache_probe(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust, source_identity, save_generated, token_recipe, extraction_provenance
+        app = self.make_mock_app()
+        app.selected = self.source
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app._current_adjust = lambda: Adjust()
+        app.status, app._show_token = Mock(), Mock()
+        app.events = queue.Queue()
+        for name, value in {'work_mode': 'token', 'show_cutout': False, 'ext': 'webp',
+                            'model': 'birefnet-general', 'keep_alpha': True, 'edge_mode': 'e'}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        old, new = ('old',), ('new',)
+        identity = source_identity(self.source)
+        recipe = token_recipe(app.frame, Adjust(), 256, 'webp',
+                              extraction_provenance('birefnet-general', True, 'e', revision=old))
+        save_generated(Image.new('RGBA', (256, 256), 'red'), token_output_path(self.source),
+                       self.source, 'token', skip_exists=False, input_identity=identity, recipe=recipe)
+        with patch('tokenforge.model_revision', return_value=old), \
+             patch('tokenforge.threading.Thread') as launch:
+            old_key = app._cache_key(self.source, 'birefnet-general', True, 'e')
+            new_key = (*old_key[:-1], new)
+            app._get_cutout = Mock(return_value=(None, new_key))
+            app._request_preview(cached_only=True)
+            launch.call_args.kwargs['target']()
+            self.assertEqual(app.events.get_nowait()[0], 'saved_preview')
+            action, data = app.events.get_nowait()
+            self.assertEqual(action, 'preview')
+            self.assertEqual(data[2], new_key)
+            self.assertTrue(any('Параметры генерации' in warning for warning in data[5]))
+            self.assertTrue(app._get_cutout.call_args.kwargs['cached_only'])
+
     def test_old_token_display_has_no_neural_load(self):
         existing = token_output_path(self.source)
         from token_engine import save_generated
@@ -842,7 +1350,7 @@ class CacheTests(unittest.TestCase):
         app.work_mode = SimpleNamespace(get=lambda: 'token')
         displays = []
         app._show_token = lambda img: displays.append(img)
-        self.assertEqual(app._load_saved_preview(self.source, 'token', 'webp').size, (256, 256))
+        self.assertEqual(app._load_saved_preview(self.source, 'token', 'webp')[0].size, (256, 256))
         self.assertEqual(displays, [])
 
 

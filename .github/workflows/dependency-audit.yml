@@ -1,0 +1,40 @@
+name: Dependency vulnerability audit
+
+on:
+  pull_request:
+    paths:
+      - 'requirements*.txt'
+      - 'constraints/**'
+      - '.github/workflows/dependency-audit.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'requirements*.txt'
+      - 'constraints/**'
+      - '.github/workflows/dependency-audit.yml'
+  schedule:
+    - cron: '19 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisory-check:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Audit the pinned package versions
+        run: |
+          python -m pip install pip-audit
+          python -m pip_audit --no-deps --strict -r constraints/windows-${{ matrix.python }}.txt

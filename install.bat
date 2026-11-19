@@ -107,7 +107,7 @@ if not errorlevel 0 goto pip_missing
 ".venv\Scripts\python.exe" -m pip install --upgrade pip
 if errorlevel 1 goto failed
 if not errorlevel 0 goto failed
-".venv\Scripts\python.exe" -m pip install -r "requirements.txt"
+".venv\Scripts\python.exe" "install_dependencies.py"
 if errorlevel 1 goto failed
 if not errorlevel 0 goto failed
 

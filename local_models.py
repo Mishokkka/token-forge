@@ -1,7 +1,52 @@
 """Only explicitly supported local inference backends may be instantiated."""
+from functools import lru_cache
+
+
 LOCAL_MODELS = ('birefnet-general', 'birefnet-portrait', 'bria-rmbg',
                 'birefnet-general-lite', 'isnet-general-use', 'isnet-anime', 'u2net')
 DEFAULT_MODEL = LOCAL_MODELS[0]
+
+
+@lru_cache(maxsize=1)
+def _inference_versions():
+    # Loaded Python/native packages do not change inside an active process.
+    from importlib.metadata import version, PackageNotFoundError
+    versions = []
+    for package in ('rembg', 'onnxruntime', 'Pillow', 'numpy', 'scipy', 'scikit-image', 'pymatting'):
+        try:
+            versions.append((package, version(package)))
+        except PackageNotFoundError:
+            versions.append((package, 'not-installed'))
+    return tuple(versions)
+
+
+def model_revision(name):
+    """Cheap local model revision; never import rembg or download weights.
+
+    Cover the legacy flat model directory and newer per-model layout.
+    Package versions and file metadata invalidate caches on ordinary upgrades
+    or replacement. This is not a cryptographic verification of model weights.
+    """
+    import os
+    from pathlib import Path
+    require_local_model(name)
+    xdg = os.environ.get('XDG_DATA_HOME')
+    explicit = os.environ.get('U2NET_HOME')
+    # Match rembg's getenv semantics, including deliberately empty values.
+    legacy = Path(os.environ.get('U2NET_HOME',
+                                 os.path.join(os.environ.get('XDG_DATA_HOME', '~'), '.u2net'))).expanduser()
+    default_home = os.path.join(xdg, 'rembg') if xdg else '~/.rembg'
+    home = Path(explicit or os.environ.get('REMBG_HOME', default_home)).expanduser()
+    candidates = (home / 'models' / name / (name + '.onnx'),
+                  legacy / (name + '.onnx'), home / (name + '.onnx'))
+    stamps = []
+    for path in dict.fromkeys(candidates):
+        try:
+            st = path.stat()
+            stamps.append((str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+        except OSError:
+            continue
+    return _inference_versions(), tuple(stamps)
 
 
 def require_local_model(name):

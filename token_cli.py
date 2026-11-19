@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from cutout_service import load_cutout
-from settings_store import read_settings_file, adjustment_for, output_format
+from settings_store import read_settings_file, adjustment_for, decode_settings
 from local_models import DEFAULT_MODEL, require_local_model, new_local_session
 import os
 import traceback
@@ -12,9 +12,9 @@ from app_paths import preferences_dir
 
 from token_engine import (
     IMAGE_EXTS, Adjust, DiskCutoutCache,
-    export_batch, frame_interior, list_source_images, read_image,
+    export_batch, load_frame, list_source_images, read_image,
     remove_background, token_output_path, source_identity, read_export_owner,
-    LoadedCutout, excluded_file,
+    LoadedCutout, excluded_file, extraction_provenance,
 )
 from item_engine import item_output_path, export_items
 
@@ -45,13 +45,14 @@ def resolve_context_source(filename: str | Path, *, frame_path: Path | None = No
     if frame_path is None:
         # GUI open must remain usable for recovery from an invalid settings
         # file. Automatic commands pass their strictly read frame explicitly.
-        frame_path = Path(read_settings_file(PREFS_FILE).get('ring') or BASE / 'RingT.png')
+        frame_path = Path(decode_settings(read_settings_file(PREFS_FILE),
+                                         default_frame=BASE / 'RingT.png')['ring'])
     if excluded_file(path, frame_path):
         raise ValueError('Выбранный файл используется как рамка, а не исходный арт.')
     owner = read_export_owner(path)
     if owner is None:
         return path
-    if owner[0] == 2:
+    if owner[0] >= 2:
         candidate = path.with_name(owner[2])
         if (candidate.suffix.lower() in IMAGE_EXTS and candidate.is_file()
                 and not excluded_file(candidate, path) and read_export_owner(candidate) is None
@@ -74,13 +75,15 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
     require_local_model(model)
     cache = DiskCutoutCache(PREFS_DIR / 'cutouts')
     memory, sessions = {}, {}
-    def get_cutout(path: Path):
-        identity = source_identity(path)
+    def get_cutout(path: Path, *, captured=None):
+        identity = captured.identity if captured is not None else source_identity(path)
         key = (*identity, model, keep_alpha, edge_mode)
+        decode = (lambda path, *, identity: captured.decode()) if captured is not None else read_image
         cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key,
                             disk_cache=cache, memory=memory, sessions=sessions,
-                            decode=read_image, extract=remove_background, session_factory=new_local_session)
-        return LoadedCutout(cutout, identity)
+                            decode=decode, extract=remove_background, session_factory=new_local_session)
+        return LoadedCutout(cutout.image, identity,
+                            extraction_provenance(model, keep_alpha, edge_mode, revision=cutout.revision))
 
     return get_cutout
 
@@ -88,33 +91,30 @@ def make_cutout_loader(model, keep_alpha, edge_mode):
 def automatic_token(filename: str | Path) -> tuple[str, Path]:
     """Create a single token with the saved settings and disk extraction cache.
 
-    Returns ('created'|'skipped', token_path). Errors raise exceptions. Never
-    loads the Tk GUI, and only invokes the AI if no valid cutout is cached.
+    Returns (status, token_path), where status is 'created', 'skipped',
+    'created_with_warning', or 'skipped_with_warning'. Fatal errors raise
+    exceptions. Never loads the Tk GUI; inference is only used when needed.
     """
-    settings = read_settings()
-    frame_path = Path(settings.get('ring') or BASE / 'RingT.png')
+    settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='token')
+    frame_path = Path(settings['ring'])
     source = resolve_context_source(filename, frame_path=frame_path)
-    def load_frame():
-        frame = read_image(frame_path)
-        if frame.width != frame.height:
-            raise ValueError('PNG-кольцо должно быть квадратным.')
-        return frame, frame_interior(frame)
+
 
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
-    keep_alpha = bool(settings.get('keep_alpha', True))
-    ext = output_format(settings.get('ext', 'webp'), strict=True)
-    size = int(settings.get('size', 256))
-    if size not in (256, 512, 1024):
-        raise ValueError('Неподдерживаемый размер токена в настройках.')
+    keep_alpha = settings['keep_alpha']
+    ext = settings['ext']
+    size = settings['size']
 
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_batch(
         [source], get_cutout, None, None, {source: _adjust_for(settings, source)},
-        frame_loader=load_frame,
+        frame_loader=lambda: load_frame(frame_path),
         out_size=size, format_name=ext,
-        skip_exists=bool(settings.get('skip_exists', True)),
-        convert_original=bool(settings.get('convert_original', True)),
+        skip_exists=settings['skip_exists'],
+        convert_original=settings['convert_original'],
+        extraction_recipe=lambda: extraction_provenance(model, keep_alpha, edge_mode),
+        captured_loader=lambda capture: get_cutout(capture.path, captured=capture),
     )
     for warning in result.warnings:
         write_log(warning)
@@ -132,17 +132,19 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
 
 def automatic_item(filename: str | Path) -> tuple[str, Path]:
-    """Create 500x500 equipment art using the same reusable cutout cache."""
-    settings = read_settings()
-    source = resolve_context_source(filename, frame_path=Path(settings.get('ring') or BASE / 'RingT.png'))
+    """Create 500x500 equipment art with automatic_token's status contract."""
+    settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='item')
+    source = resolve_context_source(filename, frame_path=Path(settings['ring']))
     model = settings.get('model', DEFAULT_MODEL)
     edge_mode = settings.get('edge_mode', 'Очистка краёв')
-    keep_alpha = bool(settings.get('keep_alpha', True))
+    keep_alpha = settings['keep_alpha']
     adj = adjustment_for(settings, source, 'item')
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)
     result = export_items([source], get_cutout, {source: adj},
-                          skip_exists=bool(settings.get('skip_exists', True)),
-                          convert_original=bool(settings.get('convert_original', True)))
+                          skip_exists=settings['skip_exists'],
+                          convert_original=settings['convert_original'],
+                          extraction_recipe=lambda: extraction_provenance(model, keep_alpha, edge_mode),
+                          captured_loader=lambda capture: get_cutout(capture.path, captured=capture))
     for warning in result.warnings:
         write_log(warning)
     if result.errors:
