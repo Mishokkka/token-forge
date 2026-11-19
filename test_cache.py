@@ -219,6 +219,54 @@ class CacheTests(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_contended_inference_lock_only_delays_art_that_needs_inference(self):
+        from contextlib import contextmanager
+        from unittest.mock import Mock
+        from cutout_service import load_cutout
+        from token_engine import source_identity
+        model = 'birefnet-general'
+        identity = source_identity(self.source)
+        transparent = Image.new('RGBA', (10, 10), (20, 30, 40, 80))
+        opaque = Image.new('RGBA', (10, 10), 'red')
+        waiting, held = [], []
+        @contextmanager
+        def lock(path, timeout):
+            waiting.append(timeout)
+            if timeout == 0:
+                raise TimeoutError('contended')
+            held.append(True)
+            try:
+                yield
+            finally:
+                held.pop()
+        for image, cache_hit in ((transparent, False), (opaque, True), (opaque, False)):
+            with self.subTest(alpha=image.getpixel((0, 0))[3], cache_hit=cache_hit):
+                waiting.clear()
+                disk = Mock(directory=self.cache.directory)
+                disk.load.side_effect = [None, transparent if cache_hit else None]
+                decode = Mock(return_value=image)
+                def infer(*args):
+                    self.assertTrue(held)
+                    return transparent
+                extract, factory = Mock(side_effect=infer), Mock(return_value=object())
+                with patch('cutout_service.process_lock', side_effect=lock):
+                    result = load_cutout(self.source, model, True, 'e',
+                                         key=(*identity, model, True, 'e'),
+                                         disk_cache=disk, memory={}, sessions={}, decode=decode,
+                                         extract=extract, session_factory=factory)
+                self.assertIs(result.image, transparent)
+                decode.assert_called_once()
+                self.assertFalse(held)
+                if image is transparent:
+                    self.assertEqual(waiting, [0])
+                    extract.assert_not_called()
+                    disk.save.assert_not_called()
+                else:
+                    self.assertEqual(waiting, [0, 120])
+                    self.assertEqual(disk.load.call_count, 2)
+                    self.assertEqual(extract.call_count, int(not cache_hit))
+                    self.assertEqual(disk.save.call_count, int(not cache_hit))
+
     def test_second_cache_hit_does_not_reencode_or_run_inference(self):
         from unittest.mock import Mock
         from cutout_service import load_cutout

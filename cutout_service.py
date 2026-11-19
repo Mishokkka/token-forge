@@ -62,28 +62,37 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
             check()
             verify_revision()
             return CutoutResult(None, revision)
-        # Recheck under the reservation before allocating decoded pixels.
-        # If the cache directory is inaccessible, already-transparent artwork
-        # can still be returned safely without either inference or disk writes.
+        # Try an immediate reservation for possible alpha bypasses. If
+        # uncontended, the second cache lookup still precedes source decoding.
+        lock_path = disk_cache.directory.parent / 'inference'
+        original = None
         with ExitStack() as reservation:
             try:
-                reservation.enter_context(process_lock(disk_cache.directory.parent / 'inference', timeout=120))
-            except OSError:
+                reservation.enter_context(process_lock(lock_path, timeout=0 if keep_alpha else 120))
+            except OSError as lock_error:
                 if not keep_alpha:
                     raise
+                revision = model_revision(model)
+                memory_key = (*key, revision)
                 original = decode(path, identity=identity)
-                if not already_transparent(original):
-                    raise
                 validate_art_dimensions(original)
-                check()
-                verify_revision()
-                remember(memory, memory_key, original, count_limit=memory_limit)
-                return CutoutResult(original, revision)
+                if already_transparent(original):
+                    # No inference and no contested disk publication.
+                    check()
+                    verify_revision()
+                    remember(memory, memory_key, original, count_limit=memory_limit)
+                    return CutoutResult(original, revision)
+                if not isinstance(lock_error, TimeoutError):
+                    raise
+                # Opaque artwork still needs the shared inference lock. Reuse
+                # the verified decode only if the second cache lookup misses.
+                reservation.enter_context(process_lock(lock_path, timeout=120))
             revision = model_revision(model)
             memory_key = (*key, revision)
             cutout = cached()
             if cutout is None:
-                original = decode(path, identity=identity)
+                if original is None:
+                    original = decode(path, identity=identity)
                 if keep_alpha and already_transparent(original):
                     cutout = original
                 else:
