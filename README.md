@@ -19,7 +19,7 @@ When updating, copy the complete source distribution, not individual modules. Pr
 - Equipment: 500 × 500 lossless WebP, 3 px black outline, complete fit, rotation, mirrors and placement controls.
 - Optional high-quality WebP source copy beside the untouched original.
 
-Select a folder, choose the desired mode, adjust the preview and export one image or the entire folder. Existing independent images require explicit overwrite approval; legacy or stale generated files are not silently overwritten by skip mode.
+Select a folder, choose the desired mode, adjust the preview and export one image or the entire folder. Use **Сохранить все изменения** (Save all changes) after adjusting multiple arts: only arts edited in the current folder and mode during this app session are exported, even with Skip existing enabled. Successfully saved edits are cleared; failed, cancelled or newer edits remain pending. The button never authorizes replacement of independent images; use Save selected for explicit approval. Existing independent images require explicit overwrite approval; legacy or stale generated files are not silently overwritten by skip mode.
 
 Limits: PNG/JPEG/WebP/BMP/TIFF, 256 MiB encoded size, 64 Mi pixels, side at most 16384 px, rings at most 4096 square. Valid embedded color profiles are converted to sRGB. Uncached background removal has separate work-size limits: ordinary 16 Mi pixels, edge cleanup 4 Mi pixels, alpha matting 1 Mi pixel. Larger images can still be viewed/copied subject to decoder limits; for extraction, resize or choose a less expensive mode. Transparent bypass and valid cache hits do not require inference. Signed/float/32-bit grayscale data needs conversion to a defined 8/16-bit display range first.
 

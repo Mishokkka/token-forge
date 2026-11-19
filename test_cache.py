@@ -477,6 +477,8 @@ class CacheTests(unittest.TestCase):
         app.files = []
         app.selected = None
         app.pending_resets = set()
+        app.dirty_edits = {}
+        app.edit_revision = 0
         app.save_retries = 0
         app.save_retryable = False
         app.widget_values = {}
@@ -527,6 +529,86 @@ class CacheTests(unittest.TestCase):
         app._start_export = lambda paths, force_overwrite=False: captured.append(force_overwrite)
         app._export_current()
         self.assertEqual(captured, [True])
+
+    def test_changed_export_targets_only_current_mode_and_folder(self):
+        from unittest.mock import Mock
+        app = self.make_mock_app()
+        other = self.directory / 'Other.png'
+        outside = self.directory / 'elsewhere' / 'Outside.png'
+        app.files = [self.source, other]
+        app.work_mode = SimpleNamespace(get=lambda: 'token')
+        app._start_export, app.status = Mock(), Mock()
+        app._mark_edited('token', self.source)
+        app._mark_edited('item', other)
+        app._mark_edited('token', outside)
+        app._export_changed()
+        app._start_export.assert_called_once_with(
+            [self.source], force_overwrite=True, requested_mode='token', changed_only=True)
+        app._acknowledge_edits({('token', self.source): app.dirty_edits['token', self.source]})
+        app._start_export.reset_mock()
+        app._export_changed()
+        app._start_export.assert_not_called()
+        self.assertIn(('item', other), app.dirty_edits)
+        self.assertIn(('token', outside), app.dirty_edits)
+
+    def test_changed_export_overwrites_only_edited_owned_results_and_keeps_newer_edits(self):
+        import queue
+        from unittest.mock import Mock
+        from token_engine import Adjust, save_generated, source_identity
+
+        app = self.make_mock_app()
+        app.folder = self.directory
+        app.selected = self.source
+        app.running_batch, app.busy = False, True
+        app.frame = read_image(Path(__file__).parent / 'RingT.png')
+        app.interior = frame_interior(app.frame)
+        app.status, app.progress, app.events = Mock(), {}, queue.Queue()
+        for name, value in {'work_mode': 'token', 'model': 'birefnet-general', 'keep_alpha': True,
+                            'edge_mode': 'Обычный', 'ext': 'webp', 'size': '512',
+                            'skip_exists': True, 'convert_original': False}.items():
+            setattr(app, name, SimpleNamespace(get=lambda v=value: v))
+        good = self.directory / 'Good.png'
+        conflict = self.directory / 'Conflict.png'
+        untouched = self.directory / 'Untouched.png'
+        for path in (good, conflict, untouched):
+            Image.new('RGBA', (50, 80), (0, 180, 0, 220)).save(path)
+        app.files = [self.source, good, conflict, untouched]
+        for path in (self.source, good, untouched):
+            save_generated(Image.new('RGBA', (256, 256), 'red'), token_output_path(path),
+                           path, 'token', skip_exists=False)
+        Image.new('RGBA', (32, 32), 'blue').save(token_output_path(conflict))
+        protected = {path: token_output_path(path).read_bytes() for path in (conflict, untouched)}
+        app._adjust_for = lambda path: Adjust(zoom=130 if path == self.source else 115)
+        app._get_cutout = lambda path, *args, captured=None: (
+            captured.decode(), captured.identity + args + (__import__('local_models').model_revision(args[0]),))
+        for path in (self.source, good, conflict):
+            app._mark_edited('token', path)
+        with patch('tokenforge.threading.Thread') as launch, \
+             patch('tokenforge.messagebox.askyesno', side_effect=AssertionError('bulk overwrite approval')):
+            app._export_changed()
+            self.assertIsNotNone(app.pending_export)
+            # This newer edit must survive completion of the captured request.
+            app._mark_edited('token', self.source)
+            app.busy = False
+            app._after_preview()
+            launch.call_args.kwargs['target']()
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get_nowait())
+        result = events[-1][1]
+        self.assertEqual(events[-1][0], 'done')
+        self.assertEqual((result.created, result.skipped, result.total), (2, 0, 3))
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(set(result.saved_sources), {self.source, good})
+        for action, data in events:
+            if action == 'exported_edits':
+                app._apply_worker_event(action, data)
+        self.assertEqual(set(app.dirty_edits), {('token', self.source), ('token', conflict)})
+        for path in (self.source, good):
+            with Image.open(token_output_path(path)) as image:
+                self.assertEqual(image.size, (512, 512))
+        for path, before in protected.items():
+            self.assertEqual(token_output_path(path).read_bytes(), before)
 
     def test_real_selected_export_replaces_owned_file_with_global_skip_enabled(self):
         import queue
@@ -956,7 +1038,7 @@ class CacheTests(unittest.TestCase):
         app.events, app.cancel_event, app.status = queue.Queue(), threading.Event(), Mock()
         dest = token_output_path(self.source)
         stamp = file_stamp(self.source)
-        request = ([self.source], 'token') + (None,) * 13 + (
+        request = ([self.source], 'token') + (None,) * 13 + ({},
             (self.source, dest, stamp, None, app.frame_path),)
         with patch('tokenforge.threading.Thread') as launch:
             app._run_preflight(request)
@@ -1016,6 +1098,7 @@ class CacheTests(unittest.TestCase):
         app._reset_current()
         app._select.assert_called_once_with(self.source, force_preview=True)
         self.assertNotIn(key, app.settings['overrides'])
+        self.assertIn(('token', self.source), app.dirty_edits)
 
     def test_explicit_selection_preview_does_not_show_old_token(self):
         from unittest.mock import Mock

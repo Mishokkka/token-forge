@@ -1354,6 +1354,9 @@ class BatchResult:
     error_details: list[str] = field(default_factory=list)
     outputs: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Identify the actual source rather than inferring it from an output
+    # filename (different sources can have colliding output paths).
+    saved_sources: list[Path] = field(default_factory=list)
 
     def record_error(self, source: Path, stage: str, exc: Exception) -> None:
         message = f'{source.name}: {stage}: {exc}'
@@ -1457,6 +1460,10 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     if publication:
                         result.created += 1
                         result.outputs.append(destination)
+                        # A publication warning can mean the source changed or
+                        # a competing write occurred. Keep those edits retryable.
+                        if not publication.warnings:
+                            result.saved_sources.append(source)
                     else:
                         result.skipped += 1
             except OperationCancelled:

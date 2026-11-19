@@ -28,6 +28,8 @@ def run():
         draw.ellipse((100, 10, 220, 160), fill=(180, 140, 100, 255))
         draw.polygon([(110, 140), (210, 140), (310, 480), (10, 480)], fill=(50, 90, 130, 255))
         img.save(source)
+        second = arts / 'Other.png'
+        img.save(second)
         pref_file = prefs / 'settings.json'
         pref_file.write_text(json.dumps({'keep_alpha': True, 'convert_original': False,
                                          'ring': str(tokenforge.BASE / 'RingT.png')}),
@@ -103,6 +105,27 @@ def run():
                 with Image.open(token) as result:
                     assert result.size == (256, 256)
                     result.load()
+                # Edit two different arts, revisit the first, then save both
+                # through the new button while Skip existing stays enabled.
+                old_token = token.read_bytes()
+                app.zoom.set(155)
+                app._on_adjust('zoom')
+                app._select(second)
+                update_until(lambda: idle() and app.current_cutout is not None, 'second token preview')
+                app.x.set(12)
+                app._on_adjust('x')
+                app._select(source)
+                update_until(lambda: idle() and app.current_cutout is not None, 'revisit edited token')
+                assert app.zoom.get() == 155
+                assert app.skip_exists.get()
+                save_all = find_button(app.root, 'Сохранить все изменения')
+                assert save_all is not None
+                save_all.invoke()
+                second_token = token_output_path(second)
+                update_until(lambda: idle() and second_token.is_file() and not app.dirty_edits,
+                             'save all edited tokens')
+                assert token.read_bytes() != old_token
+                assert read_export_owner(second_token)[:3] == (3, 'token', second.name)
                 app.work_mode.set('item')
                 app._on_work_mode_change()
                 update_until(lambda: idle() and app.current_cutout is not None, 'switch mode')
@@ -130,7 +153,8 @@ def run():
                 app._on_close()
                 assert app.closing
                 saved = json.loads(pref_file.read_text(encoding='utf-8'))
-                assert saved['overrides'][str(source.resolve())]['zoom'] == 140
+                assert saved['overrides'][str(source.resolve())]['zoom'] == 155
+                assert saved['overrides'][str(second.resolve())]['x'] == 12
                 print('GUI token/item export and preferences: OK', flush=True)
             finally:
                 if not app.closing:
