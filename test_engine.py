@@ -1211,6 +1211,52 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(repeated.skipped, 3)
             self.assertEqual(repeated.converted, 0)
 
+    def test_copy_failure_or_warning_keeps_edit_pending_until_clean_retry(self):
+        from item_engine import ItemAdjust, export_items, item_output_path
+        from token_engine import Publication
+
+        for mode in ('token', 'item'):
+            for problem in ('error', 'warning'):
+                with self.subTest(mode=mode, problem=problem), tempfile.TemporaryDirectory() as temp:
+                    folder = Path(temp)
+                    source, other = folder / 'Hero.png', folder / 'Other.png'
+                    for path in (source, other):
+                        self.figure.save(path)
+                    files = [source, other]
+
+                    def run():
+                        if mode == 'token':
+                            return export_batch(files, read_image, self.frame, self.mask,
+                                                {p: Adjust() for p in files}, skip_exists=False)
+                        return export_items(files, read_image, {p: ItemAdjust() for p in files},
+                                            skip_exists=False)
+
+                    output_path = token_output_path if mode == 'token' else item_output_path
+
+                    def copy_with_problem(path, **kwargs):
+                        if path == source:
+                            if problem == 'error':
+                                raise OSError('copy failed')
+                            return Publication(True, ('copy warning',))
+                        return save_original_webp(path, **kwargs)
+
+                    with patch('token_engine.save_original_webp', side_effect=copy_with_problem):
+                        result = run()
+                    self.assertEqual(result.created, 2)
+                    self.assertEqual(result.saved_sources, [other])
+                    self.assertEqual(len(result.errors), int(problem == 'error'))
+                    self.assertEqual(len(result.warnings), int(problem == 'warning'))
+                    self.assertTrue(output_path(source).is_file())
+
+                    # Retry with a healthy copy path. The other source already
+                    # has a valid WebP copy; skipping it is not an error.
+                    result = run()
+                    self.assertEqual(result.created, 2)
+                    self.assertEqual(result.converted, 1)
+                    self.assertEqual(result.errors, [])
+                    self.assertEqual(result.warnings, [])
+                    self.assertEqual(result.saved_sources, files)
+
     def test_batch_one_failed_image_does_not_abort(self):
         import tempfile
         with tempfile.TemporaryDirectory() as temp:

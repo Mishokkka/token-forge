@@ -1354,6 +1354,9 @@ class BatchResult:
     error_details: list[str] = field(default_factory=list)
     outputs: list[Path] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Identify the actual source rather than inferring it from an output
+    # filename (different sources can have colliding output paths).
+    saved_sources: list[Path] = field(default_factory=list)
 
     def record_error(self, source: Path, stage: str, exc: Exception) -> None:
         message = f'{source.name}: {stage}: {exc}'
@@ -1396,6 +1399,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 on_progress(index+1, len(files), f'Выполнено: {index + 1}/{len(files)}')
             continue
         with CapturedArtwork(source, identity) as captured:
+            copy_succeeded = True
             if convert_original:
                 try:
                     publication = save_original_webp(
@@ -1405,12 +1409,15 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     copy_destination = original_webp_path(source)
                     result.warnings.extend(f'{source.name}: {copy_destination.name}: {warning}'
                                            for warning in publication.warnings)
+                    # A valid existing copy also counts as success.
+                    copy_succeeded = not publication.warnings
                 except StaleApprovalError as exc:
                     result.record_error(source, 'преобразование оригинала', exc)
                     if on_progress:
                         on_progress(index + 1, len(files), f'Выполнено: {index + 1}/{len(files)}')
                     continue
                 except Exception as exc:
+                    copy_succeeded = False
                     result.record_error(source, 'преобразование оригинала', exc)
             try:
                 check_cancel(cancel_event)
@@ -1457,6 +1464,10 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                     if publication:
                         result.created += 1
                         result.outputs.append(destination)
+                        # Acknowledge only when all requested outputs succeeded
+                        # without warnings. Otherwise keep the edit retryable.
+                        if copy_succeeded and not publication.warnings:
+                            result.saved_sources.append(source)
                     else:
                         result.skipped += 1
             except OperationCancelled:

@@ -147,6 +147,10 @@ class TokenForge:
         self.pending_scan = None
         self.active_scan = None
         self.pending_resets = set()
+        # Export dirtiness is independent of the debounced settings save.
+        # Keep separate revisions for tokens and items, across selections.
+        self.dirty_edits = {}
+        self.edit_revision = 0
         self.save_retries = 0
         self.save_retryable = False
         self.worker = None
@@ -416,6 +420,8 @@ class TokenForge:
         actions = tk.Frame(self.root, bg=BG)
         actions.pack(fill='x', padx=24, pady=(15, 6))
         ttk.Button(actions, text='Сохранить выбранный', command=self._export_current).pack(side='left')
+        ttk.Button(actions, text='Сохранить все изменения',
+                   command=self._export_changed).pack(side='left', padx=(9, 0))
         ttk.Button(actions, text='Обработать всю папку', style='Accent.TButton',
                    command=self._export_all).pack(side='left', padx=9)
         ttk.Button(actions, text='Остановить', command=self._cancel).pack(side='right')
@@ -662,7 +668,18 @@ class TokenForge:
         path_key = str(path.resolve())
         stored = mapping.get(path_key)
         mapping[path_key] = {**(stored if isinstance(stored, dict) else {}), field: value}
+        self._mark_edited('item' if name == 'item_overrides' else 'token', path)
         return True
+
+    def _mark_edited(self, mode, path):
+        self.edit_revision += 1
+        self.dirty_edits[mode, path] = self.edit_revision
+
+    def _acknowledge_edits(self, saved):
+        for key, revision in saved.items():
+            # A later edit may have happened while the export was queued or running.
+            if self.dirty_edits.get(key) == revision:
+                del self.dirty_edits[key]
 
     def _clear_selection(self):
         self.preview_generation += 1
@@ -726,7 +743,7 @@ class TokenForge:
             self.sliders_updating = False
         # Ordinary selection can show the saved result immediately. Explicit
         # Reset must produce a fresh preview even when the cutout is uncached.
-        if force_preview:
+        if force_preview or (self.dirty_edits and (self.work_mode.get(), path) in self.dirty_edits):
             self._request_preview()
         else:
             self._request_preview(cached_only=not self.show_cutout.get())
@@ -802,7 +819,8 @@ class TokenForge:
     def _reset_current(self):
         if self.selected is None:
             return
-        key = 'item_overrides' if self.work_mode.get() == 'item' else 'overrides'
+        mode = self.work_mode.get()
+        key = 'item_overrides' if mode == 'item' else 'overrides'
         path_key = str(self.selected.resolve())
         self.pending_resets.add((key, path_key))
         self.settings.setdefault(key, {}).pop(path_key, None)
@@ -811,6 +829,7 @@ class TokenForge:
         baseline = self._settings_baseline.get(key)
         if isinstance(baseline, dict):
             baseline.pop(path_key, None)
+        self._mark_edited(mode, self.selected)
         self._select(self.selected, force_preview=True)
         self._schedule_save()
 
@@ -1139,13 +1158,24 @@ class TokenForge:
         if self.selected:
             self._start_export([self.selected], force_overwrite=True)
 
+    def _export_changed(self):
+        mode = self.work_mode.get()
+        files = [path for path in self.files if (mode, path) in self.dirty_edits]
+        if not files:
+            self.status.set('В текущей папке нет несохранённых изменений.')
+            return
+        # Like manual Save, regenerate even if Skip existing is enabled.
+        # Unlike manual Save, never ask to overwrite an unowned file in bulk.
+        self._start_export(files, force_overwrite=True, requested_mode=mode, changed_only=True)
+
     def _export_all(self):
         if not self.folder:
             messagebox.showinfo('Нет изображений', 'Сначала выбери папку с артами.')
             return
         self._start_export(self.files, scan_folder=self.folder)
 
-    def _start_export(self, image_files, force_overwrite=False, requested_mode=None, scan_folder=None):
+    def _start_export(self, image_files, force_overwrite=False, requested_mode=None, scan_folder=None,
+                      *, changed_only=False):
         if self.closing or self.approval_pending:
             return
         if self.frame_loading or self.pending_frame is not None:
@@ -1183,7 +1213,8 @@ class TokenForge:
         scan = (scan_folder, self.frame_path, deepcopy(self.settings),
                 self.default_item_layout.get() if mode == 'item' else None) if scan_folder else None
         preflight = None
-        if force_overwrite and len(files) == 1:
+        edits = {key: revision for key, revision in self.dirty_edits.items() if key[0] == mode}
+        if force_overwrite and len(files) == 1 and not changed_only:
             source = files[0]
             destination = item_output_path(source) if mode == 'item' else token_output_path(source, ext)
             try:
@@ -1198,7 +1229,7 @@ class TokenForge:
                 expected_input = self.current_key[:4]
             preflight = (source, destination, source_stamp, destination_stamp, self.frame_path)
         request = (files, mode, model, keep, edge_mode, ext, size, skip,
-                   convert, frame, interior, adjustments, approved_outputs, expected_input, scan)
+                   convert, frame, interior, adjustments, approved_outputs, expected_input, scan, edits)
         if preflight is not None:
             request += (preflight,)
         # Only the dispatcher consumes queued requests.
@@ -1253,18 +1284,18 @@ class TokenForge:
             else:
                 prior, owned = inspect_existing_export(destination, source, mode)
             check_stamps()
-            ready = request[:12] + ({destination: prior}, identity, request[14])
+            ready = request[:12] + ({destination: prior}, identity) + request[14:-1]
             self.events.put(('export_preflight', (ready, destination, prior is not EXPECTED_ABSENT and not owned)))
 
         self._launch_worker(work, lambda exc: self.events.put(
             ('preflight_failure', self._worker_error_text(exc))))
 
     def _run_export(self, request):
-        if len(request) == 16:
+        if len(request) == 17:
             self._run_preflight(request)
             return
         (files, mode, model, keep, edge_mode, ext, size, skip,
-         convert, frame, interior, adjustments, approved_outputs, expected_input, scan) = request
+         convert, frame, interior, adjustments, approved_outputs, expected_input, scan, edits) = request
         self.busy = True
         self.running_batch = True
         self.cancel_event.clear()
@@ -1307,6 +1338,10 @@ class TokenForge:
                                       expected_inputs={str(files[0]): expected_input} if expected_input is not None else None,
                                       extraction_recipe=lambda: extraction_provenance(model, keep, edge_mode),
                                       captured_loader=load_captured)
+            saved = {(mode, path): edits[mode, path] for path in result.saved_sources
+                     if (mode, path) in edits}
+            if saved:
+                self.events.put(('exported_edits', saved))
             self.events.put(('done', result))
         self._launch_worker(work, lambda exc: self.events.put(('batch_failure', traceback.format_exc())))
 
@@ -1528,6 +1563,8 @@ class TokenForge:
             n, total, text = data
             self.progress['value'] = n / max(1, total) * 100
             self.status.set(text)
+        elif action == 'exported_edits':
+            self._acknowledge_edits(data)
         elif action == 'done':
             report = (f'Создано: {data.created}. Пропущено: {data.skipped}. '
                       f'Артов в WebP: {data.converted}. Ошибок: {len(data.errors)}. '
