@@ -25,10 +25,16 @@ def gray_profile():
     return bytes(data)
 
 
-def packed_gray_tiff(bits, profile=None):
-    """Four unsigned little-endian TIFF samples, packed in TIFF bit order."""
+def packed_gray_tiff(bits, profile=None, *, sample_format=1):
+    """Four little-endian grayscale TIFF samples, packed in TIFF bit order.
+
+    SampleFormat can be omitted (unsigned by default) or set explicitly.
+    For signed 8-bit samples these same bytes include negative values.
+    """
     values = (0, 1 << (bits - 2), 1 << (bits - 1), (1 << bits) - 1)
-    if bits == 12:
+    if bits == 8:
+        pixels = bytes(values)
+    elif bits == 12:
         pixels = bytes.fromhex('000400800fff')
     elif bits == 16:
         pixels = struct.pack('<4H', *values)
@@ -36,7 +42,9 @@ def packed_gray_tiff(bits, profile=None):
         raise ValueError(bits)
     tags = [(256, 4, 1, 4), (257, 4, 1, 1), (258, 3, 1, bits),
             (259, 3, 1, 1), (262, 3, 1, 1), (273, 4, 1, 0), (277, 3, 1, 1),
-            (278, 4, 1, 1), (279, 4, 1, len(pixels)), (339, 3, 1, 1)]
+            (278, 4, 1, 1), (279, 4, 1, len(pixels))]
+    if sample_format is not None:
+        tags.append((339, 3, 1, sample_format))
     if profile is not None:
         tags.append((34675, 7, len(profile), 0))
     offset = 8 + 2 + 12 * len(tags) + 4
@@ -72,6 +80,40 @@ class NormalizationTests(unittest.TestCase):
                         with Image.open(path.with_suffix('.webp')) as copy:
                             self.assertEqual(copy.size, (4, 1))
                             self.assertGreater(copy.convert('RGB').getpixel((3, 0))[0], 230)
+
+    def test_tiff_sample_format_is_checked_even_when_pillow_exposes_mode_l(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            for tagged in (False, True):
+                profile = gray_profile() if tagged else None
+                for sample_format in (None, 1, 2):
+                    with self.subTest(tagged=tagged, sample_format=sample_format):
+                        path = folder / f'gray8-{tagged}-{sample_format}.tiff'
+                        path.write_bytes(packed_gray_tiff(8, profile, sample_format=sample_format))
+                        with Image.open(path) as raw:
+                            self.assertEqual(raw.mode, 'L')
+                            if sample_format == 2:
+                                with patch.object(raw, 'load', side_effect=AssertionError('unexpected pixel decode')):
+                                    with self.assertRaisesRegex(ValueError, 'числовой диапазон TIFF'):
+                                        decode_artwork(raw, force_alpha=True)
+                        if sample_format == 2:
+                            with self.assertRaisesRegex(ValueError, 'числовой диапазон TIFF'):
+                                read_image(path)
+                            with self.assertRaisesRegex(ValueError, 'числовой диапазон TIFF'):
+                                save_original_webp(path)
+                            self.assertFalse(path.with_suffix('.webp').exists())
+                        else:
+                            result = read_image(path)
+                            self.assertEqual(result.mode, 'RGBA')
+                            self.assertEqual(result.getchannel('A').getextrema(), (255, 255))
+                            reds = list(result.getchannel('R').getdata())
+                            self.assertEqual((reds[0], reds[-1]), (0, 255))
+                            self.assertLess(reds[1], reds[2])
+                            if not tagged:
+                                self.assertEqual(reds, [0, 64, 128, 255])
+                            self.assertTrue(save_original_webp(path))
+                            self.assertTrue(path.with_suffix('.webp').is_file())
 
     def test_common_containers_and_alpha_layouts(self):
         palette = Image.new('P', (3, 2))

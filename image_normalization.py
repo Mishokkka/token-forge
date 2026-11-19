@@ -33,14 +33,19 @@ def sample_layout(raw):
     if mode in ('I', 'F'):
         raise ValueError('32-битные, знаковые и вещественные изображения требуют явной нормализации диапазона. '
                          'Сохрани арт как обычный 8- или 16-битный PNG/TIFF.')
+    # TIFF sample type is independent of Pillow's decoded mode. In particular,
+    # signed 8-bit grayscale opens as L, just like unsigned display samples.
+    if raw.format == 'TIFF':
+        sample_formats = _tag_values(raw, 339, (1,))
+        if not sample_formats or any(value != 1 for value in sample_formats):
+            raise ValueError('Неподдерживаемый числовой диапазон TIFF. '
+                             'Сохрани арт как беззнаковый 8- или 16-битный PNG/TIFF.')
     depth = None
     if mode in HIGH_GRAY_MODES:
         depth = 16
         if raw.format == 'TIFF':
             bits = _tag_values(raw, 258, (16,))
-            sample_format = _tag_values(raw, 339, (1,))
-            if (len(bits) != 1 or type(bits[0]) is not int or not 9 <= bits[0] <= 16
-                    or tuple(sample_format) != (1,)):
+            if len(bits) != 1 or type(bits[0]) is not int or not 9 <= bits[0] <= 16:
                 raise ValueError('Неподдерживаемый числовой диапазон TIFF.')
             depth = bits[0]
     # Pillow's 16-bit gray+alpha PNG is expanded to 8-bit RGBA by its
