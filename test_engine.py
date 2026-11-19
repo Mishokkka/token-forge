@@ -763,7 +763,7 @@ class EngineTests(unittest.TestCase):
             self.figure.save(source)
             dest = source.with_suffix('.webp')
             save_original_webp(source)
-            with patch('token_engine.read_export_owner', side_effect=InvalidExportError('Готовое изображение повреждено.')):
+            with patch('token_engine._probe_owner', side_effect=InvalidExportError('Готовое изображение повреждено.')):
                 with self.assertRaisesRegex(InvalidExportError, 'Перемести или удали повреждённую WebP-копию'):
                     validate_skip(dest, source, 'copy')
 
@@ -957,13 +957,13 @@ class EngineTests(unittest.TestCase):
                 return export_batch([source], loader, self.frame, self.mask, {source: Adjust()},
                                     convert_original=False, extraction_recipe=revision)
             self.assertEqual(run(read_image).created, 1)
-            original_validate = token_engine.validate_skip
+            original_validate = token_engine.capture_validated_skip
             def validate(*args, **kwargs):
                 owner = original_validate(*args, **kwargs)
                 revision.return_value = new
                 return owner
             loader = Mock(side_effect=AssertionError('skip must not extract'))
-            with patch('token_engine.validate_skip', side_effect=validate):
+            with patch('token_engine.capture_validated_skip', side_effect=validate):
                 result = run(loader)
             self.assertEqual(result.skipped, 1, result.errors)
             self.assertTrue(any('Параметры генерации' in w for w in result.warnings))
@@ -999,6 +999,85 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(report.skipped, 1, report.errors)
                     self.assertFalse(report.warnings)
 
+    def test_skip_protocol_detects_source_and_destination_changes_for_all_paths(self):
+        import token_engine as engine
+        from unittest.mock import Mock
+        for path in ('batch', 'existing', 'publication', 'copy'):
+            for changed in ('source', 'destination'):
+                with self.subTest(path=path, changed=changed), tempfile.TemporaryDirectory() as d:
+                    source = Path(d) / 'Hero.png'
+                    self.figure.save(source)
+                    kind = 'copy' if path == 'copy' else 'token'
+                    destination = source.with_suffix('.webp') if kind == 'copy' else token_output_path(source)
+                    identity = engine.source_identity(source)
+                    recipe = engine.COPY_RECIPE if kind == 'copy' else engine.token_recipe(
+                        self.frame, Adjust(), 256, 'webp', None)
+                    def winner():
+                        engine.save_generated(self.figure, destination, source, kind, skip_exists=False,
+                                              input_identity=identity, recipe=recipe)
+                    if path != 'publication':
+                        winner()
+                    mutation = b'changed external bytes'
+                    def mutate():
+                        (source if changed == 'source' else destination).write_bytes(mutation)
+                        return recipe
+                    def loser(temporary, target):
+                        winner()
+                        return False
+                    # Avoid recursive interception while publishing the winner.
+                    real_publish = engine._publish_new
+                    def publish(temporary, target):
+                        with patch.object(engine, '_publish_new', real_publish):
+                            return loser(temporary, target)
+                    if path == 'batch':
+                        loader = Mock(side_effect=AssertionError('skip must not extract'))
+                        result = engine.export_images(
+                            [source], loader, lambda p: destination, lambda im, p: im, kind=kind,
+                            convert_original=False, recipe_for=lambda p, actual=None: mutate())
+                        self.assertEqual(result.skipped, 0)
+                        self.assertTrue(result.errors)
+                        loader.assert_not_called()
+                    elif path == 'copy':
+                        # Inject mutation after validation via approval guard.
+                        checks = []
+                        def approval():
+                            checks.append(True)
+                            if len(checks) == 2:
+                                mutate()
+                        with self.assertRaises(OSError):
+                            engine.save_original_webp(source, input_identity=identity, approval_guard=approval)
+                    else:
+                        with patch.object(engine, '_publish_new', side_effect=publish), self.assertRaises(OSError):
+                            engine.save_generated(self.figure, destination, source, kind, skip_exists=True,
+                                                  input_identity=identity, recipe=recipe, skip_recipe=mutate)
+                    self.assertEqual((source if changed == 'source' else destination).read_bytes(), mutation)
+
+    def test_actual_atomic_publication_loser_accepts_only_the_current_winner(self):
+        import token_engine as engine
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            destination = token_output_path(source)
+            identity = engine.source_identity(source)
+            old = engine.recipe_digest('token', revision='old')
+            current = engine.recipe_digest('token', revision='new')
+            winner = Image.new('RGBA', (32, 32), 'green')
+            exif = Image.Exif()
+            exif[270] = engine.export_owner(source, 'token', source_digest=identity[-1], recipe=current)
+            winner_bytes = []
+            def lose(temporary, path):
+                winner.save(path, 'WEBP', lossless=True, exif=exif)
+                winner_bytes.append(path.read_bytes())
+                return False
+            with patch.object(engine, '_publish_new', side_effect=lose) as publish:
+                result = engine.save_generated(self.figure, destination, source, 'token',
+                                               skip_exists=True, input_identity=identity, recipe=old,
+                                               skip_recipe=lambda: current)
+            publish.assert_called_once()
+            self.assertFalse(result.created)
+            self.assertFalse(result.warnings)
+            self.assertEqual(destination.read_bytes(), winner_bytes[0])
+
     def test_token_without_visible_subject_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'вне видимой области'):
             compose(self.figure, self.frame, self.mask, 256, Adjust(x=120))
@@ -1027,6 +1106,38 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(values[0], ('RGB', {'session': 'fake-session'}))
         self.assertEqual(values[1][1]['decontaminate'], True)
         self.assertEqual(values[2][1]['alpha_matting'], True)
+
+    def test_expensive_modes_are_bounded_at_public_entry_point(self):
+        from resource_policy import EXTRACTION_POLICIES, ExtractionPolicy
+        from unittest.mock import Mock
+        for mode in EXTRACTION_POLICIES:
+            with self.subTest(mode=mode), patch.dict(EXTRACTION_POLICIES, {mode: ExtractionPolicy(100)}):
+                backend = Mock()
+                with patch('token_engine.call_rembg', backend):
+                    with self.assertRaisesRegex(ValueError, 'слишком велик'):
+                        remove_background(Image.new('RGBA', (11, 10)), object(), mode)
+                backend.assert_not_called()
+
+    def test_resource_policy_exact_boundaries_without_allocating_large_images(self):
+        from resource_policy import (EXTRACTION_POLICIES, validate_extraction_dimensions,
+                                     validate_intermediate_size, MAX_COMPOSITION_PIXELS)
+        for mode, policy in EXTRACTION_POLICIES.items():
+            with self.subTest(mode=mode):
+                validate_extraction_dimensions(SimpleNamespace(width=1024, height=policy.max_pixels // 1024), mode)
+                with self.assertRaises(ValueError):
+                    validate_extraction_dimensions(
+                        SimpleNamespace(width=1024, height=policy.max_pixels // 1024 + 1), mode)
+        validate_intermediate_size((4096, MAX_COMPOSITION_PIXELS // 4096))
+        with self.assertRaises(ValueError):
+            validate_intermediate_size((4096, MAX_COMPOSITION_PIXELS // 4096 + 1))
+
+    def test_invalid_output_size_is_rejected_before_allocation(self):
+        from token_engine import prepare_token_frame
+        with patch('token_engine.Image.new', side_effect=AssertionError('unexpected allocation')):
+            with self.assertRaises(ValueError):
+                compose(self.figure, self.frame, self.mask, 100000)
+            with self.assertRaises(ValueError):
+                prepare_token_frame(self.frame, self.mask, 100000)
 
     def test_webp_retains_alpha(self):
         import tempfile

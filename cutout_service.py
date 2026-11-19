@@ -5,8 +5,7 @@ from PIL import Image
 from token_engine import already_transparent, assert_source_identity, validate_art_dimensions
 from local_models import require_local_model, model_revision
 from process_lock import process_lock
-
-MEMORY_LIMIT_BYTES = 256 * 1024**2
+from resource_policy import MEMORY_CACHE_BYTES as MEMORY_LIMIT_BYTES, validate_extraction_dimensions
 
 
 @dataclass(frozen=True)
@@ -84,8 +83,9 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
                     return CutoutResult(original, revision)
                 if not isinstance(lock_error, TimeoutError):
                     raise
-                # Opaque artwork still needs the shared inference lock. Reuse
-                # the verified decode only if the second cache lookup misses.
+                # No full pixel buffer may survive a blocking wait. A cache
+                # hit after the reservation needs no further decoding.
+                original = None
                 reservation.enter_context(process_lock(lock_path, timeout=120))
             revision = model_revision(model)
             memory_key = (*key, revision)
@@ -93,9 +93,13 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
             if cutout is None:
                 if original is None:
                     original = decode(path, identity=identity)
+                validate_art_dimensions(original)
                 if keep_alpha and already_transparent(original):
                     cutout = original
                 else:
+                    # Reject expensive work before allocating a native session.
+                    # The public remove_background entry point checks this too.
+                    validate_extraction_dimensions(original, edge_mode)
                     existing = sessions.get(model)
                     if existing is not None and existing[0] == revision:
                         session = existing[1]

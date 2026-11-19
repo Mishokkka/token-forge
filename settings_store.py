@@ -10,6 +10,7 @@ from token_engine import atomic_write, Adjust, source_identity, source_snapshot,
 from local_models import LOCAL_MODELS, DEFAULT_MODEL, require_local_model
 from item_engine import ItemAdjust, ITEM_MODES
 from process_lock import process_lock as settings_lock
+from resource_policy import EDGE_MODES, DEFAULT_EDGE_MODE, TOKEN_OUTPUT_SIZES
 
 
 def read_settings_file(path: Path, *, strict=False) -> dict:
@@ -30,7 +31,6 @@ def read_settings_file(path: Path, *, strict=False) -> dict:
 
 
 
-EDGE_MODES = ('Очистка краёв', 'Обычный', 'Alpha matting (медленно)')
 BOOL_DEFAULTS = {'keep_alpha': True, 'skip_exists': True, 'convert_original': True}
 
 
@@ -59,7 +59,7 @@ def decode_settings(raw, *, default_frame, strict=False, mode=None):
             value = invalid(name, default)
         result[name] = value
     for name, allowed, default in (('model', LOCAL_MODELS, DEFAULT_MODEL),
-                                   ('edge_mode', EDGE_MODES, EDGE_MODES[0])):
+                                   ('edge_mode', EDGE_MODES, DEFAULT_EDGE_MODE)):
         value = raw.get(name, default)
         if name == 'model' and strict:
             require_local_model(value)
@@ -68,9 +68,9 @@ def decode_settings(raw, *, default_frame, strict=False, mode=None):
     if mode != 'item':
         result['ext'] = output_format(raw.get('ext', 'webp'), strict=strict)
         size = raw.get('size', 256)
-        if isinstance(size, str) and size in ('256', '512', '1024'):
+        if isinstance(size, str) and size in tuple(map(str, TOKEN_OUTPUT_SIZES)):
             size = int(size)
-        result['size'] = size if type(size) is int and size in (256, 512, 1024) else invalid('size', 256)
+        result['size'] = size if type(size) is int and size in TOKEN_OUTPUT_SIZES else invalid('size', 256)
     ring = raw.get('ring', str(default_frame))
     if not isinstance(ring, str) or '\0' in ring:
         ring = invalid('ring', str(default_frame))

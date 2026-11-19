@@ -34,6 +34,7 @@ from settings_store import (read_settings_file, save_settings_delta, adjustment_
 from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session, model_revision
 from cutout_service import load_cutout
 from preview_renderer import PreviewJob, PreviewRenderer
+from resource_policy import TOKEN_OUTPUT_SIZES
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -159,7 +160,7 @@ class TokenForge:
         self.edge_mode = tk.StringVar(value=self.settings.get('edge_mode', EDGE_MODES[0]))
         self.show_cutout = tk.BooleanVar(value=False)
         saved_size = str(self.settings.get('size', 256))
-        self.size = tk.StringVar(value=saved_size if saved_size in ('256', '512', '1024') else '256')
+        self.size = tk.StringVar(value=saved_size if saved_size in tuple(map(str, TOKEN_OUTPUT_SIZES)) else '256')
         self.ext = tk.StringVar(value=output_format(self.settings.get('ext', 'webp')))
         self.keep_alpha = tk.BooleanVar(value=self.settings.get('keep_alpha', True))
         self.skip_exists = tk.BooleanVar(value=self.settings.get('skip_exists', True))
@@ -306,7 +307,7 @@ class TokenForge:
         options = tk.Frame(self.token_controls, bg=PANEL)
         options.pack(fill='x', pady=(8, 5))
         self._label(options, 'Размер:', font=('Segoe UI', 9)).grid(row=0, column=0, sticky='w', pady=3)
-        size_box = ttk.Combobox(options, values=['256', '512', '1024'], textvariable=self.size,
+        size_box = ttk.Combobox(options, values=tuple(map(str, TOKEN_OUTPUT_SIZES)), textvariable=self.size,
                                  state='readonly', width=8)
         size_box.grid(row=0, column=1, sticky='w', padx=(8, 0), pady=3)
         size_box.bind('<<ComboboxSelected>>', lambda e: self._on_size_change())

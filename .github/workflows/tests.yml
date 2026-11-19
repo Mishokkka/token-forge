@@ -49,6 +49,8 @@ jobs:
         run: python python_compat.py
       - name: Verify installer imports (no model download)
         run: python -c "import PIL, rembg, onnxruntime, tkinterdnd2, tkinter; print('Imports OK')"
+      - name: Exercise installed background-removal kernels with synthetic masks
+        run: python backend_smoke.py
 
   gui-smoke:
     runs-on: windows-latest

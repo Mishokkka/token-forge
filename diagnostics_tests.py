@@ -3,7 +3,8 @@ import sys
 import unittest
 from pathlib import Path
 
-REQUIRED_SUITES = ('test_engine.py', 'test_items.py', 'test_cli.py', 'test_cache.py', 'test_settings.py')
+REQUIRED_SUITES = ('test_engine.py', 'test_items.py', 'test_cli.py', 'test_cache.py', 'test_settings.py',
+                   'test_image_normalization.py', 'test_concurrency.py')
 
 
 class ExecutionResult(unittest.TextTestResult):
