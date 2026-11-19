@@ -1118,6 +1118,19 @@ class EngineTests(unittest.TestCase):
                         remove_background(Image.new('RGBA', (11, 10)), object(), mode)
                 backend.assert_not_called()
 
+    def test_resource_policy_exact_boundaries_without_allocating_large_images(self):
+        from resource_policy import (EXTRACTION_POLICIES, validate_extraction_dimensions,
+                                     validate_intermediate_size, MAX_COMPOSITION_PIXELS)
+        for mode, policy in EXTRACTION_POLICIES.items():
+            with self.subTest(mode=mode):
+                validate_extraction_dimensions(SimpleNamespace(width=1024, height=policy.max_pixels // 1024), mode)
+                with self.assertRaises(ValueError):
+                    validate_extraction_dimensions(
+                        SimpleNamespace(width=1024, height=policy.max_pixels // 1024 + 1), mode)
+        validate_intermediate_size((4096, MAX_COMPOSITION_PIXELS // 4096))
+        with self.assertRaises(ValueError):
+            validate_intermediate_size((4096, MAX_COMPOSITION_PIXELS // 4096 + 1))
+
     def test_invalid_output_size_is_rejected_before_allocation(self):
         from token_engine import prepare_token_frame
         with patch('token_engine.Image.new', side_effect=AssertionError('unexpected allocation')):

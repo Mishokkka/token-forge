@@ -192,6 +192,12 @@ class NoClipTests(unittest.TestCase):
                     (870, 140), (108, 156)], fill=(230, 145, 30, 255))
         dr.line([(32, 102), (940, 113)], fill=(255, 255, 255, 230), width=4)
 
+    def test_invalid_output_dimensions_fail_before_orientation(self):
+        from unittest.mock import patch
+        with patch('item_engine._orient', side_effect=AssertionError('unexpected orientation')):
+            with self.assertRaises(ValueError):
+                compose_item(Image.new('RGBA', (2, 2), 'red'), size=100000)
+
     def test_extreme_zoom_caps_at_full_fitting_size(self):
         for mode in ITEM_MODES:
             with self.subTest(mode=mode):

@@ -90,7 +90,7 @@ def _cms_input(artwork, layout):
         # LittleCMS expects the full 16-bit range, not right-aligned 12-bit
         # samples. Preserve precision when expanding the latter.
         if layout.high_gray_bits == 16:
-            return artwork
+            return artwork.convert('I').convert('I;16') if artwork.mode == 'I;16N' else artwork
         return _scale_gray(artwork, layout.high_gray_bits, 16)
     if layout.gray:
         if artwork.mode == 'LA':

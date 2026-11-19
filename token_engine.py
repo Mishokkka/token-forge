@@ -16,7 +16,7 @@ import math
 from local_models import call_rembg, model_revision
 from process_lock import process_lock
 from resource_policy import (MAX_ENCODED_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, MAX_RING_SIDE,
-                             DISK_CACHE_BYTES, DISK_CACHE_ENTRIES, validate_extraction_dimensions,
+                             DISK_CACHE_BYTES, DISK_CACHE_ENTRIES, DEFAULT_EDGE_MODE, validate_extraction_dimensions,
                              validate_output_size, validate_intermediate_size)
 from PIL import Image, ImageDraw, ImageFilter, ImageChops
 from image_normalization import decode_artwork, NORMALIZATION_VERSION
@@ -181,8 +181,8 @@ class DiskCutoutCache:
                  *, identity: tuple | None = None, revision=None) -> Path:
         version = identity or source_identity(source)
         revision = model_revision(model) if revision is None else revision
-        key = [CUTOUT_CACHE_VERSION, version[0], version[-1],
-               model, bool(keep_alpha), edge_mode, revision]
+        key = [version[0], version[-1],
+               extraction_provenance(model, keep_alpha, edge_mode, revision=revision)]
         digest = hashlib.sha256(json.dumps(key, ensure_ascii=False).encode('utf-8')).hexdigest()
         return self.directory / f'{digest}.png'
 
@@ -190,11 +190,13 @@ class DiskCutoutCache:
              *, identity: tuple | None = None, revision=None) -> Image.Image | None:
         path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
         try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                return None
             with open_art(path, formats=('PNG',)) as stored:
                 image = stored.convert('RGBA')
             try:
-                os.utime(path, None)
-            except OSError:
+                os.utime(path, None, follow_symlinks=False)
+            except (OSError, NotImplementedError):
                 pass
             return image
         except FileNotFoundError:
@@ -351,8 +353,6 @@ class CapturedArtwork:
 
 def read_image(path: Path, *, identity: tuple | None = None) -> Image.Image:
     if identity is None:
-        if path.stat().st_size > MAX_ENCODED_BYTES:
-            raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
         with open_art(path) as img:
             return decode_artwork(img, force_alpha=True)
     with source_snapshot(path, identity) as snapshot:
@@ -365,7 +365,7 @@ def already_transparent(img: Image.Image) -> bool:
     return img.getchannel('A').getextrema()[0] < 250
 
 
-def remove_background(img: Image.Image, session, edge_mode: str = 'Очистка краёв') -> Image.Image:
+def remove_background(img: Image.Image, session, edge_mode: str = DEFAULT_EDGE_MODE) -> Image.Image:
     # Never hard-threshold the soft mask; fine hair depends on partial alpha.
     validate_art_dimensions(img)
     policy = validate_extraction_dimensions(img, edge_mode)
@@ -474,8 +474,6 @@ def _enclosed_shape(barrier: Image.Image) -> Image.Image:
 
 
 def load_frame(path: Path):
-    if path.stat().st_size > MAX_ENCODED_BYTES:
-        raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
     with open_art(path, ring=True) as raw:
         frame = decode_artwork(raw, force_alpha=True)
     return frame, frame_interior(frame)
@@ -523,6 +521,9 @@ class PreparedTokenFrame:
 def prepare_token_frame(frame, interior, out_size):
     """Prepare the invariant ring layers once per frame and output size."""
     validate_output_size(out_size)
+    _validate_dimensions(*frame.size, ring=True)
+    if interior.size != frame.size or interior.mode != 'L' or frame.mode != 'RGBA':
+        raise ValueError('Рамка RGBA и её маска L должны иметь одинаковый размер.')
     inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
     support = interior.point(lambda a: 255 if a else 0).resize(
         (out_size, out_size), Image.Resampling.NEAREST)
@@ -783,7 +784,7 @@ COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100,
 
 def extraction_provenance(model, keep_alpha, edge_mode, *, revision=None):
     """Use the exact observed revision for rendered pixels, current one for freshness."""
-    return (model, keep_alpha, edge_mode, CUTOUT_CACHE_VERSION,
+    return (model, bool(keep_alpha), edge_mode, CUTOUT_CACHE_VERSION, NORMALIZATION_VERSION,
             model_revision(model) if revision is None else revision)
 
 
@@ -1117,6 +1118,8 @@ class ValidatedExport:
 
 def capture_validated_skip(destination, source, kind, *, identity=None):
     """Validate a decodable owned image on the exact bytes we fingerprint."""
+    if destination.suffix.lower() not in ('.png', '.webp'):
+        raise ValueError('Результат TokenForge должен иметь расширение PNG или WebP.')
     try:
         if identity is None:
             with fingerprinted_snapshot(destination) as (identity, snapshot):

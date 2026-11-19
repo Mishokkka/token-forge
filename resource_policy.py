@@ -10,7 +10,9 @@ MAX_ENCODED_BYTES = 256 * MIB
 MAX_IMAGE_PIXELS = 64 * MIB
 MAX_IMAGE_SIDE = 16384
 MAX_RING_SIDE = 4096
-MAX_OUTPUT_SIDE = 1024
+TOKEN_OUTPUT_SIZES = (256, 512, 1024)
+MAX_OUTPUT_SIDE = max(TOKEN_OUTPUT_SIZES)
+DEFAULT_EDGE_MODE = 'Очистка краёв'
 MAX_COMPOSITION_PIXELS = 16 * MIB
 MEMORY_CACHE_BYTES = 256 * MIB
 DISK_CACHE_BYTES = 2 * 1024 * MIB
@@ -27,16 +29,17 @@ class ExtractionPolicy:
 # matting additionally builds sparse systems. Do not silently reduce quality,
 # switch modes, or apply these limits to already-transparent/cache-hit art.
 EXTRACTION_POLICIES = {
+    DEFAULT_EDGE_MODE: ExtractionPolicy(4 * MIB, (('decontaminate', True),)),
     'Обычный': ExtractionPolicy(16 * MIB),
-    'Очистка краёв': ExtractionPolicy(4 * MIB, (('decontaminate', True),)),
-    'Alpha matting (медленно)': ExtractionPolicy(2 * MIB, (('alpha_matting', True),)),
+    'Alpha matting (медленно)': ExtractionPolicy(1 * MIB, (('alpha_matting', True),)),
 }
+EDGE_MODES = tuple(EXTRACTION_POLICIES)
 
 
 def extraction_options(edge_mode):
     try:
         return EXTRACTION_POLICIES[edge_mode]
-    except KeyError:
+    except (KeyError, TypeError):
         raise ValueError(f'Неизвестный режим краёв: {edge_mode}') from None
 
 

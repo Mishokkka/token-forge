@@ -17,6 +17,7 @@ from token_engine import (
     LoadedCutout, excluded_file, extraction_provenance,
 )
 from item_engine import item_output_path, export_items
+from resource_policy import DEFAULT_EDGE_MODE
 
 BASE = Path(__file__).resolve().parent
 PREFS_DIR = preferences_dir()
@@ -101,7 +102,7 @@ def automatic_token(filename: str | Path) -> tuple[str, Path]:
 
 
     model = settings.get('model', DEFAULT_MODEL)
-    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    edge_mode = settings.get('edge_mode', DEFAULT_EDGE_MODE)
     keep_alpha = settings['keep_alpha']
     ext = settings['ext']
     size = settings['size']
@@ -136,7 +137,7 @@ def automatic_item(filename: str | Path) -> tuple[str, Path]:
     settings = decode_settings(read_settings(), default_frame=BASE / 'RingT.png', strict=True, mode='item')
     source = resolve_context_source(filename, frame_path=Path(settings['ring']))
     model = settings.get('model', DEFAULT_MODEL)
-    edge_mode = settings.get('edge_mode', 'Очистка краёв')
+    edge_mode = settings.get('edge_mode', DEFAULT_EDGE_MODE)
     keep_alpha = settings['keep_alpha']
     adj = adjustment_for(settings, source, 'item')
     get_cutout = make_cutout_loader(model, keep_alpha, edge_mode)

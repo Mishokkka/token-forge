@@ -10,7 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from PIL import Image, ImageChops, ImageFilter
 
-from token_engine import BatchResult, export_images, recipe_digest, canonical_placement
+from token_engine import BatchResult, export_images, recipe_digest, canonical_placement, validate_art_dimensions
+from resource_policy import validate_output_size
 
 ITEM_SIZE = 500
 ITEM_STROKE = 3
@@ -98,6 +99,11 @@ def _major_axis_angle(image: Image.Image) -> float:
 
 
 def _orient(cutout: Image.Image, adjust: ItemAdjust) -> Image.Image:
+    validate_art_dimensions(cutout)
+    if adjust.layout not in ITEM_MODES:
+        raise ValueError(f'Неизвестный способ расположения: {adjust.layout}')
+    if not math.isfinite(float(adjust.rotation)):
+        raise ValueError('Некорректный угол поворота.')
     image = _prepare_subject(cutout, adjust.clean_noise)
     image = image.crop(_subject_bbox(image, clean_noise=False))
     # Mirrors are applied before automatic diagonal alignment so the chosen
@@ -107,8 +113,6 @@ def _orient(cutout: Image.Image, adjust: ItemAdjust) -> Image.Image:
     if adjust.flip_vertical:
         image = image.transpose(Image.Transpose.FLIP_TOP_BOTTOM)
     image.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-    if adjust.layout not in ITEM_MODES:
-        raise ValueError(f'Неизвестный способ расположения: {adjust.layout}')
     rotation = float(adjust.rotation)
     if adjust.layout != 'По центру':
         target = 45.0 if adjust.layout == 'Диагональ ↗' else -45.0
@@ -130,14 +134,16 @@ def compose_item(cutout: Image.Image, adjust: ItemAdjust | None = None,
     """
     if adjust is None:
         adjust = ItemAdjust()
-    if size < 32 or stroke_px < 0 or stroke_px > size // 10:
+    validate_output_size(size)
+    if size < 32 or type(stroke_px) is not int or stroke_px < 0 or stroke_px > size // 10:
         raise ValueError('Некорректные параметры размера или обводки.')
     if not math.isfinite(float(adjust.zoom)) or float(adjust.zoom) <= 0:
         raise ValueError('Масштаб предмета должен быть положительным.')
     if not all(math.isfinite(float(value)) for value in (adjust.x, adjust.y, adjust.rotation)):
         raise ValueError('Некорректные параметры положения или поворота.')
 
-    image = _orient(cutout, adjust) if prepared is None else prepared
+    validate_art_dimensions(cutout)
+    image = _orient(cutout, adjust) if prepared is None else validate_art_dimensions(prepared)
     # Center: the user requested >=5% whitespace, diagonals use a small
     # visual margin. Three black outline pixels need their own safe space.
     margin = math.ceil(size * .05) if adjust.layout == 'По центру' else round(size * .018)

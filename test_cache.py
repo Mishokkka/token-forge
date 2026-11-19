@@ -91,6 +91,15 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(blocked.exists())
         self.assertFalse(first.path_for(other, *args).exists())
 
+    def test_disk_cache_key_uses_the_same_normalization_revision_as_exports(self):
+        from token_engine import extraction_provenance
+        args = ('birefnet-general', True, 'Обычный')
+        old = self.cache.path_for(self.source, *args)
+        recipe = extraction_provenance(*args)
+        with patch('token_engine.NORMALIZATION_VERSION', 999):
+            self.assertNotEqual(self.cache.path_for(self.source, *args), old)
+            self.assertNotEqual(extraction_provenance(*args), recipe)
+
     def test_disk_cache_persists_full_rgba_unchanged(self):
         image = Image.new('RGBA', (170, 220), (11, 22, 33, 0))
         image.putpixel((20, 30), (71, 92, 154, 157))
