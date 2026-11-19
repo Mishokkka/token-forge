@@ -21,7 +21,7 @@ When updating, copy the complete source distribution, not individual modules. Pr
 
 Select a folder, choose the desired mode, adjust the preview and export one image or the entire folder. Existing independent images require explicit overwrite approval; legacy or stale generated files are not silently overwritten by skip mode.
 
-Limits: PNG/JPEG/WebP/BMP/TIFF, 256 MiB encoded size, 64 Mi pixels, side at most 16384 px, rings at most 4096 square. Valid embedded color profiles are converted to sRGB.
+Limits: PNG/JPEG/WebP/BMP/TIFF, 256 MiB encoded size, 64 Mi pixels, side at most 16384 px, rings at most 4096 square. Valid embedded color profiles are converted to sRGB. Uncached background removal has separate work-size limits: ordinary 16 Mi pixels, edge cleanup 4 Mi pixels, alpha matting 1 Mi pixel. Larger images can still be viewed/copied subject to decoder limits; for extraction, resize or choose a less expensive mode. Transparent bypass and valid cache hits do not require inference. Signed/float/32-bit grayscale data needs conversion to a defined 8/16-bit display range first.
 
 ## Checks
 
