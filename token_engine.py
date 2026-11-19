@@ -18,9 +18,10 @@ from process_lock import process_lock
 from resource_policy import (MAX_ENCODED_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, MAX_RING_SIDE,
                              DISK_CACHE_BYTES, DISK_CACHE_ENTRIES, validate_extraction_dimensions,
                              validate_output_size, validate_intermediate_size)
-from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
+from PIL import Image, ImageDraw, ImageFilter, ImageChops
+from image_normalization import decode_artwork, NORMALIZATION_VERSION
 
-CUTOUT_CACHE_VERSION = 5
+CUTOUT_CACHE_VERSION = 6
 ART_FORMATS = ('PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF')
 
 
@@ -302,69 +303,6 @@ def source_snapshot(path: Path, identity: tuple):
             raise OSError(f'Исходный файл изменился во время чтения: {path.name}')
         snapshot.seek(0)
         yield snapshot
-
-
-def decode_artwork(raw, *, force_alpha=False):
-    """Normalize tagged artwork to sRGB; preserve alpha independently of color.
-
-    Never attach a CMYK/grayscale source profile to converted RGB data.
-    Invalid embedded profiles fail with an actionable per-image error.
-    """
-    import io
-    from PIL import ImageCms
-    # Pillow exposes a 16-bit grayscale+alpha PNG as RGBA. Capture the
-    # decoder's original sample layout before exif_transpose loads it.
-    gray_alpha16_png = (raw.format == 'PNG' and raw.mode == 'RGBA'
-                        and any(tile[3] == 'LA;16B' for tile in getattr(raw, 'tile', ())))
-    artwork = ImageOps.exif_transpose(raw)
-    has_alpha = 'A' in artwork.getbands() or 'transparency' in artwork.info
-    grayscale16 = artwork.mode in ('I;16', 'I;16L', 'I;16B')
-    profile = artwork.info.get('icc_profile')
-    alpha = None
-    if has_alpha and (profile or grayscale16):
-        transparent = artwork.info.get('transparency')
-        if grayscale16 and isinstance(transparent, int):
-            # Test the original sample, not its quantized RGB equivalent.
-            from PIL import ImageMath
-            alpha = ImageMath.lambda_eval(lambda args: (args['samples'] != args['key']) * 255,
-                                          samples=artwork.convert('I'), key=transparent).convert('L')
-        else:
-            alpha = artwork.convert('RGBA').getchannel('A')
-    if profile:
-        try:
-            source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
-            target = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
-            if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB', 'I;16', 'I;16L', 'I;16B'):
-                color = artwork
-            elif artwork.mode == '1':
-                color = artwork.convert('L')
-            elif artwork.mode == 'LA':
-                color = artwork.getchannel('L')
-            elif gray_alpha16_png:
-                # The decoder already expanded gray into three equal 8-bit
-                # channels. CMS needs one gray channel; alpha is independent.
-                color = artwork.getchannel('R')
-            else:
-                color = artwork.convert('RGB')
-            result = ImageCms.profileToProfile(color, source, target, outputMode='RGB')
-            if alpha is not None:
-                result.putalpha(alpha)
-            elif force_alpha:
-                result = result.convert('RGBA')
-            result.info['icc_profile'] = target.tobytes()
-            return result
-        except (OSError, ValueError, TypeError, ImageCms.PyCMSError) as exc:
-            raise ValueError('Некорректный или неподдерживаемый цветовой профиль ICC. '
-                             'Сохрани изображение в sRGB и повтори обработку.') from exc
-    # Pillow's ordinary 16-bit -> RGB conversion clips values above 255.
-    # Scale the sample range rather than saturating most grayscale pixels.
-    if grayscale16:
-        gray = artwork.convert('I').point(lambda value: (value + 128) / 257).convert('L')
-        result = gray.convert('RGBA' if has_alpha or force_alpha else 'RGB')
-        if alpha is not None:
-            result.putalpha(alpha)
-        return result
-    return artwork.convert('RGBA' if has_alpha or force_alpha else 'RGB')
 
 
 class BorrowedStream:
@@ -840,7 +778,7 @@ def recipe_digest(kind, **settings):
 
 
 COPY_RECIPE = recipe_digest('copy', quality=95, method=6, alpha_quality=100,
-                            color='sRGB', decoder=2)
+                            color='sRGB', decoder=NORMALIZATION_VERSION)
 
 
 def extraction_provenance(model, keep_alpha, edge_mode, *, revision=None):
