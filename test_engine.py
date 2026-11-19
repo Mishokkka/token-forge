@@ -1028,6 +1028,25 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(values[1][1]['decontaminate'], True)
         self.assertEqual(values[2][1]['alpha_matting'], True)
 
+    def test_expensive_modes_are_bounded_at_public_entry_point(self):
+        from resource_policy import EXTRACTION_POLICIES, ExtractionPolicy
+        from unittest.mock import Mock
+        for mode in EXTRACTION_POLICIES:
+            with self.subTest(mode=mode), patch.dict(EXTRACTION_POLICIES, {mode: ExtractionPolicy(100)}):
+                backend = Mock()
+                with patch('token_engine.call_rembg', backend):
+                    with self.assertRaisesRegex(ValueError, 'слишком велик'):
+                        remove_background(Image.new('RGBA', (11, 10)), object(), mode)
+                backend.assert_not_called()
+
+    def test_invalid_output_size_is_rejected_before_allocation(self):
+        from token_engine import prepare_token_frame
+        with patch('token_engine.Image.new', side_effect=AssertionError('unexpected allocation')):
+            with self.assertRaises(ValueError):
+                compose(self.figure, self.frame, self.mask, 100000)
+            with self.assertRaises(ValueError):
+                prepare_token_frame(self.frame, self.mask, 100000)
+
     def test_webp_retains_alpha(self):
         import tempfile
         with tempfile.TemporaryDirectory() as temp:

@@ -14,12 +14,12 @@ from statistics import median
 import math
 from local_models import call_rembg, model_revision
 from process_lock import process_lock
+from resource_policy import (MAX_ENCODED_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, MAX_RING_SIDE,
+                             DISK_CACHE_BYTES, DISK_CACHE_ENTRIES, validate_extraction_dimensions,
+                             validate_output_size, validate_intermediate_size)
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageChops
 
 CUTOUT_CACHE_VERSION = 5
-MAX_ENCODED_BYTES = 256 * 1024 * 1024
-MAX_IMAGE_PIXELS = 64 * 1024 * 1024
-MAX_IMAGE_SIDE = 16384
 ART_FORMATS = ('PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF')
 
 
@@ -27,7 +27,7 @@ def _validate_dimensions(width, height, *, ring=False):
     if ring:
         if width != height:
             raise ValueError('PNG-кольцо должно быть квадратным.')
-        if width > 4096:
+        if width > MAX_RING_SIDE:
             raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
     if (width <= 0 or height <= 0 or width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE
             or width * height > MAX_IMAGE_PIXELS):
@@ -168,7 +168,7 @@ def assert_source_identity(source: Path, identity: tuple) -> None:
 class DiskCutoutCache:
     """Lossless persistent cache. No image extraction rerun for unchanged inputs."""
 
-    def __init__(self, directory: Path, *, max_bytes=2 * 1024**3, max_entries=4096):
+    def __init__(self, directory: Path, *, max_bytes=DISK_CACHE_BYTES, max_entries=DISK_CACHE_ENTRIES):
         self.directory = Path(directory)
         self.max_bytes = max_bytes
         self.max_entries = max_entries
@@ -412,14 +412,10 @@ def already_transparent(img: Image.Image) -> bool:
 
 def remove_background(img: Image.Image, session, edge_mode: str = 'Очистка краёв') -> Image.Image:
     # Never hard-threshold the soft mask; fine hair depends on partial alpha.
-    kwargs = {'session': session}
-    if edge_mode == 'Очистка краёв':
-        kwargs['decontaminate'] = True
-    elif edge_mode == 'Alpha matting (медленно)':
-        kwargs['alpha_matting'] = True
-    elif edge_mode != 'Обычный':
-        raise ValueError(f'Неизвестный режим краёв: {edge_mode}')
-    result = call_rembg('remove', img.convert('RGB'), **kwargs)
+    validate_art_dimensions(img)
+    policy = validate_extraction_dimensions(img, edge_mode)
+    result = call_rembg('remove', img.convert('RGB'), session=session, **dict(policy.options))
+    validate_art_dimensions(result)
     return result.convert('RGBA')
 
 
@@ -571,6 +567,7 @@ class PreparedTokenFrame:
 
 def prepare_token_frame(frame, interior, out_size):
     """Prepare the invariant ring layers once per frame and output size."""
+    validate_output_size(out_size)
     inner = interior.resize((out_size, out_size), Image.Resampling.LANCZOS)
     support = interior.point(lambda a: 255 if a else 0).resize(
         (out_size, out_size), Image.Resampling.NEAREST)
@@ -584,6 +581,8 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
             out_size: int = 256, adjust: Adjust | None = None, *, geometry=None,
             prepared_frame=None) -> Image.Image:
     """Place cutout against a ring, clipping everything outside its interior."""
+    validate_art_dimensions(cutout)
+    validate_output_size(out_size)
     if adjust is None:
         adjust = Adjust()
     center_x, head_width, top_y = silhouette_geometry(cutout) if geometry is None else geometry
@@ -619,6 +618,7 @@ def compose(cutout: Image.Image, frame: Image.Image, interior: Image.Image,
                        max(1, int(round((lower - upper) * scale))))
         if max(target_size) > max(4096, out_size * 8):
             raise ValueError('Масштаб токена слишком велик для безопасной компоновки.')
+        validate_intermediate_size(target_size)
         scaled = cropped.resize(target_size, Image.Resampling.LANCZOS)
         image_layer.paste(scaled, (int(round(ox + left * scale)), int(round(oy + upper * scale))))
     prepared = prepare_token_frame(frame, interior, out_size) if prepared_frame is None else prepared_frame
