@@ -114,6 +114,15 @@ def run():
                     assert result.size == (500, 500)
                     result.load()
                 assert not source.with_suffix('.webp').exists()
+                # Byte progress and native-stage activity are independent
+                # of the ordinary batch progress bar.
+                model = app.model.get()
+                app._apply_inference_status((model, 'download', 250, 1000, 250.0))
+                assert int(app.inference_progress['value']) == 25
+                assert '25%' in app.model_activity.get()
+                app._apply_inference_status((model, 'initialize', 0, 0, 0.0))
+                assert str(app.inference_progress.cget('mode')) == 'indeterminate'
+                app._finish_activity()
                 app._on_close()
                 assert app.closing
                 saved = json.loads(pref_file.read_text(encoding='utf-8'))
