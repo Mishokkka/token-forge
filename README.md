@@ -26,3 +26,6 @@ Limits: PNG/JPEG/WebP/BMP/TIFF, 256 MiB encoded size, 64 Mi pixels, side at most
 ## Checks
 
 `check_install.bat` runs diagnostics and offline regression tests. `gui_smoke.py` runs genuine Tk event-loop integration with synthetic transparent art. Actions covers Python 3.11–3.13 on Windows. Model quality, first download, large real-world folders and actual Explorer interaction are manual release checks.
+
+### Model readiness and cancellation
+The desktop shows whether the selected model has a local weights file, displays downloaded bytes, percent/speed/ETA when available, and distinguishes model initialization from background removal. Native processing shows elapsed time rather than a fictional percent. Stop or close cancels a model download/inference process; completed files remain intact. Local presence does not guarantee ONNX initialization. Diagnostic stage/error log: `%LOCALAPPDATA%\TokenForge\inference.log`. Automatic Explorer actions still use the existing silent CLI.

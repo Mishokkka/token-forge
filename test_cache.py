@@ -433,6 +433,17 @@ class CacheTests(unittest.TestCase):
         app.disk_cache = self.cache
         app.cache = {}
         app.sessions = {}
+        # Keep existing unit tests injectable and offline; the real GUI
+        # instantiates InferenceClient, covered separately by process tests.
+        import threading
+        from unittest.mock import Mock
+        app.inference = None
+        app.cancel_event = threading.Event()
+        app.preview_active = False
+        app.activity = None
+        app.close_started = None
+        app.model_activity = Mock()
+        app.inference_progress = Mock()
         app.current_key = None
         app.current_cutout = None
         app.closing = False
