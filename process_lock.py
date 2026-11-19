@@ -4,10 +4,11 @@ import os
 import errno
 from pathlib import Path
 import time
+from operation_control import check_cancel
 
 
 @contextmanager
-def process_lock(path: Path, timeout=3.0):
+def process_lock(path: Path, timeout=3.0, *, cancel_event=None):
     """Stable lock inode; OS releases lock when its owning process exits."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_name(path.name + '.lock')
@@ -16,6 +17,7 @@ def process_lock(path: Path, timeout=3.0):
         # lock file, since another process may already hold an open handle.
         deadline = time.monotonic() + timeout
         while True:
+            check_cancel(cancel_event)
             try:
                 if os.name == 'nt':
                     import msvcrt
@@ -32,7 +34,10 @@ def process_lock(path: Path, timeout=3.0):
                     raise
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Ресурс занят другим экземпляром TokenForge.')
-                time.sleep(.05)
+                if cancel_event is None:
+                    time.sleep(.05)
+                else:
+                    cancel_event.wait(.05)
         try:
             yield
         finally:

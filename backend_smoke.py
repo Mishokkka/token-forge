@@ -22,7 +22,27 @@ class SyntheticSession:
         return [self.mask.copy()]
 
 
+def verify_download_manifest():
+    # Capture the actual pinned rembg call contract, without downloading.
+    import os
+    import tempfile
+    from rembg.sessions import sessions_class
+    from model_download import MODEL_ASSETS, RELEASE
+    with tempfile.TemporaryDirectory() as directory, \
+         patch.dict(os.environ, {'U2NET_HOME': directory}, clear=False):
+        os.environ.pop('MODEL_CHECKSUM_DISABLED', None)
+        for name, (asset, checksum) in MODEL_ASSETS.items():
+            cls = next(item for item in sessions_class if item.name() == name)
+            with patch('pooch.retrieve') as retrieve:
+                cls.download_models()
+            retrieve.assert_called_once()
+            call = retrieve.call_args
+            assert call.args[:2] == (RELEASE + asset, checksum), (name, call)
+            assert call.kwargs['fname'] == name + '.onnx'
+
+
 def run():
+    verify_download_manifest()
     size = (96, 96)
     mask = Image.new('L', size)
     ImageDraw.Draw(mask).ellipse((20, 16, 75, 80), fill=255)

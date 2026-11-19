@@ -31,7 +31,9 @@ from item_engine import ItemAdjust, ITEM_MODES, compose_item, export_items, item
 from settings_store import (read_settings_file, save_settings_delta, adjustment_for,
                             override_for, output_format, valid_layout, TOKEN_RANGES, ITEM_RANGES,
                             EDGE_MODES, decode_settings, recover_settings_file, BatchAdjustments)
-from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session, model_revision
+from local_models import LOCAL_MODELS, DEFAULT_MODEL, new_local_session, model_revision, weights_status
+from inference_worker import InferenceClient
+from operation_control import OperationCancelled
 from cutout_service import load_cutout
 from preview_renderer import PreviewJob, PreviewRenderer
 from resource_policy import TOKEN_OUTPUT_SIZES
@@ -90,8 +92,8 @@ class TokenForge:
     def __init__(self, startup_file: Path | None = None, startup_mode: str | None = None):
         self.root = RootClass()
         self.root.title('TokenForge 1.8.0 | Tokens & Items')
-        self.root.geometry('1070x785')
-        self.root.minsize(945, 730)
+        self.root.geometry('1070x830')
+        self.root.minsize(945, 775)
         self.root.configure(bg=BG)
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
         self.style = ttk.Style(self.root)
@@ -152,6 +154,16 @@ class TokenForge:
         self.widget_values = {}
         self.cancel_event = threading.Event()
         self.events = queue.Queue()
+        self.inference = InferenceClient(self.cancel_event, self._inference_event, log=self._inference_log)
+        self.preview_active = False
+        self.activity = None
+        self.activity_started = 0.0
+        self.activity_received = 0.0
+        self.activity_tick = 0.0
+        self.close_started = None
+        self.model_probe_active = False
+        self.model_probe_serial = 0
+        self.model_probe_request = None
         self.sliders_updating = False
         self.save_timer = None
 
@@ -188,8 +200,11 @@ class TokenForge:
         self.folder_label = tk.StringVar(value='Папка не выбрана')
         self.ring_label = tk.StringVar(value='')
         self.preview_label = tk.StringVar(value='Выбери изображение слева')
+        self.model_state = tk.StringVar(value='Проверка модели…')
+        self.model_activity = tk.StringVar(value='Нейросеть: нет активной операции')
 
         self._build()
+        self._refresh_model_status()
         self._on_work_mode_change(initial=True)
         self._request_frame(self.frame_path, initial=True)
         self._settings_baseline = self._settings_snapshot()
@@ -381,6 +396,8 @@ class TokenForge:
                                  state='readonly', width=19)
         edges_box.grid(row=1, column=1, sticky='ew', padx=(8, 0), pady=3)
         edges_box.bind('<<ComboboxSelected>>', lambda e: self._on_model_change())
+        self._label(common_options, '', color=MUTED, font=('Segoe UI', 9),
+                    textvariable=self.model_state).grid(row=2, column=0, columnspan=2, sticky='w', pady=(1, 3))
         common_options.columnconfigure(1, weight=1)
 
         checks = tk.Frame(settings_col, bg=PANEL)
@@ -402,6 +419,10 @@ class TokenForge:
         ttk.Button(actions, text='Обработать всю папку', style='Accent.TButton',
                    command=self._export_all).pack(side='left', padx=9)
         ttk.Button(actions, text='Остановить', command=self._cancel).pack(side='right')
+        tk.Label(self.root, textvariable=self.model_activity, bg=BG, fg=MUTED,
+                 font=('Segoe UI', 9), anchor='w').pack(fill='x', padx=24, pady=(1, 1))
+        self.inference_progress = ttk.Progressbar(self.root, mode='determinate', maximum=100)
+        self.inference_progress.pack(fill='x', padx=24, pady=(1, 5))
         self.progress = ttk.Progressbar(self.root, mode='determinate', maximum=100)
         self.progress.pack(fill='x', padx=24, pady=(4, 6))
         tk.Label(self.root, textvariable=self.status, bg=BG, fg=MUTED,
@@ -793,9 +814,127 @@ class TokenForge:
         self._select(self.selected, force_preview=True)
         self._schedule_save()
 
+    def _inference_log(self, message):
+        try:
+            from datetime import datetime
+            PREFS_DIR.mkdir(parents=True, exist_ok=True)
+            log = PREFS_DIR / 'inference.log'
+            # A best-effort bounded diagnostic history, never part of correctness.
+            if log.exists() and log.stat().st_size > 2 * 1024**2:
+                log.replace(log.with_suffix('.old.log'))
+            with log.open('a', encoding='utf-8') as file:
+                file.write(f'[{datetime.now().isoformat(timespec="seconds")}] {message}\n')
+        except OSError:
+            pass
+
+    def _inference_event(self, model, stage, count, total, speed):
+        if stage != 'download' or count == 0:
+            self._inference_log(f'{model}: {stage} ({count}/{total})')
+        self.events.put(('inference_status', (model, stage, count, total, speed)))
+
+    def _refresh_model_status(self):
+        """Single lightweight probe; remote model roots never block Tk."""
+        self.model_probe_serial += 1
+        self.model_probe_request = (self.model_probe_serial, self.model.get())
+        self.model_state.set('Проверка модели…')
+        self._start_model_probe()
+
+    def _start_model_probe(self):
+        if self.model_probe_active or self.closing or self.model_probe_request is None:
+            return
+        request = self.model_probe_request
+        self.model_probe_request = None
+        self.model_probe_active = True
+
+        def probe():
+            try:
+                status = weights_status(request[1])
+            except Exception:
+                status = 'unknown'
+            self.events.put(('model_probe', (*request, status)))
+
+        try:
+            threading.Thread(target=probe, daemon=True).start()
+        except (OSError, RuntimeError):
+            self.model_probe_active = False
+            self.model_state.set('Не удалось проверить модель')
+
+    def _show_model_status(self, model, status):
+        if model != self.model.get():
+            return
+        values = {'local': 'Файл модели найден • загрузка в память по необходимости',
+                  'missing': 'Модель не скачана', 'invalid': 'Файл модели пуст или недоступен',
+                  'unknown': 'Не удалось проверить модель', 'ready': 'Модель готова (в памяти)'}
+        self.model_state.set(values.get(status, status))
+
+    def _apply_inference_status(self, data):
+        model, stage, count, total, speed = data
+        self.activity_received = time.monotonic()
+        previous = self.activity
+        if previous is None or previous[:2] != data[:2]:
+            self.activity_started = time.monotonic()
+            self.inference_progress.stop()
+            determinate = stage in ('local', 'ready', 'verify') or (stage == 'download' and total > 0)
+            self.inference_progress.configure(mode='determinate' if determinate else 'indeterminate')
+            self.inference_progress['value'] = 0
+            if not determinate:
+                self.inference_progress.start(15)
+        elif stage == 'download' and total > 0 and previous[3] == 0:
+            self.inference_progress.stop()
+            self.inference_progress.configure(mode='determinate')
+        self.activity = data
+        if stage in ('local', 'ready', 'initialize'):
+            self._show_model_status(model, 'ready' if stage == 'ready' else 'local')
+        elif stage == 'download':
+            self._show_model_status(model, 'Модель скачивается…')
+        self._update_activity()
+
+    def _update_activity(self):
+        if self.activity is None:
+            return
+        model, stage, count, total, speed = self.activity
+        elapsed = max(0, int(time.monotonic() - self.activity_started))
+        names = {'wait': 'Ожидание доступа к нейросети',
+                 'download': 'Скачивание модели', 'verify': 'Проверка контрольной суммы',
+                 'local': 'Модель скачана', 'initialize': 'Инициализация ONNX',
+                 'ready': 'Модель готова', 'transfer': 'Подготовка изображения',
+                 'extract': 'Удаление фона и обработка краёв'}
+        detail = names.get(stage, stage)
+        if stage == 'download':
+            detail += f': {count / 1e6:.1f} МБ'
+            if total:
+                percent = min(100, count * 100 / total)
+                detail += f' / {total / 1e6:.1f} МБ ({percent:.0f}%)'
+                self.inference_progress['value'] = percent
+            silence = int(time.monotonic() - self.activity_received)
+            if silence >= 5:
+                detail += f', нет новых данных {silence} с'
+            elif speed > 0:
+                detail += f', {speed / 1e6:.1f} МБ/с'
+                if total > count:
+                    eta = int((total - count) / speed)
+                    detail += f', ~{eta // 60} мин {eta % 60} с'
+        elif stage in ('local', 'ready', 'verify'):
+            self.inference_progress['value'] = 100
+        self.model_activity.set(f'{model}: {detail}  |  {elapsed} с')
+
+    def _finish_activity(self):
+        if self.activity is None:
+            return
+        self.activity = None
+        self.inference_progress.stop()
+        self.inference_progress.configure(mode='determinate')
+        self.inference_progress['value'] = 0
+        cancelled = self.cancel_event.is_set()
+        self.model_activity.set('Нейросеть: операция отменена' if cancelled else 'Нейросеть: нет активной операции')
+        self._refresh_model_status()
+
     def _on_model_change(self):
         self._schedule_save()
+        self._refresh_model_status()
         if self.selected:
+            if self.preview_active:
+                self.cancel_event.set()
             self.preview_generation += 1
             self.current_cutout = None
             self.current_key = None
@@ -814,10 +953,21 @@ class TokenForge:
         elif key is None:
             key = self._cache_key(path, model, keep_alpha, edge_mode)
         decode = (lambda path, *, identity: captured.decode()) if captured is not None else read_image
-        cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key[:7],
-                            disk_cache=self.disk_cache, memory=self.cache, sessions=self.sessions,
-                            decode=decode, extract=remove_background, session_factory=new_local_session,
-                            cached_only=cached_only)
+        inference = self.inference
+        options = {} if inference is None else dict(
+            cancel_event=self.cancel_event, prepare_model=inference.prepare,
+            on_wait=lambda name: self._inference_event(name, 'wait', 0, 0, 0.0))
+        try:
+            cutout = load_cutout(path, model, keep_alpha, edge_mode, key=key[:7],
+                                disk_cache=self.disk_cache, memory=self.cache, sessions=self.sessions,
+                                decode=decode, extract=remove_background if inference is None else inference.extract,
+                                session_factory=new_local_session if inference is None else inference.session,
+                                cached_only=cached_only, **options)
+        except Exception:
+            if inference is not None:
+                self.sessions.clear()
+                inference.close()
+            raise
         return cutout.image, (*key[:7], cutout.revision)
 
     def _preview_request(self):
@@ -853,6 +1003,8 @@ class TokenForge:
         saved_frame = self.frame if prefer_saved and saved_mode == 'token' else None
         saved_interior = self.interior if saved_frame is not None else None
         self.busy = True
+        self.preview_active = True
+        self.cancel_event.clear()
         if not verify:
             self.preview_saved_only = False
             self.preview_export_stamp = None
@@ -919,9 +1071,14 @@ class TokenForge:
                 notice += ('Выбери корректное PNG-кольцо для редактирования.',)
             self.events.put(('preview', (request, img, key, observed, checked_at, notice)))
 
-        self._launch_worker(work, lambda exc: self.events.put(
-            ('error', (request, f'{path.name}: {self._worker_error_text(exc)}',
-                       isinstance(exc, OSError), verify))))
+        def failed(exc):
+            if isinstance(exc, OperationCancelled):
+                self.events.put(('preview_cancelled', request))
+            else:
+                self._inference_log(traceback.format_exc())
+                self.events.put(('error', (request, f'{path.name}: {self._worker_error_text(exc)}',
+                                           isinstance(exc, OSError), verify)))
+        self._launch_worker(work, failed)
 
     def _watch_source(self):
         # Cheap metadata checks every 2.5s; a full hash on change or at
@@ -1181,7 +1338,14 @@ class TokenForge:
     def _cancel(self):
         if self.running_batch:
             self.cancel_event.set()
-            self.status.set('Остановка после текущего изображения…')
+            self.status.set('Отмена обработки; ожидаю безопасного завершения записи…')
+        elif self.preview_active:
+            self.cancel_event.set()
+            self.preview_pending = False
+            self.pending_render = None
+            self.pending_export = None
+            self.preview_retry = False
+            self.status.set('Отмена предпросмотра…')
         elif self.frame_loading or self.pending_frame is not None:
             self.frame_generation += 1
             self.pending_frame = None
@@ -1210,13 +1374,20 @@ class TokenForge:
             pass
         finally:
             if self.closing and (self.worker is None or not self.worker.is_alive()):
-                self.root.destroy()
+                self._destroy()
             else:
+                now = time.monotonic()
+                if self.closing:
+                    if self.close_started is not None and now - self.close_started > 5:
+                        self.status.set('Ожидание I/O или завершения записи. Принудительная остановка может прервать экспорт.')
+                elif self.activity is not None and now - self.activity_tick >= 1:
+                    self.activity_tick = now
+                    self._update_activity()
                 self.root.after(40, self._poll)
 
     def _handle_worker_event(self, action, data):
         terminal = action in ('folder_scan', 'preview_unchanged', 'preview', 'error',
-                              'preview_no_frame', 'export_preflight', 'preflight_failure',
+                              'preview_no_frame', 'preview_cancelled', 'export_preflight', 'preflight_failure',
                               'done', 'batch_failure', 'rendered', 'frame_loaded')
         # Keep the reservation during completion handling, including modal
         # Tk loops; retries and queued exports cannot steal the worker slot.
@@ -1224,13 +1395,33 @@ class TokenForge:
             self._apply_worker_event(action, data)
         finally:
             if terminal:
+                if action in ('preview', 'preview_unchanged', 'preview_no_frame', 'preview_cancelled', 'error'):
+                    self.preview_active = False
+                if action in ('preview', 'preview_unchanged', 'preview_no_frame', 'preview_cancelled',
+                              'error', 'done', 'batch_failure'):
+                    self._finish_activity()
                 if action in ('export_preflight', 'preflight_failure', 'done', 'batch_failure'):
                     self.running_batch = False
                 self.busy = False
                 self._after_preview()
 
     def _apply_worker_event(self, action, data):
-        if action == 'frame_loaded':
+        if action == 'model_probe':
+            serial, model, status = data
+            self.model_probe_active = False
+            if serial == self.model_probe_serial and (self.activity is None or self.activity[0] != model):
+                if status == 'local' and self.inference.loaded == model:
+                    status = 'ready'
+                self._show_model_status(model, status)
+            self._start_model_probe()
+        elif action == 'inference_status':
+            if not self.cancel_event.is_set():
+                self._apply_inference_status(data)
+        elif action == 'preview_cancelled':
+            if data == self._preview_request():
+                self.preview_retry = False
+                self.status.set('Предпросмотр отменён.')
+        elif action == 'frame_loaded':
             self._apply_frame(*data)
         elif action == 'folder_scan':
             self.scan_running = False
@@ -1299,7 +1490,10 @@ class TokenForge:
                 self.last_full_check = checked_at
         elif action == 'preview':
             request, img, key, stamp, checked_at, notice = data
-            if request == self._preview_request():
+            if request == self._preview_request() and self.cancel_event.is_set():
+                self.status.set('Предпросмотр отменён.')
+                self.preview_retry = False
+            elif request == self._preview_request():
                 self.preview_retry = False
                 self.preview_stamp = stamp
                 self.last_full_check = checked_at
@@ -1319,7 +1513,10 @@ class TokenForge:
                                     f'Готовый результат: {self.selected.name}. Для редактирования измени ползунок.')
         elif action == 'error':
             request, error, retry, verifying = data
-            if request == self._preview_request():
+            if request == self._preview_request() and self.cancel_event.is_set():
+                self.status.set('Предпросмотр отменён.')
+                self.preview_retry = False
+            elif request == self._preview_request():
                 self.preview_retry = retry
                 self.current_cutout = None
                 self.current_key = None
@@ -1432,6 +1629,7 @@ class TokenForge:
                 self._resume_save_retry()
                 return
         self.closing = True
+        self.close_started = time.monotonic()
         self.pending_scan = None
         self.pending_export = None
         self.pending_frame = None
@@ -1439,9 +1637,19 @@ class TokenForge:
         self.preview_pending = False
         self.cancel_event.set()
         if not self.busy and not self.approval_pending and (self.worker is None or not self.worker.is_alive()):
-            self.root.destroy()
+            self._destroy()
         else:
-            self.status.set('Завершение текущей операции и очистка временных файлов…')
+            self.status.set('Отмена операции и безопасное завершение…')
+            self.model_activity.set('Нейросеть: остановка…')
+            self.inference_progress.stop()
+
+    def _destroy(self):
+        if self.inference is not None:
+            try:
+                self.inference.close()
+            except Exception as exc:
+                self._inference_log(str(exc))
+        self.root.destroy()
 
     def run(self):
         self.root.mainloop()
