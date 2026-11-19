@@ -41,7 +41,9 @@ def model_revision(name):
     for path in candidates:
         try:
             st = path.stat()
-        except (FileNotFoundError, NotADirectoryError):
+        except OSError:
+            # rembg's os.path.exists() treats inaccessible candidates as
+            # absent. Preserve its precedence and readable legacy fallback.
             continue
         # Keep the historical revision shape for unchanged single-file models.
         # An absolute path also distinguishes relative roots after cwd changes.

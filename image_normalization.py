@@ -9,7 +9,7 @@ from functools import lru_cache
 import io
 from PIL import ImageCms, ImageMath, ImageOps
 
-NORMALIZATION_VERSION = 3
+NORMALIZATION_VERSION = 4
 HIGH_GRAY_MODES = frozenset(('I;16', 'I;16L', 'I;16B', 'I;16N'))
 GRAY_MODES = frozenset(('1', 'L', 'LA', 'La'))
 ALPHA_MODES = frozenset(('LA', 'La', 'RGBA', 'RGBa', 'PA'))
@@ -20,6 +20,7 @@ class SampleLayout:
     gray: bool
     high_gray_bits: int | None
     alpha: bool
+    invert_high_gray: bool = False
 
 
 def _tag_values(raw, tag, default):
@@ -41,6 +42,7 @@ def sample_layout(raw):
             raise ValueError('Неподдерживаемый числовой диапазон TIFF. '
                              'Сохрани арт как беззнаковый 8- или 16-битный PNG/TIFF.')
     depth = None
+    invert_high_gray = False
     if mode in HIGH_GRAY_MODES:
         depth = 16
         if raw.format == 'TIFF':
@@ -48,13 +50,18 @@ def sample_layout(raw):
             if len(bits) != 1 or type(bits[0]) is not int or not 9 <= bits[0] <= 16:
                 raise ValueError('Неподдерживаемый числовой диапазон TIFF.')
             depth = bits[0]
+            # Pillow's high-depth TIFF raw modes preserve sample polarity.
+            # Its low-depth 1/L modes already invert WhiteIsZero (1;I/L;I
+            # etc.), so applying this to 1/L would undo the decoder's work.
+            invert_high_gray = raw.tag_v2.get(262, 1) == 0
     # Pillow's 16-bit gray+alpha PNG is expanded to 8-bit RGBA by its
     # decoder. Truecolor RGBA must not be mistaken for grayscale just
     # because the three decoded channels happen to have equal values.
     expanded_gray = (raw.format == 'PNG' and mode == 'RGBA'
                      and any(tile[3] == 'LA;16B' for tile in getattr(raw, 'tile', ())))
     return SampleLayout(mode in GRAY_MODES or depth is not None or expanded_gray,
-                        depth, mode in ALPHA_MODES or 'transparency' in raw.info)
+                        depth, mode in ALPHA_MODES or 'transparency' in raw.info,
+                        invert_high_gray)
 
 
 def _straight_alpha(image):
@@ -76,13 +83,16 @@ def _alpha_plane(image, layout):
     return image.convert('RGBA').getchannel('A')
 
 
-def _scale_gray(image, bits, target_bits):
+def _scale_gray(image, bits, target_bits, *, invert=False):
     source_max = (1 << bits) - 1
     target_max = (1 << target_bits) - 1
     # Pillow I.point evaluates the affine expression as an integer mapping.
     # Add half a source step for nearest-sample rounding.
-    return image.convert('I').point(lambda x: (x * target_max + source_max // 2) / source_max).convert(
-        'L' if target_bits == 8 else 'I;16')
+    def scale(x):
+        # Invert in the declared sample range, before quantization or ICC.
+        sample = source_max - x if invert else x
+        return (sample * target_max + source_max // 2) / source_max
+    return image.convert('I').point(scale).convert('L' if target_bits == 8 else 'I;16')
 
 
 @lru_cache(maxsize=1)
@@ -94,9 +104,9 @@ def _cms_input(artwork, layout):
     if layout.high_gray_bits is not None:
         # LittleCMS expects the full 16-bit range, not right-aligned 12-bit
         # samples. Preserve precision when expanding the latter.
-        if layout.high_gray_bits == 16:
+        if layout.high_gray_bits == 16 and not layout.invert_high_gray:
             return artwork.convert('I').convert('I;16') if artwork.mode == 'I;16N' else artwork
-        return _scale_gray(artwork, layout.high_gray_bits, 16)
+        return _scale_gray(artwork, layout.high_gray_bits, 16, invert=layout.invert_high_gray)
     if layout.gray:
         if artwork.mode == 'LA':
             return artwork.getchannel('L')
@@ -131,7 +141,7 @@ def decode_artwork(raw, *, force_alpha=False):
                              'Сохрани изображение в sRGB и повтори обработку.') from exc
     output_mode = 'RGBA' if layout.alpha or force_alpha else 'RGB'
     if layout.high_gray_bits is not None:
-        gray = _scale_gray(artwork, layout.high_gray_bits, 8)
+        gray = _scale_gray(artwork, layout.high_gray_bits, 8, invert=layout.invert_high_gray)
         result = gray.convert(output_mode)
         if alpha is not None:
             result.putalpha(alpha)

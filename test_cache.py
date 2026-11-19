@@ -289,6 +289,40 @@ class CacheTests(unittest.TestCase):
                     self.assertNotEqual(model_revision(name), current)
                     self.assertEqual(model_revision(name)[1][0][0], str(flat.absolute()))
 
+    def test_model_revision_falls_back_when_preferred_candidate_cannot_be_statted(self):
+        from local_models import model_revision
+        name = 'birefnet-general'
+        root = self.directory / 'weights'
+        preferred = root / 'models' / name / (name + '.onnx')
+        legacy = root / (name + '.onnx')
+        preferred.parent.mkdir(parents=True)
+        legacy.write_bytes(b'legacy')
+        preferred.write_bytes(b'preferred')
+        original_stat = Path.stat
+        with patch.dict('os.environ', {'U2NET_HOME': str(root)}, clear=True):
+            current = model_revision(name)
+            self.assertEqual(current[1][0][0], str(preferred.absolute()))
+            for error in (PermissionError('denied'), OSError('unavailable'),
+                          FileNotFoundError('missing'), NotADirectoryError('not a directory')):
+                with self.subTest(error=type(error).__name__):
+                    def guarded(path, *args, **kwargs):
+                        if path == preferred:
+                            raise error
+                        return original_stat(path, *args, **kwargs)
+                    with patch.object(Path, 'stat', guarded):
+                        fallback = model_revision(name)
+                        self.assertEqual(fallback[1][0][0], str(legacy.absolute()))
+                        self.assertNotEqual(fallback, current)
+            # When neither candidate can be observed, bypass/missing-model
+            # behavior is unchanged (no exception during revision discovery).
+            def unavailable(path, *args, **kwargs):
+                if path in (preferred, legacy):
+                    raise PermissionError('denied')
+                return original_stat(path, *args, **kwargs)
+            with patch.object(Path, 'stat', unavailable):
+                self.assertEqual(model_revision(name)[1], ())
+            self.assertEqual(model_revision(name), current)
+
     def test_contended_inference_lock_only_delays_art_that_needs_inference(self):
         from contextlib import contextmanager
         from unittest.mock import Mock

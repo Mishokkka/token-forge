@@ -3,6 +3,7 @@ import io
 import struct
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from PIL import Image, ImageCms
 from token_engine import read_image, save_original_webp
@@ -25,23 +26,30 @@ def gray_profile():
     return bytes(data)
 
 
-def packed_gray_tiff(bits, profile=None, *, sample_format=1):
+def packed_gray_tiff(bits, profile=None, *, sample_format=1, photometric=1,
+                     compression=1, values=None):
     """Four little-endian grayscale TIFF samples, packed in TIFF bit order.
 
     SampleFormat can be omitted (unsigned by default) or set explicitly.
     For signed 8-bit samples these same bytes include negative values.
     """
-    values = (0, 1 << (bits - 2), 1 << (bits - 1), (1 << bits) - 1)
+    if values is None:
+        values = (0, 1 << (bits - 2), 1 << (bits - 1), (1 << bits) - 1)
     if bits == 8:
         pixels = bytes(values)
     elif bits == 12:
-        pixels = bytes.fromhex('000400800fff')
+        packed = (values[0] << 36) | (values[1] << 24) | (values[2] << 12) | values[3]
+        pixels = packed.to_bytes(6, 'big')
     elif bits == 16:
         pixels = struct.pack('<4H', *values)
     else:
         raise ValueError(bits)
+    if compression == 8:
+        pixels = zlib.compress(pixels)
+    elif compression != 1:
+        raise ValueError(compression)
     tags = [(256, 4, 1, 4), (257, 4, 1, 1), (258, 3, 1, bits),
-            (259, 3, 1, 1), (262, 3, 1, 1), (273, 4, 1, 0), (277, 3, 1, 1),
+            (259, 3, 1, compression), (262, 3, 1, photometric), (273, 4, 1, 0), (277, 3, 1, 1),
             (278, 4, 1, 1), (279, 4, 1, len(pixels))]
     if sample_format is not None:
         tags.append((339, 3, 1, sample_format))
@@ -80,6 +88,44 @@ class NormalizationTests(unittest.TestCase):
                         with Image.open(path.with_suffix('.webp')) as copy:
                             self.assertEqual(copy.size, (4, 1))
                             self.assertGreater(copy.convert('RGB').getpixel((3, 0))[0], 230)
+
+    def test_tiff_white_is_zero_matches_equivalent_black_is_zero(self):
+        # Exercise raw and libtiff decoder paths. The latter also must not
+        # double-invert 8-bit grayscale, which Pillow already normalizes.
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            for bits in (8, 16):
+                maximum = (1 << bits) - 1
+                samples = (0, 1 << (bits - 2), 1 << (bits - 1), maximum)
+                for compression in (1, 8):
+                    for tagged in (False, True):
+                        with self.subTest(bits=bits, compression=compression, tagged=tagged):
+                            profile = gray_profile() if tagged else None
+                            reference = folder / f'black-{bits}-{compression}-{tagged}.tiff'
+                            inverse = folder / f'white-{bits}-{compression}-{tagged}.tiff'
+                            reference.write_bytes(packed_gray_tiff(
+                                bits, profile, compression=compression,
+                                values=tuple(maximum - x for x in samples)))
+                            inverse.write_bytes(packed_gray_tiff(
+                                bits, profile, photometric=0, compression=compression,
+                                values=samples))
+                            expected = read_image(reference)
+                            actual = read_image(inverse)
+                            self.assertEqual(actual.mode, 'RGBA')
+                            self.assertEqual(actual.tobytes(), expected.tobytes())
+                            reds = list(actual.getchannel('R').getdata())
+                            self.assertEqual((reds[0], reds[-1]), (255, 0))
+                            self.assertGreater(reds[1], reds[2])
+                            if not tagged:
+                                self.assertEqual(reds, [255, 191, 127, 0])
+                            self.assertEqual(actual.getchannel('A').getextrema(), (255, 255))
+                            for path in (reference, inverse):
+                                self.assertTrue(save_original_webp(path))
+                            with Image.open(reference.with_suffix('.webp')) as black, \
+                                 Image.open(inverse.with_suffix('.webp')) as white:
+                                self.assertEqual(black.convert('RGB').tobytes(), white.convert('RGB').tobytes())
+                                self.assertGreater(white.convert('RGB').getpixel((0, 0))[0], 230)
+                                self.assertLess(white.convert('RGB').getpixel((3, 0))[0], 25)
 
     def test_tiff_sample_format_is_checked_even_when_pillow_exposes_mode_l(self):
         from unittest.mock import patch
