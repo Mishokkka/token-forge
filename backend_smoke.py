@@ -32,7 +32,7 @@ def run():
     artwork = Image.composite(foreground, background, mask).convert('RGBA')
 
     with patch.object(bg, 'new_session', side_effect=AssertionError('Unexpected model download')):
-        for mode in EDGE_MODES:
+        for index, mode in enumerate(EDGE_MODES, 1):
             session = SyntheticSession(mask)
             with patch.object(bg, 'decontaminate_cutout', wraps=bg.decontaminate_cutout) as cleanup, \
                  patch.object(bg, 'alpha_matting_cutout', wraps=bg.alpha_matting_cutout) as matting:
@@ -53,7 +53,7 @@ def run():
                     cleanup.assert_called_once()
                 else:
                     cleanup.assert_not_called()
-            print(f'Installed backend {mode}: OK', flush=True)
+            print(f'Installed backend mode {index}: OK', flush=True)
 
 
 if __name__ == '__main__':
