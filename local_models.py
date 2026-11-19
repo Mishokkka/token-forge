@@ -23,9 +23,9 @@ def _inference_versions():
 def model_revision(name):
     """Cheap local model revision; never import rembg or download weights.
 
-    Cover the legacy flat model directory and newer per-model layout.
-    Package versions and file metadata invalidate caches on ordinary upgrades
-    or replacement. This is not a cryptographic verification of model weights.
+    Mirror the pinned rembg resolver: the per-model file shadows the legacy
+    file. Only selected weights affect provenance. Metadata is not a
+    cryptographic verification of model weights.
     """
     import os
     from pathlib import Path
@@ -37,16 +37,17 @@ def model_revision(name):
                                  os.path.join(os.environ.get('XDG_DATA_HOME', '~'), '.u2net'))).expanduser()
     default_home = os.path.join(xdg, 'rembg') if xdg else '~/.rembg'
     home = Path(explicit or os.environ.get('REMBG_HOME', default_home)).expanduser()
-    candidates = (home / 'models' / name / (name + '.onnx'),
-                  legacy / (name + '.onnx'), home / (name + '.onnx'))
-    stamps = []
-    for path in dict.fromkeys(candidates):
+    candidates = (home / 'models' / name / (name + '.onnx'), legacy / (name + '.onnx'))
+    for path in candidates:
         try:
             st = path.stat()
-            stamps.append((str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
-        except OSError:
+        except (FileNotFoundError, NotADirectoryError):
             continue
-    return _inference_versions(), tuple(stamps)
+        # Keep the historical revision shape for unchanged single-file models.
+        # An absolute path also distinguishes relative roots after cwd changes.
+        stamp = (str(path.absolute()), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+        return _inference_versions(), (stamp,)
+    return _inference_versions(), ()
 
 
 def require_local_model(name):

@@ -53,6 +53,44 @@ class CacheTests(unittest.TestCase):
         self.assertTrue(two.exists())
         self.assertEqual(keep.read_bytes(), b'foreign')
 
+    def test_cache_capacity_across_instances_and_no_scan_on_hits(self):
+        from unittest.mock import Mock
+        first = DiskCutoutCache(self.cache.directory, max_entries=1)
+        second = DiskCutoutCache(self.cache.directory, max_entries=1)
+        image = Image.new('RGBA', (8, 8), 'red')
+        other = self.directory / 'Other.png'
+        image.save(other)
+        args = ('birefnet-general', True, 'Обычный')
+        first.save(self.source, *args, image)
+        second.save(other, *args, image)
+        self.assertEqual(len(list(self.cache.directory.glob('*.png'))), 1)
+        self.assertIsNone(first.load(self.source, *args))
+        with patch.object(first, '_make_room', side_effect=AssertionError('cache hit scanned directory')):
+            self.assertIsNotNone(first.load(other, *args))
+        # If maintenance is not available, never exceed the entry budget.
+        with patch('token_engine.process_lock', side_effect=TimeoutError('busy')):
+            first.save(self.source, *args, image)
+        self.assertEqual(len(list(self.cache.directory.glob('*.png'))), 1)
+        self.assertIsNotNone(first.load(other, *args))
+
+    def test_cache_refuses_to_grow_when_eviction_fails(self):
+        first = DiskCutoutCache(self.cache.directory, max_entries=1)
+        image = Image.new('RGBA', (8, 8), 'red')
+        other = self.directory / 'Other.png'
+        image.save(other)
+        args = ('birefnet-general', True, 'Обычный')
+        first.save(self.source, *args, image)
+        blocked = first.path_for(self.source, *args)
+        unlink = Path.unlink
+        def guarded(path, *args, **kwargs):
+            if path == blocked:
+                raise PermissionError('busy')
+            return unlink(path, *args, **kwargs)
+        with patch.object(Path, 'unlink', guarded):
+            first.save(other, *args, image)
+        self.assertTrue(blocked.exists())
+        self.assertFalse(first.path_for(other, *args).exists())
+
     def test_disk_cache_persists_full_rgba_unchanged(self):
         image = Image.new('RGBA', (170, 220), (11, 22, 33, 0))
         image.putpixel((20, 30), (71, 92, 154, 157))
@@ -219,6 +257,29 @@ class CacheTests(unittest.TestCase):
         finally:
             os.chdir(old_cwd)
 
+    def test_model_revision_tracks_only_the_selected_weights_for_every_backend(self):
+        from local_models import LOCAL_MODELS, model_revision
+        legacy = self.directory / 'legacy'
+        legacy.mkdir()
+        with patch.dict('os.environ', {'U2NET_HOME': str(legacy)}, clear=True):
+            for name in LOCAL_MODELS:
+                with self.subTest(name=name):
+                    flat = legacy / (name + '.onnx')
+                    selected = legacy / 'models' / name / (name + '.onnx')
+                    selected.parent.mkdir(parents=True)
+                    flat.write_bytes(b'legacy')
+                    fallback = model_revision(name)
+                    selected.write_bytes(b'modern')
+                    current = model_revision(name)
+                    self.assertNotEqual(current, fallback)
+                    flat.write_bytes(b'changed shadow')
+                    self.assertEqual(model_revision(name), current)
+                    selected.write_bytes(b'changed selection')
+                    self.assertNotEqual(model_revision(name), current)
+                    selected.unlink()
+                    self.assertNotEqual(model_revision(name), current)
+                    self.assertEqual(model_revision(name)[1][0][0], str(flat.absolute()))
+
     def test_contended_inference_lock_only_delays_art_that_needs_inference(self):
         from contextlib import contextmanager
         from unittest.mock import Mock
@@ -384,7 +445,7 @@ class CacheTests(unittest.TestCase):
                 init.assert_not_called()
             self.assertEqual(b.tobytes(), cutout.tobytes())
             self.assertEqual(len(count), 1)
-            second._get_cutout(self.source, 'birefnet-general', False, 'different')
+            second._get_cutout(self.source, 'birefnet-general', False, 'Очистка краёв')
             self.assertEqual(len(count), 2)
 
     def test_single_export_overwrites_even_when_skip_enabled(self):

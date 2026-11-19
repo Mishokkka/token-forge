@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import struct
+import stat
 import traceback
 from pathlib import Path
 from statistics import median
@@ -172,8 +173,8 @@ class DiskCutoutCache:
         self.directory = Path(directory)
         self.max_bytes = max_bytes
         self.max_entries = max_entries
-        self._last_prune = None
-        self._bytes_since_prune = 0
+        if max_bytes < 0 or max_entries < 0:
+            raise ValueError('Лимиты кэша не могут быть отрицательными.')
 
     def path_for(self, source: Path, model: str, keep_alpha: bool, edge_mode: str,
                  *, identity: tuple | None = None, revision=None) -> Path:
@@ -218,51 +219,67 @@ class DiskCutoutCache:
             if identity is not None:
                 assert_source_identity(source, identity)
             encoded_bytes = temporary.stat().st_size
-            if encoded_bytes <= self.max_bytes:
-                os.replace(temporary, destination)
-                self._bytes_since_prune += encoded_bytes
-                self._maybe_prune()
+            if encoded_bytes <= min(self.max_bytes, MAX_ENCODED_BYTES) and self.max_entries:
+                # A single maintenance reservation covers accounting, eviction
+                # and publication across all GUI and CLI cache instances.
+                # Contention or insufficient capacity only loses the cache write.
+                try:
+                    with process_lock(self.directory / '.maintenance', timeout=0):
+                        if self._make_room(destination, encoded_bytes):
+                            os.replace(temporary, destination)
+                except OSError:
+                    pass
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
-    def _maybe_prune(self):
-        import time
-        now = time.monotonic()
-        if (self._last_prune is None or now - self._last_prune >= 30
-                or self._bytes_since_prune >= min(self.max_bytes // 8, 128 * 1024**2)):
+    def _make_room(self, destination=None, encoded_bytes=0):
+        """Reconcile actual files under the maintenance lock, not local counters.
+
+        Scan once per publication (no scans on cache hits). Only cache-shaped
+        regular files participate; readers can touch an entry to protect it.
+        A failed eviction does not authorize exceeding the configured budget.
+        """
+        entries = []
+        with os.scandir(self.directory) as listing:
+            for entry in listing:
+                path = Path(entry.path)
+                if path.suffix != '.png' or not _valid_digest(path.stem) or path == destination:
+                    continue
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISREG(info.st_mode):
+                        entries.append((info.st_mtime_ns, info.st_size, info.st_ctime_ns, path))
+                except FileNotFoundError:
+                    continue
+        total = encoded_bytes + sum(entry[1] for entry in entries)
+        count = len(entries) + (destination is not None)
+        if total <= self.max_bytes and count <= self.max_entries:
+            return True
+        for stamp, size, ctime, path in sorted(entries):
             try:
-                self.prune()
-                self._last_prune = now
-                self._bytes_since_prune = 0
+                info = path.lstat()
+                if (stat.S_ISREG(info.st_mode)
+                        and (info.st_mtime_ns, info.st_size, info.st_ctime_ns) == (stamp, size, ctime)):
+                    path.unlink()
+                else:
+                    continue
+            except FileNotFoundError:
+                pass
             except OSError:
-                pass  # Cache maintenance never blocks successful exports.
+                continue
+            total -= size
+            count -= 1
+            if total <= self.max_bytes and count <= self.max_entries:
+                return True
+        return False
 
     def prune(self):
-        """Best-effort LRU of only our cache names; never touch source images."""
+        """Best-effort maintenance, sharing the same reservation as writers."""
+        if not self.directory.is_dir():
+            return
         with process_lock(self.directory / '.maintenance', timeout=0):
-            entries = []
-            for path in self.directory.glob('*.png'):
-                if not _valid_digest(path.stem) or path.is_symlink():
-                    continue
-                try:
-                    st = path.stat()
-                    if path.is_file():
-                        entries.append((st.st_mtime_ns, st.st_size, path))
-                except OSError:
-                    continue
-            total, count = sum(item[1] for item in entries), len(entries)
-            for stamp, size, path in sorted(entries):
-                if total <= self.max_bytes and count <= self.max_entries:
-                    break
-                try:
-                    st = path.stat()
-                    if (st.st_mtime_ns, st.st_size) == (stamp, size):
-                        path.unlink()
-                        total -= size
-                        count -= 1
-                except OSError:
-                    continue
+            self._make_room()
 
 
 @contextmanager
