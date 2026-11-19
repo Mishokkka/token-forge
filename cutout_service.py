@@ -5,6 +5,7 @@ from PIL import Image
 from token_engine import already_transparent, assert_source_identity, validate_art_dimensions
 from local_models import require_local_model, model_revision
 from process_lock import process_lock
+from operation_control import check_cancel
 from resource_policy import MEMORY_CACHE_BYTES as MEMORY_LIMIT_BYTES, validate_extraction_dimensions
 
 
@@ -26,8 +27,10 @@ def remember(memory, key, image, *, count_limit=6, byte_limit=MEMORY_LIMIT_BYTES
 
 def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, sessions,
                 decode, extract, session_factory, cached_only=False, memory_limit=6,
-                verify=None):
+                verify=None, cancel_event=None, prepare_model=None, on_wait=None):
+    check_cancel(cancel_event)
     require_local_model(model)
+    lock_options = {} if cancel_event is None else {'cancel_event': cancel_event}
     identity = key[:4]
     check = verify if verify is not None else lambda: assert_source_identity(path, identity)
     revision = model_revision(model)
@@ -56,6 +59,7 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
         verify_revision()
 
     cutout = cached()
+    check_cancel(cancel_event)
     if cutout is None:
         if cached_only:
             check()
@@ -67,7 +71,9 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
         original = None
         with ExitStack() as reservation:
             try:
-                reservation.enter_context(process_lock(lock_path, timeout=0 if keep_alpha else 120))
+                if on_wait is not None:
+                    on_wait(model)
+                reservation.enter_context(process_lock(lock_path, timeout=0 if keep_alpha else 120, **lock_options))
             except OSError as lock_error:
                 if not keep_alpha:
                     raise
@@ -86,7 +92,7 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
                 # No full pixel buffer may survive a blocking wait. A cache
                 # hit after the reservation needs no further decoding.
                 original = None
-                reservation.enter_context(process_lock(lock_path, timeout=120))
+                reservation.enter_context(process_lock(lock_path, timeout=120, **lock_options))
             revision = model_revision(model)
             memory_key = (*key, revision)
             cutout = cached()
@@ -107,6 +113,12 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
                         # Release previous native sessions before allocating another.
                         sessions.clear()
                         del existing
+                        if prepare_model is not None:
+                            # Download/verify first, so the initial native session
+                            # need not be instantiated twice on a first download.
+                            prepare_model(model)
+                            revision = model_revision(model)
+                        check_cancel(cancel_event)
                         for attempt in range(2):
                             session = session_factory(model)
                             observed = model_revision(model)
@@ -120,9 +132,12 @@ def load_cutout(path, model, keep_alpha, edge_mode, *, key, disk_cache, memory, 
                             raise OSError('Файлы модели нестабильны. Повтори обработку.')
                         memory_key = (*key, revision)
                         sessions[model] = (revision, session)
+                    check_cancel(cancel_event)
                     cutout = extract(original, session, edge_mode)
+                check_cancel(cancel_event)
                 publish(cutout)
 
+    check_cancel(cancel_event)
     # Also verify hits (including the second lookup under the inference lock).
     check()
     verify_revision()

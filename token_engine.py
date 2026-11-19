@@ -15,6 +15,7 @@ from statistics import median
 import math
 from local_models import call_rembg, model_revision
 from process_lock import process_lock
+from operation_control import OperationCancelled, check_cancel
 from resource_policy import (MAX_ENCODED_BYTES, MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE, MAX_RING_SIDE,
                              DISK_CACHE_BYTES, DISK_CACHE_ENTRIES, DEFAULT_EDGE_MODE, validate_extraction_dimensions,
                              validate_output_size, validate_intermediate_size)
@@ -1412,6 +1413,7 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 except Exception as exc:
                     result.record_error(source, 'преобразование оригинала', exc)
             try:
+                check_cancel(cancel_event)
                 assert_approval(destination, approved)
                 ensure_no_source_collision(destination, source, kind, folders)
                 if skip_exists and destination.exists():
@@ -1439,7 +1441,9 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                         identity = loaded.identity
                     else:
                         cutout = loaded
+                    check_cancel(cancel_event)
                     image = renderer(cutout, source)
+                    check_cancel(cancel_event)
                     # Use the revision that actually produced the pixels, not
                     # an observation made before first download or model reload.
                     actual = loaded.extraction if isinstance(loaded, LoadedCutout) else None
@@ -1455,6 +1459,9 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                         result.outputs.append(destination)
                     else:
                         result.skipped += 1
+            except OperationCancelled:
+                result.cancelled = True
+                break
             except Exception as exc:
                 result.record_error(source, stage, exc)
         if on_progress:
