@@ -23,21 +23,75 @@ MAX_IMAGE_SIDE = 16384
 ART_FORMATS = ('PNG', 'JPEG', 'WEBP', 'BMP', 'TIFF')
 
 
-def validate_art_dimensions(image):
-    if (image.width > MAX_IMAGE_SIDE or image.height > MAX_IMAGE_SIDE
-            or image.width * image.height > MAX_IMAGE_PIXELS):
+def _validate_dimensions(width, height, *, ring=False):
+    if ring:
+        if width != height:
+            raise ValueError('PNG-кольцо должно быть квадратным.')
+        if width > 4096:
+            raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+    if (width <= 0 or height <= 0 or width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE
+            or width * height > MAX_IMAGE_PIXELS):
         raise ValueError('Изображение превышает ресурсный лимит TokenForge (64 МиПикс, сторона 16384).')
+
+
+def validate_art_dimensions(image):
+    _validate_dimensions(*image.size)
     return image
 
 
-def open_art(source):
-    # Pillow also keeps its own decompression-bomb limit.
-    image = Image.open(source, formats=ART_FORMATS)
+def _webp_dimensions(stream):
+    """Inspect the RIFF canvas header, without allocating a native decoder.
+
+    Simple lossy/lossless and extended (including animated) WebP layouts have
+    distinct dimension fields. A recognized but invalid header fails closed.
+    """
+    stream.seek(0)
     try:
-        return validate_art_dimensions(image)
-    except BaseException:
-        image.close()
-        raise
+        header = stream.read(30)
+        if header[:4] != b'RIFF' or header[8:12] != b'WEBP':
+            return None
+        if len(header) < 20:
+            raise ValueError('Повреждённый заголовок WebP.')
+        kind = header[12:16]
+        length = int.from_bytes(header[16:20], 'little')
+        riff_end = 8 + int.from_bytes(header[4:8], 'little')
+        if 20 + length + (length & 1) > riff_end:
+            raise ValueError('Повреждённый заголовок WebP.')
+        if kind == b'VP8X' and length == 10 and len(header) >= 30:
+            return (1 + int.from_bytes(header[24:27], 'little'),
+                    1 + int.from_bytes(header[27:30], 'little'))
+        if kind == b'VP8L' and length >= 5 and len(header) >= 25 and header[20] == 0x2f:
+            bits = int.from_bytes(header[21:25], 'little')
+            if bits >> 29 == 0:
+                return (1 + (bits & 0x3fff), 1 + ((bits >> 14) & 0x3fff))
+        if (kind == b'VP8 ' and length >= 10 and len(header) >= 30
+                and not header[20] & 1 and header[23:26] == b'\x9d\x01\x2a'):
+            return (int.from_bytes(header[26:28], 'little') & 0x3fff,
+                    int.from_bytes(header[28:30], 'little') & 0x3fff)
+        raise ValueError('Повреждённый или неподдерживаемый заголовок WebP.')
+    finally:
+        stream.seek(0)
+
+
+@contextmanager
+def open_art(source, *, formats=ART_FORMATS, ring=False):
+    """Validate before WebP decoder creation, then verify decoded dimensions.
+
+    A pathname is opened once: header inspection and Pillow see the same
+    handle (or an existing immutable snapshot for captured artwork).
+    """
+    context = open(source, 'rb') if isinstance(source, (str, bytes, os.PathLike)) else nullcontext(source)
+    with context as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() > MAX_ENCODED_BYTES:
+            raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
+        dimensions = _webp_dimensions(stream)
+        if dimensions is not None:
+            _validate_dimensions(*dimensions, ring=ring)
+        # Pillow also keeps its own decompression-bomb limit.
+        with Image.open(stream, formats=formats) as image:
+            _validate_dimensions(*image.size, ring=ring)
+            yield image
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tif', '.tiff'}
 
@@ -134,8 +188,7 @@ class DiskCutoutCache:
              *, identity: tuple | None = None, revision=None) -> Image.Image | None:
         path = self.path_for(source, model, keep_alpha, edge_mode, identity=identity, revision=revision)
         try:
-            with Image.open(path, formats=('PNG',)) as stored:
-                validate_art_dimensions(stored)
+            with open_art(path, formats=('PNG',)) as stored:
                 image = stored.convert('RGBA')
             try:
                 os.utime(path, None)
@@ -266,6 +319,8 @@ def decode_artwork(raw, *, force_alpha=False):
             target = ImageCms.ImageCmsProfile(ImageCms.createProfile('sRGB'))
             if artwork.mode in ('RGB', 'CMYK', 'L', 'LAB', 'I;16', 'I;16L', 'I;16B'):
                 color = artwork
+            elif artwork.mode == '1':
+                color = artwork.convert('L')
             elif artwork.mode == 'LA':
                 color = artwork.getchannel('L')
             elif gray_alpha16_png:
@@ -470,11 +525,7 @@ def _enclosed_shape(barrier: Image.Image) -> Image.Image:
 def load_frame(path: Path):
     if path.stat().st_size > MAX_ENCODED_BYTES:
         raise OSError('Файл превышает лимит TokenForge 256 МиБ.')
-    with open_art(path) as raw:
-        if raw.width != raw.height:
-            raise ValueError('PNG-кольцо должно быть квадратным.')
-        if raw.width > 4096:
-            raise ValueError('Размер рамки превышает 4096 × 4096. Уменьши PNG-кольцо.')
+    with open_art(path, ring=True) as raw:
         frame = decode_artwork(raw, force_alpha=True)
     return frame, frame_interior(frame)
 
@@ -849,8 +900,7 @@ def _parse_owner(owner):
 def _probe_owner(stream, *, require_pixels=False):
     """Discovery is not evidence that the pixels are decodable."""
     try:
-        with Image.open(stream, formats=('PNG', 'WEBP')) as stored:
-            validate_art_dimensions(stored)
+        with open_art(stream, formats=('PNG', 'WEBP')) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if owner and require_pixels:
                 try:
@@ -982,8 +1032,7 @@ def inspect_existing_export(destination, source, kind):
 def read_owned_export_image(destination, source, kind, *, include_owner=False):
     """Decode only the same verified bytes whose ownership was inspected."""
     with fingerprinted_snapshot(destination) as (identity, snapshot):
-        with Image.open(snapshot, formats=('PNG', 'WEBP')) as stored:
-            validate_art_dimensions(stored)
+        with open_art(snapshot, formats=('PNG', 'WEBP')) as stored:
             owner = _parse_owner(stored.getexif().get(270))
             if not _owner_matches(owner, source, kind):
                 return None
@@ -1365,15 +1414,16 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
             try:
                 assert_approval(destination, approved)
                 ensure_no_source_collision(destination, source, kind, folders)
-                recipe = recipe_for(source) if recipe_for is not None else None
                 if skip_exists and destination.exists():
                     ensure_no_source_collision(destination, source, kind, folders, live=True)
                     owner = validate_skip(destination, source, kind)
                     assert_source_identity(source, identity)
+                    recipe = recipe_for(source) if recipe_for is not None else None
                     result.warnings.extend(f'{source.name}: {destination.name}: {w}'
                                            for w in freshness_warnings(owner, identity, recipe))
                     result.skipped += 1
                 else:
+                    recipe = recipe_for(source) if recipe_for is not None else None
                     if captured_loader is None:
                         # Legacy injectable loader contract retains the old guard.
                         assert_source_identity(source, identity)

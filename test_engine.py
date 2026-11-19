@@ -285,6 +285,12 @@ class EngineTests(unittest.TestCase):
             decoded = read_image(path)
             self.assertEqual(list(decoded.getchannel('A').getdata()), [128, 64])
             self.assertLess(decoded.getpixel((0, 0))[0], decoded.getpixel((1, 0))[0])
+            # One-bit grayscale carries the same GRAY profile, not RGB.
+            mono = Image.new('1', (2, 1))
+            mono.putpixel((1, 0), 1)
+            mono.save(path, icc_profile=bytes(data), transparency=0)
+            decoded = read_image(path)
+            self.assertEqual(list(decoded.getdata()), [(0, 0, 0, 0), (255, 255, 255, 255)])
             # A truecolor PNG carrying the same incompatible profile should
             # still be rejected, not silently reduced to grayscale.
             Image.new('RGBA', (2, 1), 'red').save(path, icc_profile=bytes(data))
@@ -316,6 +322,65 @@ class EngineTests(unittest.TestCase):
             # Truncated RIFF must not be accepted as ownership evidence.
             copy.write_bytes(copy.read_bytes()[:-1])
             self.assertIsNone(read_export_owner(copy))
+
+    def test_webp_preflight_checks_all_layouts_before_decoder_allocation(self):
+        import struct
+        from token_engine import load_frame, read_export_owner, source_identity, validate_skip, read_owned_export_image
+        from PIL import WebPImagePlugin
+        with tempfile.TemporaryDirectory() as d:
+            folder = Path(d)
+            source = folder / 'Hero.png'
+            self.figure.save(source)
+            path = folder / 'Hero.webp'
+            exif = Image.Exif()
+            exif[270] = 'TokenForge/2:["copy","Hero.png"]'
+            def oversized(data, side):
+                header = bytearray(data)
+                kind = header[12:16]
+                if kind == b'VP8X':
+                    header[24:27] = (side - 1).to_bytes(3, 'little')
+                    header[27:30] = (side - 1).to_bytes(3, 'little')
+                elif kind == b'VP8L':
+                    bits = struct.unpack_from('<I', header, 21)[0]
+                    struct.pack_into('<I', header, 21,
+                                     (bits & 0xf0000000) | (side - 1) | ((side - 1) << 14))
+                elif kind == b'VP8 ':
+                    struct.pack_into('<HH', header, 26, side, side)
+                else:
+                    self.fail(f'unexpected fixture layout {kind!r}')
+                return bytes(header)
+            for expected, options in ((b'VP8 ', {}), (b'VP8L', {'lossless': True}),
+                                      (b'VP8X', {'exif': exif})):
+                with self.subTest(layout=expected):
+                    Image.new('RGB', (32, 32), 'red').save(path, 'WEBP', **options)
+                    valid = path.read_bytes()
+                    self.assertEqual(valid[12:16], expected)
+                    self.assertEqual(read_image(path).size, (32, 32))
+                    path.write_bytes(oversized(valid, 12000))
+                    with patch.object(WebPImagePlugin.WebPImageFile, '_open',
+                                      side_effect=AssertionError('decoder must not be created')):
+                        with self.assertRaisesRegex(ValueError, 'ресурсный лимит'):
+                            read_image(path)
+                        with self.assertRaisesRegex(ValueError, 'ресурсный лимит'):
+                            read_image(path, identity=source_identity(path))
+                        self.assertIsNone(read_export_owner(path, require_pixels=True))
+                        with self.assertRaises(OSError):
+                            validate_skip(path, source, 'copy')
+                        with self.assertRaisesRegex(ValueError, 'ресурсный лимит'):
+                            read_owned_export_image(path, source, 'copy')
+                        path.write_bytes(oversized(valid, 4097))
+                        with self.assertRaisesRegex(ValueError, '4096'):
+                            load_frame(path)
+                    if expected == b'VP8X':
+                        self.assertEqual(read_export_owner(path), (2, 'copy', 'Hero.png'))
+            # An invalid header cannot fall through to native allocation.
+            broken = bytearray(valid)
+            broken[16:20] = b'\x00' * 4
+            path.write_bytes(broken)
+            with patch.object(WebPImagePlugin.WebPImageFile, '_open',
+                              side_effect=AssertionError('decoder must not be created')):
+                with self.assertRaisesRegex(ValueError, 'заголовок WebP'):
+                    read_image(path)
 
     def test_oversized_ring_and_discovery_reject_before_pixel_decode(self):
         from token_engine import load_frame, read_export_owner
@@ -849,6 +914,32 @@ class EngineTests(unittest.TestCase):
                     self.assertEqual(report.skipped, 1)
                     self.assertTrue(any('Параметры генерации' in w for w in report.warnings))
                     loader.assert_not_called()
+
+    def test_early_skip_reads_current_recipe_after_validating_existing_file(self):
+        import token_engine
+        from token_engine import extraction_provenance
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / 'Hero.png'
+            self.figure.save(source)
+            old = extraction_provenance('birefnet-general', True, 'e', revision=('old',))
+            new = extraction_provenance('birefnet-general', True, 'e', revision=('new',))
+            revision = Mock(return_value=old)
+            def run(loader):
+                return export_batch([source], loader, self.frame, self.mask, {source: Adjust()},
+                                    convert_original=False, extraction_recipe=revision)
+            self.assertEqual(run(read_image).created, 1)
+            original_validate = token_engine.validate_skip
+            def validate(*args, **kwargs):
+                owner = original_validate(*args, **kwargs)
+                revision.return_value = new
+                return owner
+            loader = Mock(side_effect=AssertionError('skip must not extract'))
+            with patch('token_engine.validate_skip', side_effect=validate):
+                result = run(loader)
+            self.assertEqual(result.skipped, 1, result.errors)
+            self.assertTrue(any('Параметры генерации' in w for w in result.warnings))
+            loader.assert_not_called()
 
     def test_late_skip_compares_winner_against_current_extraction_recipe(self):
         from token_engine import LoadedCutout, source_identity, save_generated, token_recipe, extraction_provenance
