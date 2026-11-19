@@ -158,6 +158,7 @@ class TokenForge:
         self.preview_active = False
         self.activity = None
         self.activity_started = 0.0
+        self.activity_received = 0.0
         self.activity_tick = 0.0
         self.close_started = None
         self.model_probe_active = False
@@ -868,6 +869,7 @@ class TokenForge:
 
     def _apply_inference_status(self, data):
         model, stage, count, total, speed = data
+        self.activity_received = time.monotonic()
         previous = self.activity
         if previous is None or previous[:2] != data[:2]:
             self.activity_started = time.monotonic()
@@ -904,7 +906,10 @@ class TokenForge:
                 percent = min(100, count * 100 / total)
                 detail += f' / {total / 1e6:.1f} МБ ({percent:.0f}%)'
                 self.inference_progress['value'] = percent
-            if speed > 0:
+            silence = int(time.monotonic() - self.activity_received)
+            if silence >= 5:
+                detail += f', нет новых данных {silence} с'
+            elif speed > 0:
                 detail += f', {speed / 1e6:.1f} МБ/с'
                 if total > count:
                     eta = int((total - count) / speed)

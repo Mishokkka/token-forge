@@ -120,6 +120,10 @@ def run():
                 app._apply_inference_status((model, 'download', 250, 1000, 250.0))
                 assert int(app.inference_progress['value']) == 25
                 assert '25%' in app.model_activity.get()
+                app.activity_received -= 10
+                app._update_activity()
+                assert 'нет новых данных' in app.model_activity.get()
+                assert 'МБ/с' not in app.model_activity.get()
                 app._apply_inference_status((model, 'initialize', 0, 0, 0.0))
                 assert str(app.inference_progress.cget('mode')) == 'indeterminate'
                 app._finish_activity()
