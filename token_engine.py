@@ -1171,10 +1171,21 @@ def ensure_no_source_collision(destination: Path, source: Path, kind: str, index
                                   'Переименуй один из исходников.')
 
 
-def validate_skip(destination, source, kind, *, identity=None):
-    identity = identity if identity is not None else source_identity(destination)
+@dataclass(frozen=True)
+class ValidatedExport:
+    identity: tuple
+    owner: tuple
+
+
+def capture_validated_skip(destination, source, kind, *, identity=None):
+    """Validate a decodable owned image on the exact bytes we fingerprint."""
     try:
-        owner = read_export_owner(destination, identity=identity, require_pixels=True)
+        if identity is None:
+            with fingerprinted_snapshot(destination) as (identity, snapshot):
+                owner = _probe_owner(snapshot, require_pixels=True)
+        else:
+            with source_snapshot(destination, identity) as snapshot:
+                owner = _probe_owner(snapshot, require_pixels=True)
         owned = _owner_matches(owner, source, kind)
     except InvalidExportError as exc:
         hint = ('Перемести или удали повреждённую WebP-копию и повтори обработку.'
@@ -1183,8 +1194,42 @@ def validate_skip(destination, source, kind, *, identity=None):
     if not owned:
         hint = ' Перемести или переименуй существующий файл и повтори обработку.' if kind == 'copy' else ''
         raise FileExistsError(f'Имя {destination.name} занято неподтверждённым изображением.{hint}')
-    assert_source_identity(destination, identity)
-    return owner
+    return ValidatedExport(identity, owner)
+
+
+def validate_skip(destination, source, kind, *, identity=None):
+    """Standalone validation for callers that do not compute a recipe."""
+    evidence = capture_validated_skip(destination, source, kind, identity=identity)
+    assert_source_identity(destination, evidence.identity)
+    return evidence.owner
+
+
+def confirm_skip(destination, source, kind, *, input_identity=None, destination_identity=None,
+                 recipe=None, current_recipe=None, collision_index=None, approval_guard=None):
+    """One protocol for every skip, including an atomic-publication loser.
+
+    Evidence is captured first; potentially slow recipe/collision/approval work
+    happens next. Verify both live files at the final decision boundary.
+    A non-cooperating editor can still write after the final observation.
+    """
+    evidence = capture_validated_skip(destination, source, kind, identity=destination_identity)
+    current = current_recipe() if current_recipe is not None else recipe
+    warnings = freshness_warnings(evidence.owner, input_identity, current)
+    if collision_index is not None:
+        ensure_no_source_collision(destination, source, kind, collision_index, live=True)
+    if approval_guard is not None:
+        approval_guard()
+    observed = [(destination, evidence.identity)]
+    if input_identity is not None:
+        observed.append((source, input_identity))
+    stamps = [file_stamp(path) for path, _ in observed]
+    for path, identity in observed:
+        assert_source_identity(path, identity)
+    # Also detect ordinary edits to the first file during the second hash.
+    for (path, _), stamp in zip(observed, stamps):
+        if stamp is None or file_stamp(path) != stamp:
+            raise OSError(f'Файл изменился во время проверки готового результата: {path.name}')
+    return Publication(False, warnings)
 
 
 def save_generated(image: Image.Image, destination: Path, source: Path, kind: str,
@@ -1193,9 +1238,12 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
                    skip_recipe=None) -> Publication:
     # A late competing publication must be compared with the current settings,
     # not the actual extraction recipe of pixels that we did not publish.
-    def skipped(owner):
-        current = skip_recipe() if skip_recipe is not None else recipe
-        return Publication(False, freshness_warnings(owner, input_identity, current))
+    def skipped(identity=None):
+        return confirm_skip(destination, source, kind, input_identity=input_identity,
+                            destination_identity=identity, recipe=recipe, current_recipe=skip_recipe,
+                            collision_index=collision_index,
+                            approval_guard=(lambda: assert_approval(destination, approved_identity))
+                            if approved_identity is not None else None)
 
     # A suffix is not proof of ownership. Old unmarked exports require explicit
     # confirmation; automatic and batch jobs may only overwrite marked results.
@@ -1207,12 +1255,7 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     if prior is not None:
         owned = is_owned_export(destination, source, kind, identity=prior)
         if skip_exists and owned:
-            if collision_index is not None:
-                ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-            owner = validate_skip(destination, source, kind, identity=prior)
-            if input_identity is not None:
-                assert_source_identity(source, input_identity)
-            return skipped(owner)
+            return skipped(prior)
         if not owned and prior != approved_identity:
             raise FileExistsError(f'Файл {destination.name} не подтверждён как результат TokenForge. '
                                   'Переименуй его или подтверди замену вручную.')
@@ -1241,11 +1284,7 @@ def save_generated(image: Image.Image, destination: Path, source: Path, kind: st
     if not published:
         if not skip_exists:
             raise FileExistsError(f'Файл появился во время экспорта: {destination.name}')
-        if collision_index is not None:
-            ensure_no_source_collision(destination, source, kind, collision_index, live=True)
-        owner = validate_skip(destination, source, kind)
-        check_input()
-        return skipped(owner)
+        return skipped()
     return published
 
 
@@ -1301,12 +1340,12 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
     if source.suffix.lower() == '.webp':
         return Publication(False)
     destination = original_webp_path(source)
+    def skipped():
+        return confirm_skip(destination, source, 'copy', input_identity=identity,
+                            recipe=COPY_RECIPE, collision_index=collision_index,
+                            approval_guard=approval_guard)
     if destination.exists():
-        if collision_index is not None:
-            ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
-        owner = validate_skip(destination, source, 'copy')
-        assert_source_identity(source, identity)
-        return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
+        return skipped()
     if collision_index is not None:
         ensure_no_source_collision(destination, source, 'copy', collision_index)
     def guard():
@@ -1329,11 +1368,7 @@ def save_original_webp(source: Path, *, collision_index=None, input_identity=Non
                                after_publish=lambda: assert_source_identity(source, identity),
                                late_conflict_hint='Перемести или удали устаревшую WebP-копию и повтори обработку.')
         if not created:
-            if collision_index is not None:
-                ensure_no_source_collision(destination, source, 'copy', collision_index, live=True)
-            owner = validate_skip(destination, source, 'copy')
-            assert_source_identity(source, identity)
-            return Publication(False, freshness_warnings(owner, identity, COPY_RECIPE))
+            return skipped()
         return created
 
 
@@ -1439,12 +1474,13 @@ def export_images(files, get_cutout, output_path, renderer, *, kind,
                 assert_approval(destination, approved)
                 ensure_no_source_collision(destination, source, kind, folders)
                 if skip_exists and destination.exists():
-                    ensure_no_source_collision(destination, source, kind, folders, live=True)
-                    owner = validate_skip(destination, source, kind)
-                    assert_source_identity(source, identity)
-                    recipe = recipe_for(source) if recipe_for is not None else None
+                    publication = confirm_skip(destination, source, kind, input_identity=identity,
+                                               current_recipe=(lambda: recipe_for(source)) if recipe_for is not None else None,
+                                               collision_index=folders,
+                                               approval_guard=(lambda: assert_approval(destination, approved))
+                                               if approved is not None else None)
                     result.warnings.extend(f'{source.name}: {destination.name}: {w}'
-                                           for w in freshness_warnings(owner, identity, recipe))
+                                           for w in publication.warnings)
                     result.skipped += 1
                 else:
                     recipe = recipe_for(source) if recipe_for is not None else None
